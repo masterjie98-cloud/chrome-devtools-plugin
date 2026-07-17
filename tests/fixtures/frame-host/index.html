@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Frame routing host</title>
+    <style>
+      body { margin: 0; font: 16px system-ui, sans-serif; }
+      main { padding: 24px; }
+      #trusted-wrap { position: relative; display: inline-block; }
+      #trusted-button { width: 180px; height: 44px; }
+      #trusted-cover {
+        position: absolute;
+        inset: 0;
+        z-index: 2;
+        display: none;
+        place-items: center;
+        background: rgb(255 225 225 / 92%);
+        border: 1px solid #d33;
+      }
+      #trusted-wrap.covered #trusted-cover { display: grid; }
+      #trusted-result { display: inline-block; margin-left: 16px; }
+      #trusted-form-grid { display: grid; gap: 8px; max-width: 420px; }
+      #form-event-log { display: block; white-space: pre-wrap; }
+      iframe { display: block; width: 640px; height: 240px; margin-top: 24px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 id="top-heading">Top frame</h1>
+      <span id="trusted-wrap">
+        <button id="trusted-button" type="button">Trusted click target</button>
+        <span id="trusted-cover">Covered</span>
+      </span>
+      <output id="trusted-result">not clicked</output>
+      <button id="toggle-cover" type="button">Toggle target cover</button>
+      <section aria-labelledby="dialog-heading">
+        <h2 id="dialog-heading">JavaScript dialog fixtures</h2>
+        <button id="open-confirm" type="button">Open confirm</button>
+        <button id="open-prompt" type="button">Open prompt</button>
+        <output id="dialog-result">not handled</output>
+      </section>
+      <form id="trusted-keyboard-form">
+        <label for="trusted-text">Trusted keyboard target</label>
+        <input id="trusted-text" name="trustedText" value="old value" />
+        <button type="submit">Submit keyboard fixture</button>
+        <output id="keyboard-result">not typed</output>
+      </form>
+      <section aria-labelledby="form-heading">
+        <h2 id="form-heading">Trusted form fixture</h2>
+        <form id="trusted-form-grid">
+          <label for="form-name">Name</label>
+          <input id="form-name" name="formName" value="old name" data-form-control />
+          <label><input id="form-agree" type="checkbox" data-form-control /> Agree</label>
+          <fieldset>
+            <legend>Choice</legend>
+            <label><input id="form-choice-a" type="radio" name="choice" value="a" checked data-form-control /> A</label>
+            <label><input id="form-choice-b" type="radio" name="choice" value="b" data-form-control /> B</label>
+          </fieldset>
+          <label for="form-country">Country</label>
+          <select id="form-country" data-form-control>
+            <option value="cn">China</option>
+            <option value="us">United States</option>
+          </select>
+          <label for="form-tags">Tags</label>
+          <select id="form-tags" multiple size="3" data-form-control>
+            <option value="alpha">Alpha</option>
+            <option value="beta">Beta</option>
+            <option value="gamma">Gamma</option>
+          </select>
+          <label for="form-ambiguous">Ambiguous labels</label>
+          <select id="form-ambiguous" data-form-control>
+            <option value="first">Same label</option>
+            <option value="second">Same label</option>
+          </select>
+          <label for="form-readonly">Readonly</label>
+          <input id="form-readonly" value="cannot change" readonly data-form-control />
+        </form>
+        <output id="form-event-log">no form events</output>
+      </section>
+      <section aria-labelledby="sensitive-heading">
+        <h2 id="sensitive-heading">Disposable sensitive-data fixture</h2>
+        <p>Uses fixed non-secret markers only. Clean them after validation.</p>
+        <button id="seed-sensitive-markers" type="button">Seed disposable markers</button>
+        <button id="clear-sensitive-markers" type="button">Clear disposable markers</button>
+        <output id="sensitive-result">markers not seeded</output>
+      </section>
+      <iframe
+        id="cross-origin-frame"
+        title="Cross-origin fixture"
+        src="http://localhost:8766/child.html"
+      ></iframe>
+    </main>
+    <script>
+      document.querySelector("#trusted-button").addEventListener("click", (event) => {
+        document.querySelector("#trusted-result").textContent = event.isTrusted
+          ? "trusted"
+          : "synthetic";
+      });
+      document.querySelector("#toggle-cover").addEventListener("click", () => {
+        document.querySelector("#trusted-wrap").classList.toggle("covered");
+      });
+      document.querySelector("#open-confirm").addEventListener("click", () => {
+        const accepted = window.confirm("Confirm fixture action?");
+        document.querySelector("#dialog-result").textContent = accepted
+          ? "confirm accepted"
+          : "confirm dismissed";
+      });
+      document.querySelector("#open-prompt").addEventListener("click", () => {
+        const value = window.prompt("Prompt fixture value", "default value");
+        document.querySelector("#dialog-result").textContent = value === null
+          ? "prompt dismissed"
+          : `prompt accepted: ${value}`;
+      });
+      document.querySelector("#trusted-text").addEventListener("input", (event) => {
+        document.querySelector("#keyboard-result").textContent = event.isTrusted
+          ? `trusted input: ${event.target.value}`
+          : `synthetic input: ${event.target.value}`;
+      });
+      document.querySelector("#trusted-keyboard-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        document.querySelector("#keyboard-result").textContent = event.isTrusted
+          ? `trusted submit: ${document.querySelector("#trusted-text").value}`
+          : "synthetic submit";
+      });
+      document.querySelector("#trusted-form-grid").addEventListener("input", recordFormEvent);
+      document.querySelector("#trusted-form-grid").addEventListener("change", recordFormEvent);
+      function recordFormEvent(event) {
+        const target = event.target;
+        if (!target.matches("[data-form-control]")) return;
+        const value = target instanceof HTMLInputElement && ["checkbox", "radio"].includes(target.type)
+          ? String(target.checked)
+          : target instanceof HTMLSelectElement && target.multiple
+            ? Array.from(target.selectedOptions, (option) => option.value).join(",")
+            : target.value;
+        const line = `${target.id} ${event.type} ${event.isTrusted ? "trusted" : "synthetic"} ${value}`;
+        const output = document.querySelector("#form-event-log");
+        output.textContent = output.textContent === "no form events"
+          ? line
+          : `${output.textContent}\n${line}`;
+      }
+      const markerNames = {
+        local: "manual-sensitive-local",
+        session: "manual-sensitive-session",
+        cookie: "manual_sensitive_cookie",
+      };
+      document.querySelector("#seed-sensitive-markers").addEventListener("click", async () => {
+        localStorage.setItem(markerNames.local, "manual-local-value");
+        sessionStorage.setItem(markerNames.session, "manual-session-value");
+        document.cookie = `${markerNames.cookie}=manual-cookie-value; Path=/; SameSite=Lax`;
+        const response = await fetch(
+          "/sensitive-fixture.json?access_token=manual-query-marker",
+          {
+            cache: "no-store",
+            headers: { Authorization: "Bearer manual-header-marker" },
+          },
+        );
+        if (!response.ok) throw new Error(`Fixture response failed: ${response.status}`);
+        await response.json();
+        document.querySelector("#sensitive-result").textContent = "disposable markers seeded";
+      });
+      document.querySelector("#clear-sensitive-markers").addEventListener("click", () => {
+        localStorage.removeItem(markerNames.local);
+        sessionStorage.removeItem(markerNames.session);
+        document.cookie = `${markerNames.cookie}=; Max-Age=0; Path=/; SameSite=Lax`;
+        document.querySelector("#sensitive-result").textContent = "disposable markers cleared";
+      });
+    </script>
+  </body>
+</html>

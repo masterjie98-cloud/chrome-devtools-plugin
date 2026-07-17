@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "source": "AI DevTools Assistant",
+  "mockedAt": "static-extension-resource",
+  "data": {
+    "message": "This response is served from the extension mock JSON."
+  }
+}

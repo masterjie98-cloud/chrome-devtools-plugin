@@ -1,0 +1,474 @@
+import WebSocket from "ws";
+import { loadDaemonConfig } from "../daemon/config";
+import { createMessageId } from "../shared/messaging";
+import {
+  MCP_WS_URL,
+  WS_COMMANDS,
+  WS_HEARTBEAT_INTERVAL_MS,
+  WS_PROTOCOL_VERSION,
+  type DaemonStateResourceKey,
+  type ArtifactGetResultPayload,
+  type McpListToolsResultPayload,
+  type McpToPluginMessage,
+  type McpToolResultPayload,
+  type PluginToMcpMessage,
+  type StateGetResultPayload,
+} from "../shared/wsProtocol";
+import { WS_CLIENT_IDENTITIES } from "../shared/wsClientIdentity";
+import { ADAPTER_ROUTING_TOOL_NAMES } from "./adapterRoutingTools";
+
+interface PendingRequest {
+  expectedCommand:
+    | typeof WS_COMMANDS.ARTIFACT_GET_RESULT
+    | typeof WS_COMMANDS.MCP_LIST_TOOLS_RESULT
+    | typeof WS_COMMANDS.MCP_TOOL_RESULT
+    | typeof WS_COMMANDS.STATE_GET_RESULT;
+  resolve: (payload: unknown) => void;
+  reject: (error: Error) => void;
+  timeout?: ReturnType<typeof setTimeout>;
+  cleanup?: () => void;
+}
+
+export interface DaemonCallOptions {
+  signal?: AbortSignal;
+  deadlineAt?: string;
+  idempotencyKey?: string;
+}
+
+export class DaemonClient {
+  private socket: WebSocket | null = null;
+  private connecting: Promise<void> | null = null;
+  private readonly pending = new Map<string, PendingRequest>();
+  private readonly adapterInstanceId = createMessageId();
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private readonly url = process.env.AI_DEVTOOLS_DAEMON_URL ?? MCP_WS_URL,
+    private sessionId = process.env.AI_DEVTOOLS_SESSION_ID,
+    private readonly configuredBridgeToken = process.env.AI_DEVTOOLS_BRIDGE_TOKEN,
+    private readonly heartbeatIntervalMs = WS_HEARTBEAT_INTERVAL_MS,
+  ) {}
+
+  async listTools(): Promise<unknown[]> {
+    const payload = await this.request<McpListToolsResultPayload>(
+      WS_COMMANDS.MCP_LIST_TOOLS,
+      { includeExternal: true },
+      WS_COMMANDS.MCP_LIST_TOOLS_RESULT,
+      15_000,
+    );
+    if (!payload.ok) {
+      throw new Error(payload.error);
+    }
+    return payload.tools;
+  }
+
+  selectedSessionId(): string | undefined {
+    return this.sessionId;
+  }
+
+  async callTool(
+    toolName: string,
+    args: Record<string, unknown>,
+    options: DaemonCallOptions = {},
+  ): Promise<unknown> {
+    const deadlineAt = options.deadlineAt;
+    const payload = await this.request<McpToolResultPayload>(
+      WS_COMMANDS.MCP_TOOL_CALL,
+      { call: { toolName, args } },
+      WS_COMMANDS.MCP_TOOL_RESULT,
+      {
+        ...(deadlineAt
+          ? { timeoutMs: deadlineTimeoutMs(deadlineAt), deadlineAt }
+          : {}),
+        idempotencyKey: options.idempotencyKey,
+        signal: options.signal,
+      },
+    );
+    if (!payload.ok) {
+      throw new Error(payload.error);
+    }
+    if (
+      toolName === ADAPTER_ROUTING_TOOL_NAMES.SET_SESSION &&
+      isRecord(payload.data) &&
+      typeof payload.data.selectedSessionId === "string"
+    ) {
+      this.sessionId = payload.data.selectedSessionId;
+    }
+    return payload.data;
+  }
+
+  async readState(
+    key: DaemonStateResourceKey,
+    sessionId = this.sessionId,
+  ): Promise<unknown> {
+    const payload = await this.request<StateGetResultPayload>(
+      WS_COMMANDS.STATE_GET,
+      { key, ...(sessionId ? { sessionId } : {}) },
+      WS_COMMANDS.STATE_GET_RESULT,
+      10_000,
+    );
+    if (!payload.ok) {
+      throw new Error(payload.error);
+    }
+    return payload.data;
+  }
+
+  async readArtifact(artifactId: string): Promise<ArtifactGetResultPayload> {
+    return this.request<ArtifactGetResultPayload>(
+      WS_COMMANDS.ARTIFACT_GET,
+      { artifactId },
+      WS_COMMANDS.ARTIFACT_GET_RESULT,
+      15_000,
+    );
+  }
+
+  close(): void {
+    this.stopHeartbeat();
+    this.rejectPending("Daemon client closed before the response arrived.");
+    this.socket?.close();
+    this.socket = null;
+    this.connecting = null;
+  }
+
+  private async request<TPayload>(
+    command:
+      | typeof WS_COMMANDS.ARTIFACT_GET
+      | typeof WS_COMMANDS.MCP_LIST_TOOLS
+      | typeof WS_COMMANDS.MCP_TOOL_CALL
+      | typeof WS_COMMANDS.STATE_GET,
+    payload: Record<string, unknown>,
+    expectedCommand: PendingRequest["expectedCommand"],
+    options: {
+      timeoutMs?: number;
+      deadlineAt?: string;
+      idempotencyKey?: string;
+      signal?: AbortSignal;
+    } | number,
+  ): Promise<TPayload> {
+    const normalizedOptions =
+      typeof options === "number" ? { timeoutMs: options } : options;
+    throwIfAborted(normalizedOptions.signal);
+    await this.ensureConnected();
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error(`Local daemon is not connected at ${this.url}.`);
+    }
+
+    const requestId = createMessageId();
+    const message = {
+      requestId,
+      command,
+      sentAt: new Date().toISOString(),
+      ...(normalizedOptions.deadlineAt
+        ? { deadlineAt: normalizedOptions.deadlineAt }
+        : {}),
+      ...(normalizedOptions.idempotencyKey
+        ? {
+            idempotencyKey: `${this.adapterInstanceId}:${normalizedOptions.idempotencyKey}`,
+          }
+        : {}),
+      payload,
+    } as PluginToMcpMessage;
+
+    return new Promise<TPayload>((resolve, reject) => {
+      const timeout =
+        normalizedOptions.timeoutMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              const pending = this.pending.get(requestId);
+              pending?.cleanup?.();
+              this.pending.delete(requestId);
+              reject(new Error(`REQUEST_DEADLINE_EXCEEDED: ${command}`));
+              this.sendCancel(socket, requestId, "Adapter deadline exceeded.");
+            }, normalizedOptions.timeoutMs);
+
+      const abort = () => {
+        const pending = this.pending.get(requestId);
+        if (!pending) {
+          return;
+        }
+        clearPendingTimeout(pending);
+        pending.cleanup?.();
+        this.pending.delete(requestId);
+        pending.reject(createAbortError());
+        this.sendCancel(socket, requestId, "MCP client cancelled the request.");
+      };
+      normalizedOptions.signal?.addEventListener("abort", abort, { once: true });
+
+      this.pending.set(requestId, {
+        expectedCommand,
+        resolve: (value) => resolve(value as TPayload),
+        reject,
+        timeout,
+        cleanup: normalizedOptions.signal
+          ? () => normalizedOptions.signal?.removeEventListener("abort", abort)
+          : undefined,
+      });
+      socket.send(JSON.stringify(message), (error) => {
+        if (!error) {
+          return;
+        }
+        const pending = this.pending.get(requestId);
+        if (!pending) {
+          return;
+        }
+        clearPendingTimeout(pending);
+        pending.cleanup?.();
+        this.pending.delete(requestId);
+        pending.reject(error);
+      });
+    });
+  }
+
+  private sendCancel(
+    socket: WebSocket,
+    targetRequestId: string,
+    reason: string,
+  ): void {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const message: PluginToMcpMessage = {
+      requestId: createMessageId(),
+      command: WS_COMMANDS.REQUEST_CANCEL,
+      sentAt: new Date().toISOString(),
+      payload: { targetRequestId, reason },
+    };
+    socket.send(JSON.stringify(message));
+  }
+
+  private ensureConnected(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return Promise.resolve();
+    }
+    if (this.connecting) {
+      return this.connecting;
+    }
+
+    this.connecting = new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(this.url, {
+        maxPayload: 8 * 1024 * 1024,
+      });
+      this.socket = socket;
+      let settled = false;
+      let handshakeTimeout: ReturnType<typeof setTimeout> | undefined;
+
+      const failConnection = (error: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (handshakeTimeout) {
+          clearTimeout(handshakeTimeout);
+        }
+        if (this.socket === socket) {
+          this.socket = null;
+        }
+        socket.close();
+        reject(error);
+      };
+
+      const finishConnection = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (handshakeTimeout) {
+          clearTimeout(handshakeTimeout);
+        }
+        resolve();
+      };
+
+      socket.once("open", async () => {
+        socket.on("message", (raw) => {
+          const message = parseDaemonMessage(raw.toString());
+          if (message?.command === WS_COMMANDS.SERVER_WELCOME) {
+            if (message.payload.protocolVersion !== WS_PROTOCOL_VERSION) {
+              failConnection(
+                new Error(
+                  `PROTOCOL_VERSION_UNSUPPORTED: adapter requires version ${WS_PROTOCOL_VERSION}, daemon sent ${message.payload.protocolVersion}.`,
+                ),
+              );
+              return;
+            }
+            if (message.payload.assignedRole !== "mcp") {
+              failConnection(
+                new Error(
+                  `ROLE_FORBIDDEN: daemon assigned ${message.payload.assignedRole}, expected mcp.`,
+                ),
+              );
+              return;
+            }
+            this.startHeartbeat(socket);
+            finishConnection();
+            return;
+          }
+          this.handleMessage(raw.toString());
+        });
+        socket.on("close", () => {
+          this.stopHeartbeat();
+          if (this.socket === socket) {
+            this.socket = null;
+          }
+          this.connecting = null;
+          this.rejectPending("Local daemon disconnected before the response arrived.");
+          failConnection(
+            new Error("Local daemon disconnected during protocol negotiation."),
+          );
+        });
+        socket.on("error", () => {
+          // The close handler owns cleanup after the connection is established.
+        });
+
+        let bridgeToken: string;
+        try {
+          bridgeToken =
+            this.configuredBridgeToken ??
+            (await loadDaemonConfig()).bridgeToken;
+        } catch (error) {
+          failConnection(
+            error instanceof Error
+              ? error
+              : new Error("Failed to load local daemon credentials."),
+          );
+          return;
+        }
+
+        const hello: PluginToMcpMessage = {
+          requestId: createMessageId(),
+          command: WS_COMMANDS.CLIENT_HELLO,
+          sentAt: new Date().toISOString(),
+          payload: {
+            protocolVersion: WS_PROTOCOL_VERSION,
+            clientRole: WS_CLIENT_IDENTITIES.CODEX_STDIO_ADAPTER.assignedRole,
+            clientName: WS_CLIENT_IDENTITIES.CODEX_STDIO_ADAPTER.clientName,
+            bridgeToken,
+            ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+          },
+        };
+        socket.send(JSON.stringify(hello), (error) => {
+          if (error) {
+            failConnection(error);
+            return;
+          }
+          if (settled) {
+            return;
+          }
+          handshakeTimeout = setTimeout(() => {
+            failConnection(
+              new Error(
+                `PROTOCOL_NEGOTIATION_TIMEOUT: daemon did not send SERVER_WELCOME for version ${WS_PROTOCOL_VERSION}.`,
+              ),
+            );
+          }, 5_000);
+        });
+      });
+      socket.once("error", (error) => {
+        if (socket.readyState !== WebSocket.OPEN) {
+          failConnection(error);
+        }
+      });
+    }).finally(() => {
+      this.connecting = null;
+    });
+
+    return this.connecting;
+  }
+
+  private handleMessage(raw: string): void {
+    let message: McpToPluginMessage;
+    try {
+      message = JSON.parse(raw) as McpToPluginMessage;
+    } catch {
+      return;
+    }
+
+    if (
+      message.command !== WS_COMMANDS.MCP_LIST_TOOLS_RESULT &&
+      message.command !== WS_COMMANDS.MCP_TOOL_RESULT &&
+      message.command !== WS_COMMANDS.ARTIFACT_GET_RESULT &&
+      message.command !== WS_COMMANDS.STATE_GET_RESULT
+    ) {
+      return;
+    }
+
+    const pending = this.pending.get(message.requestId);
+    if (!pending || pending.expectedCommand !== message.command) {
+      return;
+    }
+    clearPendingTimeout(pending);
+    pending.cleanup?.();
+    this.pending.delete(message.requestId);
+    pending.resolve(message.payload);
+  }
+
+  private rejectPending(reason: string): void {
+    for (const [requestId, pending] of this.pending) {
+      clearPendingTimeout(pending);
+      pending.cleanup?.();
+      pending.reject(new Error(reason));
+      this.pending.delete(requestId);
+    }
+  }
+
+  private startHeartbeat(socket: WebSocket): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const message: PluginToMcpMessage = {
+        requestId: createMessageId(),
+        command: WS_COMMANDS.HEARTBEAT,
+        sentAt: new Date().toISOString(),
+        payload: { ...(this.sessionId ? { sessionId: this.sessionId } : {}) },
+      };
+      socket.send(JSON.stringify(message));
+    }, this.heartbeatIntervalMs);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseDaemonMessage(raw: string): McpToPluginMessage | null {
+  try {
+    return JSON.parse(raw) as McpToPluginMessage;
+  } catch {
+    return null;
+  }
+}
+
+function deadlineTimeoutMs(deadlineAt: string): number {
+  const parsed = Date.parse(deadlineAt);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid deadlineAt: ${deadlineAt}`);
+  }
+  return Math.max(1, parsed - Date.now());
+}
+
+function clearPendingTimeout(pending: PendingRequest): void {
+  if (pending.timeout !== undefined) {
+    clearTimeout(pending.timeout);
+  }
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+function createAbortError(): Error {
+  const error = new Error("REQUEST_CANCELLED: MCP client cancelled the request.");
+  error.name = "AbortError";
+  return error;
+}

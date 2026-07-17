@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Cross-origin child</title>
+  </head>
+  <body>
+    <h2 id="child-heading">Child frame content</h2>
+    <button id="child-button" type="button">Child trusted click target</button>
+    <output id="child-click-result">not clicked</output>
+    <label for="child-input">Child trusted input</label>
+    <input id="child-input" aria-label="Child input" value="frame-value" />
+    <output id="child-input-result">not typed</output>
+    <script>
+      document.querySelector("#child-button").addEventListener("click", (event) => {
+        document.querySelector("#child-click-result").textContent = event.isTrusted
+          ? "trusted"
+          : "synthetic";
+      });
+      document.querySelector("#child-input").addEventListener("input", (event) => {
+        document.querySelector("#child-input-result").textContent = event.isTrusted
+          ? `trusted input: ${event.target.value}`
+          : `synthetic input: ${event.target.value}`;
+      });
+    </script>
+  </body>
+</html>

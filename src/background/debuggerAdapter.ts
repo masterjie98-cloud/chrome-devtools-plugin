@@ -1,0 +1,3115 @@
+import {
+  activateTabForDebugging,
+  debuggerAttach,
+  debuggerDetach,
+  debuggerGetTargets,
+  debuggerSendCommand,
+  getAllNavigationFrames,
+  getTab,
+  isTabUrlScriptable,
+  queryActiveTab,
+} from "./chromeApi";
+import type { DebuggerCommandTarget } from "./chromeApi";
+import type {
+  BrowserConsoleMessage,
+  BrowserConsoleMessagesInput,
+  BrowserConsoleMessagesResult,
+  BrowserCoordinateClickInput,
+  BrowserCoordinateDragInput,
+  BrowserCoordinateInput,
+  BrowserDialogInput,
+  BrowserDialogResult,
+  BrowserPressKeyInput,
+  BrowserTypeInput,
+  BrowserMouseResult,
+  BrowserMouseWheelInput,
+  PageSnapshotTarget,
+  ScreenshotCaptureInput,
+  ScreenshotCaptureResult,
+} from "../shared/dom";
+import type {
+  DebuggerDetachInput,
+  DebuggerDetachResult,
+  DebuggerFetchPrepareInput,
+  DebuggerFetchStatus,
+  DebuggerNetworkBodyInput,
+  DebuggerNetworkGetInput,
+  DebuggerNetworkListInput,
+  DebuggerNetworkListResult,
+  DebuggerNetworkRequestDetail,
+  DebuggerNetworkRequestSummary,
+  DebuggerNetworkResponseBody,
+  DebuggerNetworkStartInput,
+  DebuggerNetworkStatus,
+  DebuggerProxyHeaderModification,
+  DebuggerProxyHit,
+  DebuggerProxyListHitsInput,
+  DebuggerProxyListHitsResult,
+  DebuggerProxyListResult,
+  DebuggerProxyRemoveRuleInput,
+  DebuggerProxyRule,
+  DebuggerProxyRuleInput,
+  DebuggerProxyRuleMutationResult,
+  DebuggerProxyStage,
+  DebuggerProxyStatus,
+} from "../shared/debugger";
+import {
+  buildNetworkActivityDigest,
+  normalizeNetworkResultPagination,
+} from "../shared/networkActivity";
+import { paginateCollection } from "../shared/collectionPagination";
+import { MESSAGE_TYPES } from "../shared/messages";
+import { makeEvent, sendRuntimeEvent } from "../shared/messaging";
+import {
+  trustedMouseClickEvents,
+  trustedMouseDownEvent,
+  trustedMouseDragEvents,
+  trustedMouseMoveEvent,
+  trustedMouseUpEvent,
+  trustedMouseWheelEvent,
+  type TrustedMouseEventParams,
+} from "./trustedInput";
+import { currentJavaScriptDialogCommand } from "./dialogHandling";
+import {
+  trustedKeyEvents,
+  trustedReplaceSelectionEvents,
+  type TrustedKeyEventParams,
+} from "../shared/trustedKeyboard";
+import {
+  createOopifAutoAttachParams,
+  mapDebuggerFrameTree,
+  requireDebuggerFrameRoute,
+  type CdpFrameTreeNode,
+  type DebuggerFrameRoute,
+} from "./debuggerFrameRouting";
+import {
+  debuggerAttachFailureMessage,
+  selectPageTargetInfo,
+  topLevelDebuggerTarget,
+} from "./debuggerTargetRouting";
+
+const PROTOCOL_VERSION = "1.3";
+const DEFAULT_MAX_NETWORK_ENTRIES = 300;
+const MAX_RESPONSE_BODY_CHARS = 120_000;
+const MAX_PROXY_HITS = 300;
+const MAX_CONSOLE_MESSAGES = 500;
+const MAX_CHILD_DEBUGGER_SESSIONS = 128;
+const PROXY_STATE_STORAGE_KEY = "aiDevtools.proxyState";
+const PROXY_HITS_STORAGE_KEY = "aiDevtools.proxyHits";
+const PROXY_LOG_PREFIX = "[ai-devtools-proxy]";
+
+/** 全链路诊断日志；在 chrome://extensions → Service Worker 控制台查看 */
+const PROXY_DEBUG = true;
+
+type ProxyLogLevel = "info" | "warn" | "error";
+
+function formatProxyLogMessage(
+  phase: string,
+  data?: Record<string, unknown>,
+): string {
+  if (!data) {
+    return `${PROXY_LOG_PREFIX} ${phase}`;
+  }
+  try {
+    return `${PROXY_LOG_PREFIX} ${phase} ${JSON.stringify(data)}`;
+  } catch {
+    return `${PROXY_LOG_PREFIX} ${phase} ${String(data)}`;
+  }
+}
+
+function proxyLog(
+  phase: string,
+  data?: Record<string, unknown>,
+  level: ProxyLogLevel = "info",
+): void {
+  if (!PROXY_DEBUG) {
+    return;
+  }
+  const message = formatProxyLogMessage(phase, data ? { phase, ...data } : undefined);
+  // 勿对 chrome://extensions 错误页使用 console.error(前缀, 对象)，会显示 [object Object]
+  if (level === "warn" || level === "error") {
+    console.warn(message);
+    return;
+  }
+  console.log(message);
+}
+
+function isDebuggerDetachedError(message: string): boolean {
+  return /not attached|target closed|invalid state|connection lost/i.test(
+    message,
+  );
+}
+
+function summarizeProxyRule(rule: DebuggerProxyRule): Record<string, unknown> {
+  return {
+    id: rule.id,
+    enabled: rule.enabled,
+    priority: rule.priority,
+    method: rule.method,
+    resourceType: rule.resourceType,
+    urlContains: rule.urlContains,
+    urlPattern: rule.urlPattern,
+    regexFilter: rule.regexFilter,
+    mockStage: rule.mockStage,
+    stages: fetchStagesForRule(rule),
+    hasRequestHeaders: Boolean(rule.requestHeaders?.length),
+    hasResponseBody:
+      rule.responseBody !== undefined || rule.responseBodyBase64 !== undefined,
+    statusCode: rule.statusCode,
+    hitCount: rule.hitCount,
+  };
+}
+
+function summarizeFetchPause(
+  event: FetchRequestPausedEvent,
+  stage: DebuggerProxyStage,
+): Record<string, unknown> {
+  return {
+    stage,
+    requestId: event.requestId,
+    networkId: event.networkId,
+    method: event.request.method,
+    url: event.request.url,
+    resourceType: event.resourceType,
+    responseStatusCode: event.responseStatusCode,
+  };
+}
+
+function summarizeDebuggee(source: DebuggerTarget): Record<string, unknown> {
+  return {
+    tabId: source.tabId,
+    targetId: source.targetId,
+    sessionId: source.sessionId,
+    extensionId: source.extensionId,
+  };
+}
+
+type DebuggerTarget = DebuggerCommandTarget;
+
+interface NetworkRequestRecord {
+  requestId: string;
+  url: string;
+  method: string;
+  resourceType?: string;
+  documentUrl?: string;
+  requestHeaders?: Record<string, string>;
+  requestPostData?: string;
+  responseHeaders?: Record<string, string>;
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  fromDiskCache?: boolean;
+  fromServiceWorker?: boolean;
+  encodedDataLength?: number;
+  startedAt: number;
+  finishedAt?: number;
+  failed?: boolean;
+  errorText?: string;
+  initiatorType?: string;
+  remoteAddress?: string;
+}
+
+interface ConsoleMessageRecord extends BrowserConsoleMessage {
+  timestampMs: number;
+}
+
+interface NetworkSession {
+  tabId: number;
+  target: DebuggerTarget;
+  targetInfo?: chrome.debugger.TargetInfo;
+  attached: boolean;
+  networkEnabled: boolean;
+  fetchEnabled: boolean;
+  runtimeEnabled: boolean;
+  logEnabled: boolean;
+  oopifAutoAttachEnabled: boolean;
+  pageStartedAt: number;
+  maxEntries: number;
+  preservedLog: boolean;
+  observationSessionId?: string;
+  observationStartedAt?: string;
+  requests: Map<string, NetworkRequestRecord>;
+  requestOrder: string[];
+  consoleMessages: ConsoleMessageRecord[];
+}
+
+interface ChildDebuggerSession {
+  target: DebuggerTarget;
+}
+
+interface RoutedChildDebuggerSession extends DebuggerFrameRoute {
+  sessionId: string;
+  target: DebuggerTarget;
+}
+
+export type TrustedInputTargetAddress = Pick<
+  PageSnapshotTarget,
+  "tabId" | "frameId" | "documentId"
+>;
+
+interface TrustedInputSession {
+  tabId: number;
+  target: DebuggerTarget;
+}
+
+interface ScreenshotClip {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+let activeSession: NetworkSession | null = null;
+let debuggerListenersRegistered = false;
+const proxyRules = new Map<string, DebuggerProxyRule>();
+const childDebuggerSessions = new Map<string, ChildDebuggerSession>();
+const childDebuggerRoutes = new Map<number, RoutedChildDebuggerSession>();
+let childRouteRefreshGeneration = 0;
+let proxyHits: DebuggerProxyHit[] = [];
+let proxyEnabled = false;
+let proxyStateLoaded = false;
+let proxyRestoreLoopGeneration = 0;
+let proxyStateBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+let ensureSessionPromise: Promise<NetworkSession> | null = null;
+const manualDebuggerDetachTabIds = new Set<number>();
+
+interface StoredProxyState {
+  enabled?: boolean;
+  rules?: DebuggerProxyRule[];
+}
+
+export async function prepareFetchDebugger(
+  input: DebuggerFetchPrepareInput,
+): Promise<DebuggerFetchStatus> {
+  await ensureProxyStateLoaded();
+  const session = await ensureDebuggerSession();
+  await debuggerSendCommand(session.target, "Fetch.enable", {
+    patterns: [
+      {
+        urlPattern: input.urlPattern || "*",
+        requestStage: "Request"
+      }
+    ]
+  });
+  session.fetchEnabled = true;
+
+  return {
+    attached: true,
+    fetchEnabled: true,
+    tabId: session.tabId,
+    protocolVersion: PROTOCOL_VERSION,
+    note: "CDP Fetch is enabled. Requests are continued unless a proxy rule matches."
+  };
+}
+
+export async function captureDebuggerScreenshot(
+  input: ScreenshotCaptureInput & { clip?: ScreenshotClip } = {},
+): Promise<ScreenshotCaptureResult> {
+  const session = await ensureDebuggerSession();
+  await debuggerSendCommand(session.target, "Page.enable", {}).catch(
+    () => undefined,
+  );
+
+  const format = input.type === "jpeg" ? "jpeg" : "png";
+  const params: Record<string, unknown> = {
+    format,
+    fromSurface: true,
+  };
+
+  if (format === "jpeg" && input.quality !== undefined) {
+    params.quality = Math.max(0, Math.min(100, Math.round(input.quality)));
+  }
+
+  let width: number | undefined;
+  let height: number | undefined;
+
+  if (input.clip) {
+    const clip = normalizeScreenshotClip(input.clip);
+    params.clip = { ...clip, scale: 1 };
+    params.captureBeyondViewport = true;
+    width = Math.round(clip.width);
+    height = Math.round(clip.height);
+  } else if (input.fullPage) {
+    const metrics = await debuggerSendCommand<
+      Record<string, never>,
+      PageLayoutMetrics
+    >(session.target, "Page.getLayoutMetrics", {});
+    const contentSize = metrics.cssContentSize ?? metrics.contentSize;
+    const clip = normalizeScreenshotClip({
+      x: contentSize.x ?? 0,
+      y: contentSize.y ?? 0,
+      width: contentSize.width,
+      height: contentSize.height,
+    });
+    params.clip = { ...clip, scale: 1 };
+    params.captureBeyondViewport = true;
+    width = Math.round(clip.width);
+    height = Math.round(clip.height);
+  }
+
+  const result = await debuggerSendCommand<
+    Record<string, unknown>,
+    { data: string }
+  >(session.target, "Page.captureScreenshot", params);
+  const mimeType = format === "jpeg" ? "image/jpeg" : "image/png";
+
+  return {
+    capturedAt: new Date().toISOString(),
+    mimeType,
+    dataUrl: `data:${mimeType};base64,${result.data}`,
+    method: "cdp",
+    fullPage: Boolean(input.fullPage),
+    selector: input.target ?? input.selector,
+    width,
+    height,
+  };
+}
+
+export async function dispatchTrustedMouseMove(
+  input: BrowserCoordinateInput,
+  expectedTarget?: TrustedInputTargetAddress,
+): Promise<BrowserMouseResult> {
+  const session = await ensureTrustedInputSession(expectedTarget);
+  await dispatchTrustedMouseEvents(session, [trustedMouseMoveEvent(input)]);
+  return { action: "move", x: input.x, y: input.y };
+}
+
+export async function dispatchTrustedMouseClick(
+  input: BrowserCoordinateClickInput,
+  expectedTarget?: TrustedInputTargetAddress,
+): Promise<BrowserMouseResult> {
+  const session = await ensureTrustedInputSession(expectedTarget);
+  const button = input.button ?? "left";
+  await dispatchTrustedMouseEvents(session, trustedMouseClickEvents(input));
+  return { action: "click", x: input.x, y: input.y, button };
+}
+
+export async function dispatchTrustedMouseDown(
+  input: BrowserCoordinateClickInput,
+  expectedTarget?: TrustedInputTargetAddress,
+): Promise<BrowserMouseResult> {
+  const session = await ensureTrustedInputSession(expectedTarget);
+  const button = input.button ?? "left";
+  await dispatchTrustedMouseEvents(session, [trustedMouseDownEvent(input)]);
+  return { action: "down", x: input.x, y: input.y, button };
+}
+
+export async function dispatchTrustedMouseUp(
+  input: BrowserCoordinateClickInput,
+  expectedTarget?: TrustedInputTargetAddress,
+): Promise<BrowserMouseResult> {
+  const session = await ensureTrustedInputSession(expectedTarget);
+  const button = input.button ?? "left";
+  await dispatchTrustedMouseEvents(session, [trustedMouseUpEvent(input)]);
+  return { action: "up", x: input.x, y: input.y, button };
+}
+
+export async function dispatchTrustedMouseDrag(
+  input: BrowserCoordinateDragInput,
+  expectedTarget?: TrustedInputTargetAddress,
+): Promise<BrowserMouseResult> {
+  const session = await ensureTrustedInputSession(expectedTarget);
+  await dispatchTrustedMouseEvents(
+    session,
+    trustedMouseDragEvents(input),
+    true,
+  );
+  return { action: "drag", x: input.endX, y: input.endY, button: "left" };
+}
+
+export async function dispatchTrustedMouseWheel(
+  input: BrowserMouseWheelInput,
+  expectedTarget?: TrustedInputTargetAddress,
+): Promise<BrowserMouseResult> {
+  const session = await ensureTrustedInputSession(expectedTarget);
+  const point = await resolveTrustedWheelPoint(session, input);
+  await dispatchTrustedMouseEvents(session, [trustedMouseWheelEvent(input, point)]);
+  return { action: "wheel", x: point.x, y: point.y };
+}
+
+export async function handleCurrentJavaScriptDialog(
+  input: BrowserDialogInput,
+  expectedTabId: number,
+): Promise<BrowserDialogResult> {
+  const session = await ensureDebuggerSessionForTab(expectedTabId, true);
+  try {
+    await debuggerSendCommand(
+      session.target,
+      "Page.handleJavaScriptDialog",
+      currentJavaScriptDialogCommand(input),
+    );
+  } catch (error) {
+    throw new Error(
+      `NO_JAVASCRIPT_DIALOG: no current JavaScript dialog could be ${input.action === "accept" ? "accepted" : "dismissed"}. Open the dialog in the selected tab and retry. Details: ${errorMessage(error)}`,
+    );
+  }
+  return {
+    handled: true,
+    action: input.action,
+    ...(input.action === "accept" && input.promptText !== undefined
+      ? { promptText: input.promptText }
+      : {}),
+  };
+}
+
+export async function dispatchTrustedTextInput(
+  input: Pick<BrowserTypeInput, "text" | "replace" | "slowly" | "submit">,
+  expectedTarget: TrustedInputTargetAddress,
+): Promise<void> {
+  const session = await ensureTrustedInputSession(expectedTarget);
+  if (input.replace) {
+    await dispatchTrustedKeyboardEvents(
+      session,
+      trustedReplaceSelectionEvents(),
+    );
+  }
+
+  const chunks = input.slowly ? Array.from(input.text) : [input.text];
+  for (const text of chunks) {
+    if (text) {
+      await debuggerSendCommand(session.target, "Input.insertText", { text });
+    }
+    if (input.slowly && text) {
+      await delayMs(35);
+    }
+  }
+
+  if (input.submit) {
+    await dispatchTrustedKeyboardEvents(session, trustedKeyEvents("Enter"));
+  }
+}
+
+export async function dispatchTrustedKeyPress(
+  input: Pick<BrowserPressKeyInput, "key">,
+  expectedTarget: TrustedInputTargetAddress,
+): Promise<void> {
+  const session = await ensureTrustedInputSession(expectedTarget);
+  await dispatchTrustedKeyboardEvents(session, trustedKeyEvents(input.key));
+}
+
+async function ensureTrustedInputSession(
+  expectedTarget: TrustedInputTargetAddress | undefined,
+): Promise<TrustedInputSession> {
+  const session = expectedTarget
+    ? await ensureDebuggerSessionForTab(expectedTarget.tabId, true)
+    : await ensureDebuggerSession();
+  if (!expectedTarget || expectedTarget.frameId === 0) {
+    return { tabId: session.tabId, target: session.target };
+  }
+
+  await ensureOopifAutoAttach(session);
+  await refreshChildDebuggerRoutes(session);
+  const route = requireDebuggerFrameRoute(
+    childDebuggerRoutes,
+    expectedTarget.frameId,
+    expectedTarget.documentId,
+  );
+  return { tabId: session.tabId, target: route.target };
+}
+
+async function dispatchTrustedMouseEvents(
+  session: TrustedInputSession,
+  events: TrustedMouseEventParams[],
+  paceMoves = false,
+): Promise<void> {
+  for (const event of events) {
+    await debuggerSendCommand(
+      session.target,
+      "Input.dispatchMouseEvent",
+      event,
+    );
+    if (paceMoves && event.type === "mouseMoved") {
+      await delayMs(16);
+    }
+  }
+}
+
+async function dispatchTrustedKeyboardEvents(
+  session: TrustedInputSession,
+  events: TrustedKeyEventParams[],
+): Promise<void> {
+  for (const event of events) {
+    await debuggerSendCommand(
+      session.target,
+      "Input.dispatchKeyEvent",
+      event,
+    );
+  }
+}
+
+async function resolveTrustedWheelPoint(
+  session: TrustedInputSession,
+  input: BrowserMouseWheelInput,
+): Promise<{ x: number; y: number }> {
+  if (input.x !== undefined && input.y !== undefined) {
+    return { x: input.x, y: input.y };
+  }
+  const metrics = await debuggerSendCommand<
+    Record<string, never>,
+    { cssVisualViewport?: { clientWidth?: number; clientHeight?: number } }
+  >(session.target, "Page.getLayoutMetrics", {}).catch(
+    (): { cssVisualViewport?: { clientWidth?: number; clientHeight?: number } } =>
+      ({}),
+  );
+  return {
+    x: input.x ?? Math.round((metrics.cssVisualViewport?.clientWidth ?? 0) / 2),
+    y: input.y ?? Math.round((metrics.cssVisualViewport?.clientHeight ?? 0) / 2),
+  };
+}
+
+export async function enableProxyDebugger(): Promise<DebuggerProxyStatus> {
+  await ensureProxyStateLoaded();
+  proxyEnabled = true;
+  await saveProxyState();
+  proxyLog("proxy.enable.start", {
+    ruleCount: proxyRules.size,
+    rules: currentProxyRules().map(summarizeProxyRule),
+  });
+  const session = await ensureDebuggerSession();
+  await ensureNetworkEnabled(session);
+  await applyFetchInterception(session);
+  const status = proxyStatus();
+  proxyLog("proxy.enable.done", { status });
+  return status;
+}
+
+export async function disableProxyDebugger(): Promise<DebuggerProxyStatus> {
+  await ensureProxyStateLoaded();
+  proxyEnabled = false;
+  await saveProxyState();
+  if (activeSession?.attached && activeSession.fetchEnabled) {
+    for (const target of allDebuggerTargets(activeSession)) {
+      await debuggerSendCommand(target, "Fetch.disable", {}).catch((error) => {
+        proxyLog(
+          "fetch.disable.target.fail",
+          { target: summarizeDebuggee(target), error: errorMessage(error) },
+          "warn",
+        );
+      });
+    }
+    activeSession.fetchEnabled = false;
+  }
+  const status = proxyStatus();
+  proxyLog("proxy.disable", { status });
+  return status;
+}
+
+export async function listProxyRules(): Promise<DebuggerProxyListResult> {
+  await ensureProxyStateLoaded();
+  return {
+    status: proxyStatus(),
+    rules: currentProxyRules(),
+  };
+}
+
+export async function upsertProxyRule(
+  input: DebuggerProxyRuleInput,
+): Promise<DebuggerProxyRuleMutationResult> {
+  await ensureProxyStateLoaded();
+  const now = new Date().toISOString();
+  const existing = input.id ? proxyRules.get(input.id) : undefined;
+  const id = input.id?.trim() || `proxy-${Date.now().toString(36)}`;
+  const matcher = normalizeProxyMatcherFields({ ...existing, ...input });
+  const rule: DebuggerProxyRule = {
+    ...existing,
+    ...input,
+    urlPattern: matcher.urlPattern,
+    urlContains: matcher.urlContains,
+    regexFilter: matcher.regexFilter,
+    id,
+    enabled: input.enabled ?? existing?.enabled ?? true,
+    priority: input.priority ?? existing?.priority ?? 1,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    hitCount: existing?.hitCount ?? 0,
+    lastHitAt: existing?.lastHitAt,
+  };
+
+  clearExplicitProxyFields(rule, input);
+
+  proxyRules.set(id, rule);
+  proxyEnabled = true;
+  await saveProxyState();
+  proxyLog("proxy.rule.upsert", {
+    rule: summarizeProxyRule(rule),
+    matcher,
+    inputId: input.id,
+  });
+  const session = await ensureDebuggerSession();
+  await ensureNetworkEnabled(session);
+  await applyFetchInterception(session);
+
+  const result = {
+    status: proxyStatus(),
+    rule,
+    rules: currentProxyRules(),
+  };
+  proxyLog("proxy.rule.upsert.done", { status: result.status });
+  return result;
+}
+
+function clearExplicitProxyFields(
+  rule: DebuggerProxyRule,
+  input: DebuggerProxyRuleInput,
+): void {
+  if (Object.prototype.hasOwnProperty.call(input, "requestHeaders")) {
+    rule.requestHeaders = input.requestHeaders;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "responseHeaders")) {
+    rule.responseHeaders = input.responseHeaders;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "responseBody")) {
+    rule.responseBody = input.responseBody;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "responseBodyBase64")) {
+    rule.responseBodyBase64 = input.responseBodyBase64;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "statusCode")) {
+    rule.statusCode = input.statusCode;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "contentType")) {
+    rule.contentType = input.contentType;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "responsePhrase")) {
+    rule.responsePhrase = input.responsePhrase;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "mockStage")) {
+    rule.mockStage = input.mockStage;
+  }
+}
+
+export async function removeProxyRule(
+  input: DebuggerProxyRemoveRuleInput,
+): Promise<DebuggerProxyRuleMutationResult> {
+  await ensureProxyStateLoaded();
+  proxyRules.delete(input.id);
+  await saveProxyState();
+  if (activeSession?.attached) {
+    await applyFetchInterception(activeSession);
+  }
+
+  return {
+    status: proxyStatus(),
+    rules: currentProxyRules(),
+  };
+}
+
+export async function clearProxyRules(): Promise<DebuggerProxyRuleMutationResult> {
+  await ensureProxyStateLoaded();
+  proxyRules.clear();
+  await saveProxyState();
+  if (activeSession?.attached) {
+    await applyFetchInterception(activeSession);
+  }
+
+  return {
+    status: proxyStatus(),
+    rules: [],
+  };
+}
+
+export async function restoreProxyDebuggerForTab(
+  tabId?: number,
+): Promise<DebuggerProxyStatus | undefined> {
+  await ensureProxyStateLoaded();
+  if (!proxyEnabled || proxyRules.size === 0) {
+    proxyLog("proxy.restore.skip", {
+      tabId,
+      proxyEnabled,
+      ruleCount: proxyRules.size,
+    });
+    return undefined;
+  }
+
+  proxyLog("proxy.restore.start", {
+    tabId,
+    hadSession: Boolean(activeSession),
+    wasAttached: activeSession?.attached,
+  });
+
+  if (activeSession && !activeSession.attached) {
+    clearChildDebuggerSessions();
+    activeSession = null;
+  }
+
+  try {
+    const session = await ensureDebuggerSessionForTab(tabId, false);
+    await ensureNetworkEnabled(session);
+    await applyFetchInterception(session);
+    const status = proxyStatus();
+    proxyLog("proxy.restore.done", { tabId, status });
+    return status;
+  } catch (error) {
+    proxyLog(
+      "proxy.restore.fail",
+      { tabId, error: errorMessage(error) },
+      "error",
+    );
+    throw error;
+  }
+}
+
+export function listProxyHits(
+  input: DebuggerProxyListHitsInput,
+): DebuggerProxyListHitsResult {
+  const filtered = input.ruleId
+    ? proxyHits.filter((hit) => hit.ruleId === input.ruleId)
+    : proxyHits;
+  const limit = input.limit ?? 100;
+  const hits = filtered.slice(-limit).reverse();
+
+  return {
+    total: filtered.length,
+    returned: hits.length,
+    hits,
+  };
+}
+
+export async function listConsoleMessages(
+  input: BrowserConsoleMessagesInput,
+): Promise<BrowserConsoleMessagesResult> {
+  const session = await ensureDebuggerSession();
+  await ensureConsoleEnabled(session);
+
+  const minLevel = input.level ?? "info";
+  const limit = input.limit ?? 100;
+  const filtered = session.consoleMessages
+    .filter(
+      (message) => input.all || message.timestampMs >= session.pageStartedAt,
+    )
+    .filter(
+      (message) =>
+        consoleLevelWeight(message.level) <= consoleLevelWeight(minLevel),
+    );
+  const messages = filtered
+    .slice(-limit)
+    .map(({ timestampMs: _timestampMs, ...message }) => message)
+    .reverse();
+
+  return {
+    attached: session.attached,
+    tabId: session.tabId,
+    total: filtered.length,
+    returned: messages.length,
+    messages,
+  };
+}
+
+export async function startNetworkDebugger(
+  input: DebuggerNetworkStartInput,
+): Promise<DebuggerNetworkStatus> {
+  const session = await ensureDebuggerSession();
+  const maxEntries = input.maxEntries ?? DEFAULT_MAX_NETWORK_ENTRIES;
+  const preserveLog = input.preserveLog ?? false;
+  session.maxEntries = maxEntries;
+  session.preservedLog = preserveLog;
+  if (!session.networkEnabled && !preserveLog) {
+    clearNetworkRequests();
+  }
+
+  if (!session.networkEnabled) {
+    session.observationSessionId = `network-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    session.observationStartedAt = new Date().toISOString();
+  }
+
+  await debuggerSendCommand(session.target, "Network.enable", {});
+  session.networkEnabled = true;
+
+  return networkStatus();
+}
+
+export async function stopNetworkDebugger(): Promise<DebuggerNetworkStatus> {
+  const session = requireNetworkSession();
+  if (session.networkEnabled) {
+    await debuggerSendCommand(session.target, "Network.disable", {});
+    session.networkEnabled = false;
+  }
+  return networkStatus();
+}
+
+export function clearNetworkDebugger(): DebuggerNetworkStatus {
+  clearNetworkRequests();
+  return networkStatus();
+}
+
+export function listNetworkRequests(
+  input: DebuggerNetworkListInput,
+): DebuggerNetworkListResult {
+  const digestOnly = input.digestOnly === true;
+  if (!activeSession) {
+    const page = paginateCollection([], input, {
+      kind: "network",
+      sourceKey: "detached",
+      defaultLimit: 50,
+      maxLimit: 100,
+    });
+    return {
+      attached: false,
+      digestOnly,
+      total: 0,
+      returned: 0,
+      requests: [],
+      activityDigest: buildNetworkActivityDigest([]),
+      pagination: normalizeNetworkResultPagination(page.pagination, digestOnly),
+      observationSessionId: undefined,
+      observationStartedAt: undefined,
+    };
+  }
+
+  const filteredRequests = activeSession.requestOrder
+    .map((requestId) => activeSession?.requests.get(requestId))
+    .filter((request): request is NetworkRequestRecord => Boolean(request))
+    .filter((request) => matchesNetworkFilter(request, input))
+    .reverse()
+    .map(toNetworkSummary);
+  const page = paginateCollection(filteredRequests, input, {
+    kind: "network",
+    sourceKey: JSON.stringify({
+      tabId: activeSession.tabId,
+      urlContains: input.urlContains ?? null,
+      method: input.method?.toLowerCase() ?? null,
+      resourceType: input.resourceType?.toLowerCase() ?? null,
+      statusMin: input.statusMin ?? null,
+      statusMax: input.statusMax ?? null,
+    }),
+    defaultLimit: 50,
+    maxLimit: 100,
+  });
+
+  return {
+    attached: activeSession.attached,
+    tabId: activeSession.tabId,
+    digestOnly,
+    total: filteredRequests.length,
+    returned: digestOnly ? 0 : page.items.length,
+    requests: digestOnly ? [] : page.items,
+    activityDigest: buildNetworkActivityDigest(filteredRequests),
+    pagination: normalizeNetworkResultPagination(page.pagination, digestOnly),
+    observationSessionId: activeSession.observationSessionId,
+    observationStartedAt: activeSession.observationStartedAt,
+  };
+}
+
+export async function getNetworkRequest(
+  input: DebuggerNetworkGetInput,
+): Promise<DebuggerNetworkRequestDetail> {
+  const session = requireNetworkSession();
+  const record = session.requests.get(input.requestId);
+  if (!record) {
+    throw new Error(`Network request not found: ${input.requestId}`);
+  }
+
+  const detail: DebuggerNetworkRequestDetail = {
+    ...toNetworkSummary(record),
+    documentUrl: record.documentUrl,
+    requestHeaders: record.requestHeaders,
+    responseHeaders: record.responseHeaders,
+    requestPostData: record.requestPostData,
+    initiatorType: record.initiatorType,
+    remoteAddress: record.remoteAddress,
+  };
+
+  if (input.includeBody) {
+    detail.body = await getNetworkResponseBody({
+      requestId: input.requestId,
+    });
+  }
+
+  return detail;
+}
+
+export async function getNetworkResponseBody(
+  input: DebuggerNetworkBodyInput,
+): Promise<DebuggerNetworkResponseBody> {
+  const session = requireNetworkSession();
+  if (!session.requests.has(input.requestId)) {
+    throw new Error(`Network request not found: ${input.requestId}`);
+  }
+
+  const result = await debuggerSendCommand<
+    { requestId: string },
+    { body: string; base64Encoded: boolean }
+  >(session.target, "Network.getResponseBody", {
+    requestId: input.requestId,
+  });
+
+  const truncated = result.body.length > MAX_RESPONSE_BODY_CHARS;
+  return {
+    requestId: input.requestId,
+    body: truncated
+      ? result.body.slice(0, MAX_RESPONSE_BODY_CHARS)
+      : result.body,
+    base64Encoded: result.base64Encoded,
+    truncated,
+  };
+}
+
+export async function detachDebugger(
+  input: DebuggerDetachInput = {},
+): Promise<DebuggerDetachResult> {
+  const tabId = input.tabId ?? activeSession?.tabId;
+  if (!tabId) {
+    return { detached: false };
+  }
+
+  manualDebuggerDetachTabIds.add(tabId);
+  if (activeSession?.tabId === tabId && activeSession.attached) {
+    await debuggerDetach(activeSession.target).catch((error) => {
+      manualDebuggerDetachTabIds.delete(tabId);
+      throw error;
+    });
+  } else {
+    await debuggerDetach({ tabId }).catch(() => {
+      manualDebuggerDetachTabIds.delete(tabId);
+    });
+  }
+
+  if (activeSession?.tabId === tabId) {
+    clearChildDebuggerSessions();
+    activeSession = null;
+  }
+
+  return { detached: true, tabId };
+}
+
+function registerDebuggerListeners(): void {
+  if (debuggerListenersRegistered) {
+    return;
+  }
+
+  chrome.debugger.onEvent.addListener(handleDebuggerEvent);
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    const session = activeSession;
+    if (!session || !sourceMatchesSession(source, session)) {
+      return;
+    }
+    proxyLog("debugger.detach", {
+      reason,
+      source: summarizeDebuggee(source),
+      tabId: session.tabId,
+    });
+    clearChildDebuggerSessions();
+    session.attached = false;
+    session.networkEnabled = false;
+    session.fetchEnabled = false;
+    session.oopifAutoAttachEnabled = false;
+    if (shouldRespectManualDebuggerDetach(session.tabId, reason)) {
+      void stopProxyAfterManualDebuggerDetach(session.tabId, reason);
+      return;
+    }
+    if (proxyEnabled && proxyRules.size > 0) {
+      void tryImmediateProxyReattach(session.tabId, reason);
+      requestProxyRestore(session.tabId, `detach.${reason}`);
+    }
+  });
+  debuggerListenersRegistered = true;
+}
+
+function shouldRespectManualDebuggerDetach(tabId: number, reason: string): boolean {
+  const wasManualDetach = manualDebuggerDetachTabIds.delete(tabId);
+  return reason === "canceled_by_user" || wasManualDetach;
+}
+
+async function stopProxyAfterManualDebuggerDetach(
+  tabId: number,
+  reason: string,
+): Promise<void> {
+  proxyEnabled = false;
+  proxyRestoreLoopGeneration += 1;
+  clearChildDebuggerSessions();
+  await saveProxyState();
+  scheduleProxyStateBroadcast();
+  proxyLog("proxy.stopAfterManualDetach", { tabId, reason });
+}
+
+const PROXY_RESTORE_ATTEMPTS = 50;
+const PROXY_RESTORE_INTERVAL_MS = 25;
+
+async function tryImmediateProxyReattach(
+  tabId: number,
+  reason: string,
+): Promise<void> {
+  await ensureProxyStateLoaded();
+  if (!proxyEnabled || proxyRules.size === 0) {
+    return;
+  }
+
+  try {
+    proxyLog("proxy.reattach.immediate", { tabId, reason });
+    if (activeSession && activeSession.tabId === tabId && !activeSession.attached) {
+      clearChildDebuggerSessions();
+    }
+    const session = await ensureDebuggerSessionForTab(tabId, false);
+    await ensureNetworkEnabled(session);
+    await applyFetchInterception(session);
+    proxyLog("proxy.reattach.immediate.done", {
+      tabId,
+      attached: activeSession?.attached,
+      fetchEnabled: activeSession?.fetchEnabled,
+    });
+  } catch (error) {
+    proxyLog(
+      "proxy.reattach.immediate.fail",
+      { tabId, reason, error: errorMessage(error) },
+      "warn",
+    );
+  }
+}
+
+export function requestProxyRestore(tabId: number, reason: string): void {
+  void ensureProxyStateLoaded().then(() => {
+    if (!proxyEnabled || proxyRules.size === 0) {
+      return;
+    }
+    const generation = ++proxyRestoreLoopGeneration;
+    proxyLog("proxy.restore.loop.start", { tabId, reason, generation });
+    void runProxyRestoreLoop(tabId, generation, reason);
+  });
+}
+
+async function runProxyRestoreLoop(
+  tabId: number,
+  generation: number,
+  reason: string,
+): Promise<void> {
+  proxyLog("proxy.restore.start", { tabId, reason, generation });
+
+  for (let attempt = 0; attempt < PROXY_RESTORE_ATTEMPTS; attempt += 1) {
+    if (generation !== proxyRestoreLoopGeneration) {
+      return;
+    }
+
+    if (attempt > 0) {
+      await delayMs(PROXY_RESTORE_INTERVAL_MS);
+    }
+
+    try {
+      const tab = await getTab(tabId);
+      const tabUrl = tab?.url ?? tab?.pendingUrl;
+      if (!tab?.id || !isTabUrlScriptable(tabUrl)) {
+        continue;
+      }
+
+      if (activeSession?.tabId === tabId && !activeSession.attached) {
+        clearChildDebuggerSessions();
+      }
+
+      const session = await ensureDebuggerSessionForTab(tabId, false);
+      await ensureNetworkEnabled(session);
+      await applyFetchInterception(session);
+
+      if (activeSession?.attached && activeSession.fetchEnabled) {
+        proxyLog("proxy.restore.done", {
+          tabId,
+          reason,
+          attempt,
+          generation,
+        });
+        return;
+      }
+    } catch (error) {
+      proxyLog(
+        "proxy.restore.loop.attempt.fail",
+        {
+          tabId,
+          reason,
+          attempt,
+          error: errorMessage(error),
+        },
+        "warn",
+      );
+    }
+  }
+
+  proxyLog(
+    "proxy.restore.loop.exhausted",
+    { tabId, reason, generation },
+    "warn",
+  );
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function scheduleProxyStateBroadcast(): void {
+  if (proxyStateBroadcastTimer !== null) {
+    clearTimeout(proxyStateBroadcastTimer);
+  }
+  proxyStateBroadcastTimer = setTimeout(() => {
+    proxyStateBroadcastTimer = null;
+    broadcastProxyStateChanged();
+  }, 80);
+}
+
+function broadcastProxyStateChanged(): void {
+  void persistProxyHits();
+  void saveProxyState();
+  sendRuntimeEvent(
+    makeEvent("background", MESSAGE_TYPES.DEBUGGER_PROXY_STATE_CHANGED, {
+      status: proxyStatus(),
+      rules: currentProxyRules(),
+      hits: proxyHits.slice(-50).reverse(),
+    }),
+  );
+}
+
+function handleDebuggerEvent(
+  source: DebuggerTarget,
+  method: string,
+  params?: object,
+): void {
+  if (!params) {
+    return;
+  }
+
+  if (method === "Target.attachedToTarget") {
+    if (activeSession && sourceMatchesSession(source, activeSession)) {
+      void handleAttachedToTarget(
+        activeSession,
+        source,
+        params as TargetAttachedToTargetEvent,
+      );
+    }
+    return;
+  }
+
+  if (method === "Target.detachedFromTarget") {
+    handleDetachedFromTarget(params as TargetDetachedFromTargetEvent);
+    return;
+  }
+
+  if (method === "Fetch.requestPaused") {
+    void handleFetchPauseEvent(source, params as FetchRequestPausedEvent).catch(
+      (error) => {
+        proxyLog("fetch.pause.unhandled", {
+          error: errorMessage(error),
+        }, "warn");
+      },
+    );
+    return;
+  }
+
+  if (!activeSession || !sourceMatchesSession(source, activeSession)) {
+    return;
+  }
+
+  switch (method) {
+    case "Network.requestWillBeSent":
+      handleRequestWillBeSent(params as NetworkRequestWillBeSentEvent);
+      break;
+    case "Network.responseReceived":
+      handleResponseReceived(params as NetworkResponseReceivedEvent);
+      break;
+    case "Network.loadingFinished":
+      handleLoadingFinished(params as NetworkLoadingFinishedEvent);
+      break;
+    case "Network.loadingFailed":
+      handleLoadingFailed(params as NetworkLoadingFailedEvent);
+      break;
+    case "Runtime.consoleAPICalled":
+      handleRuntimeConsoleAPICalled(params as RuntimeConsoleApiCalledEvent);
+      break;
+    case "Log.entryAdded":
+      handleLogEntryAdded(params as LogEntryAddedEvent);
+      break;
+    default:
+      break;
+  }
+}
+
+async function handleFetchPauseEvent(
+  source: DebuggerTarget,
+  event: FetchRequestPausedEvent,
+): Promise<void> {
+  const session = activeSession;
+  const stage = isResponsePausedEvent(event) ? "response" : "request";
+
+  if (session && !session.attached) {
+    proxyLog("fetch.pause.detached", {
+      ...summarizeFetchPause(event, stage),
+      source: summarizeDebuggee(source),
+      tabId: session.tabId,
+    });
+    await continuePausedRequestOnSource(source, event.requestId).catch((error) => {
+      proxyLog(
+        "fetch.pause.continueAfterDetach.fail",
+        { requestId: event.requestId, error: errorMessage(error) },
+        "warn",
+      );
+    });
+    return;
+  }
+  if (!session || !sourceMatchesSession(source, session)) {
+    proxyLog("fetch.pause.unmatchedDebuggee", {
+      ...summarizeFetchPause(event, stage),
+      source: summarizeDebuggee(source),
+      sessionTabId: session?.tabId,
+      sessionTargetId: session?.target.targetId,
+    });
+    await continuePausedRequestOnSource(source, event.requestId).catch((error) => {
+      proxyLog(
+        "fetch.pause.unmatchedDebuggee.continue.fail",
+        { requestId: event.requestId, error: errorMessage(error) },
+        "warn",
+      );
+    });
+    return;
+  }
+
+  await handleFetchRequestPaused(source, event);
+}
+
+async function handleAttachedToTarget(
+  session: NetworkSession,
+  source: DebuggerTarget,
+  event: TargetAttachedToTargetEvent,
+): Promise<void> {
+  if (!event.sessionId) {
+    return;
+  }
+  if (event.targetInfo?.type !== "iframe") {
+    return;
+  }
+  if (
+    !childDebuggerSessions.has(event.sessionId) &&
+    childDebuggerSessions.size >= MAX_CHILD_DEBUGGER_SESSIONS
+  ) {
+    await debuggerSendCommand(source, "Target.detachFromTarget", {
+      sessionId: event.sessionId,
+    }).catch(() => undefined);
+    proxyLog(
+      "oopif.session.limit",
+      { limit: MAX_CHILD_DEBUGGER_SESSIONS },
+      "warn",
+    );
+    return;
+  }
+
+  const childTarget: DebuggerTarget = {
+    ...source,
+    sessionId: event.sessionId,
+  };
+  childDebuggerSessions.set(event.sessionId, {
+    target: childTarget,
+  });
+  childRouteRefreshGeneration += 1;
+  try {
+    await enableOopifAutoAttachOnTarget(childTarget);
+    await syncChildSessionState(session, childTarget);
+    await refreshChildDebuggerRoutes(session);
+  } catch (error) {
+    proxyLog("child.session.sync.fail", {
+      sessionId: event.sessionId,
+      error: errorMessage(error),
+    }, "warn");
+  }
+}
+
+function clearChildDebuggerSessions(): void {
+  childRouteRefreshGeneration += 1;
+  childDebuggerSessions.clear();
+  childDebuggerRoutes.clear();
+}
+
+async function ensureOopifAutoAttach(session: NetworkSession): Promise<void> {
+  if (session.oopifAutoAttachEnabled) {
+    return;
+  }
+  try {
+    await enableOopifAutoAttachOnTarget(session.target);
+    session.oopifAutoAttachEnabled = true;
+  } catch (error) {
+    proxyLog(
+      "oopif.autoAttach.unavailable",
+      { tabId: session.tabId, error: errorMessage(error) },
+      "warn",
+    );
+  }
+}
+
+async function enableOopifAutoAttachOnTarget(
+  target: DebuggerTarget,
+): Promise<void> {
+  await debuggerSendCommand(
+    target,
+    "Target.setAutoAttach",
+    createOopifAutoAttachParams(),
+  );
+}
+
+async function refreshChildDebuggerRoutes(
+  session: NetworkSession,
+): Promise<void> {
+  const generation = ++childRouteRefreshGeneration;
+  const [rootFrameTree, navigationFrames] = await Promise.all([
+    debuggerSendCommand<Record<string, never>, PageFrameTreeResult>(
+      session.target,
+      "Page.getFrameTree",
+      {},
+    ),
+    getAllNavigationFrames(session.tabId),
+  ]);
+  const frameRoutes = mapDebuggerFrameTree(
+    rootFrameTree.frameTree,
+    navigationFrames,
+  );
+  const resolvedRoutes = new Map<number, RoutedChildDebuggerSession>();
+  const ambiguousFrameIds = new Set<number>();
+
+  await Promise.all(
+    [...childDebuggerSessions.entries()].map(async ([sessionId, child]) => {
+      const childFrameTree = await debuggerSendCommand<
+        Record<string, never>,
+        PageFrameTreeResult
+      >(child.target, "Page.getFrameTree", {}).catch(() => undefined);
+      const cdpFrameId = childFrameTree?.frameTree.frame.id;
+      if (!cdpFrameId) {
+        return;
+      }
+      const route = frameRoutes.get(cdpFrameId);
+      if (!route || route.frameId === 0 || ambiguousFrameIds.has(route.frameId)) {
+        return;
+      }
+      if (resolvedRoutes.has(route.frameId)) {
+        resolvedRoutes.delete(route.frameId);
+        ambiguousFrameIds.add(route.frameId);
+        return;
+      }
+      resolvedRoutes.set(route.frameId, {
+        ...route,
+        sessionId,
+        target: child.target,
+      });
+    }),
+  );
+
+  if (generation !== childRouteRefreshGeneration || activeSession !== session) {
+    return;
+  }
+  childDebuggerRoutes.clear();
+  for (const [frameId, route] of resolvedRoutes) {
+    if (!ambiguousFrameIds.has(frameId)) {
+      childDebuggerRoutes.set(frameId, route);
+    }
+  }
+}
+
+function handleDetachedFromTarget(event: TargetDetachedFromTargetEvent): void {
+  if (!event.sessionId) {
+    return;
+  }
+  childDebuggerSessions.delete(event.sessionId);
+  childRouteRefreshGeneration += 1;
+  for (const [frameId, route] of childDebuggerRoutes) {
+    if (route.sessionId === event.sessionId) {
+      childDebuggerRoutes.delete(frameId);
+    }
+  }
+}
+
+async function ensureDebuggerSession(): Promise<NetworkSession> {
+  if (ensureSessionPromise) {
+    return ensureSessionPromise;
+  }
+
+  ensureSessionPromise = ensureDebuggerSessionForTab(undefined, true).finally(() => {
+    ensureSessionPromise = null;
+  });
+
+  return ensureSessionPromise;
+}
+
+async function ensureDebuggerSessionForTab(
+  tabId: number | undefined,
+  activateTarget: boolean,
+): Promise<NetworkSession> {
+  const tab = tabId === undefined ? await queryActiveTab() : await getTab(tabId);
+  if (!tab?.id) {
+    throw new Error("No active tab is available.");
+  }
+  const tabUrl = tab.url ?? getPendingTabUrl(tab);
+  if (!isTabUrlScriptable(tabUrl)) {
+    throw new Error(
+      `当前目标页不支持 CDP 请求代理 (${tabUrl ?? "unknown"}); 请切到 http(s) 或 file 页面后再启用 Fetch/代理。`,
+    );
+  }
+
+  registerDebuggerListeners();
+
+  if (activateTarget) {
+    await activateTabForDebugging(tab);
+  }
+  const resolvedTarget = await resolveDebuggerTarget(tab.id, tabUrl);
+
+  if (activeSession && activeSession.tabId !== tab.id) {
+    await debuggerDetach(activeSession.target).catch(() => undefined);
+    clearChildDebuggerSessions();
+    activeSession = null;
+  }
+
+  if (!activeSession) {
+    activeSession = {
+      tabId: tab.id,
+      target: resolvedTarget.target,
+      targetInfo: resolvedTarget.targetInfo,
+      attached: false,
+      networkEnabled: false,
+      fetchEnabled: false,
+      runtimeEnabled: false,
+      logEnabled: false,
+      oopifAutoAttachEnabled: false,
+      pageStartedAt: Date.now(),
+      maxEntries: DEFAULT_MAX_NETWORK_ENTRIES,
+      preservedLog: true,
+      observationSessionId: undefined,
+      observationStartedAt: undefined,
+      requests: new Map(),
+      requestOrder: [],
+      consoleMessages: [],
+    };
+  }
+
+  if (!activeSession.attached) {
+    proxyLog("debugger.attach.start", {
+      tabId: tab.id,
+      target: summarizeDebuggee(activeSession.target),
+    });
+    await attachDebuggerToTab(activeSession);
+    activeSession.attached = true;
+    proxyLog("debugger.attach.done", {
+      tabId: tab.id,
+      target: summarizeDebuggee(activeSession.target),
+    });
+  }
+
+  await ensureOopifAutoAttach(activeSession);
+
+  return activeSession;
+}
+
+async function attachDebuggerToTab(session: NetworkSession): Promise<void> {
+  const target: DebuggerTarget = topLevelDebuggerTarget(session.tabId);
+  try {
+    await debuggerAttach(target, PROTOCOL_VERSION);
+    session.target = target;
+    proxyLog("debugger.attach.target", {
+      tabId: session.tabId,
+      target: summarizeDebuggee(target),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    proxyLog(
+      "debugger.attach.target.fail",
+      { tabId: session.tabId, target: summarizeDebuggee(target), error: message },
+      "warn",
+    );
+    throw new Error(debuggerAttachFailureMessage(message));
+  }
+}
+
+function uniqueDebuggeeTargets(targets: DebuggerTarget[]): DebuggerTarget[] {
+  const seen = new Set<string>();
+  const unique: DebuggerTarget[] = [];
+
+  for (const target of targets) {
+    const key = `${target.tabId ?? ""}|${target.targetId ?? ""}|${target.extensionId ?? ""}|${target.sessionId ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(target);
+  }
+
+  return unique;
+}
+
+async function resolveDebuggerTarget(
+  tabId: number,
+  tabUrl: string | undefined,
+): Promise<{
+  target: DebuggerTarget;
+  targetInfo?: chrome.debugger.TargetInfo;
+}> {
+  const targets = await debuggerGetTargets().catch(() => []);
+  const pageTarget = selectPageTargetInfo(targets, tabId, tabUrl);
+
+  if (pageTarget) {
+    return {
+      target: topLevelDebuggerTarget(tabId),
+      targetInfo: pageTarget,
+    };
+  }
+
+  return {
+    target: topLevelDebuggerTarget(tabId),
+  };
+}
+
+function sameDebuggee(a: DebuggerTarget, b: DebuggerTarget): boolean {
+  return (
+    a.tabId === b.tabId &&
+    a.targetId === b.targetId &&
+    a.extensionId === b.extensionId &&
+    a.sessionId === b.sessionId
+  );
+}
+
+function sourceMatchesSession(
+  source: DebuggerTarget,
+  session: NetworkSession,
+): boolean {
+  if (source.sessionId && childDebuggerSessions.has(source.sessionId)) {
+    return true;
+  }
+
+  return (
+    source.tabId === session.tabId ||
+    (Boolean(session.target.targetId) &&
+      source.targetId === session.target.targetId)
+  );
+}
+
+async function syncChildSessionState(
+  session: NetworkSession,
+  target: DebuggerTarget,
+): Promise<void> {
+  if (session.networkEnabled) {
+    await debuggerSendCommand(target, "Network.enable", {}).catch(
+      () => undefined,
+    );
+  }
+  if (session.runtimeEnabled) {
+    await debuggerSendCommand(target, "Runtime.enable", {}).catch(
+      () => undefined,
+    );
+  }
+  if (session.logEnabled) {
+    await debuggerSendCommand(target, "Log.enable", {}).catch(() => undefined);
+  }
+  if (proxyEnabled) {
+    await applyFetchInterceptionToTarget(target, buildFetchPatterns()).catch(
+      () => undefined,
+    );
+  }
+}
+
+function allDebuggerTargets(session: NetworkSession): DebuggerTarget[] {
+  return uniqueDebuggeeTargets([
+    session.target,
+    ...[...childDebuggerSessions.values()].map((child) => child.target),
+  ]);
+}
+
+async function ensureNetworkEnabled(session: NetworkSession): Promise<void> {
+  if (session.networkEnabled) {
+    return;
+  }
+
+  for (const target of allDebuggerTargets(session)) {
+    await debuggerSendCommand(target, "Network.enable", {});
+  }
+  session.networkEnabled = true;
+}
+
+async function ensureConsoleEnabled(session: NetworkSession): Promise<void> {
+  if (!session.runtimeEnabled) {
+    for (const target of allDebuggerTargets(session)) {
+      await debuggerSendCommand(target, "Runtime.enable", {});
+    }
+    session.runtimeEnabled = true;
+  }
+  if (!session.logEnabled) {
+    for (const target of allDebuggerTargets(session)) {
+      await debuggerSendCommand(target, "Log.enable", {}).catch(
+        () => undefined,
+      );
+    }
+    session.logEnabled = true;
+  }
+}
+
+async function applyFetchInterception(session: NetworkSession): Promise<void> {
+  const patterns = buildFetchPatterns();
+
+  for (const target of allDebuggerTargets(session)) {
+    await applyFetchInterceptionToTarget(target, patterns);
+  }
+  session.fetchEnabled = proxyEnabled && patterns.length > 0;
+  proxyLog("fetch.enable", {
+    tabId: session.tabId,
+    proxyEnabled,
+    patternCount: patterns.length,
+    patterns,
+    fetchEnabled: session.fetchEnabled,
+    targets: allDebuggerTargets(session).map(summarizeDebuggee),
+  });
+}
+
+async function applyFetchInterceptionToTarget(
+  target: DebuggerTarget,
+  patterns: Array<{
+    urlPattern: string;
+    resourceType?: string;
+    requestStage: "Request" | "Response";
+  }>,
+): Promise<void> {
+  if (!proxyEnabled || patterns.length === 0) {
+    await debuggerSendCommand(target, "Fetch.disable", {}).catch(() => undefined);
+    return;
+  }
+
+  await debuggerSendCommand(target, "Fetch.enable", {
+    patterns,
+  });
+  proxyLog("fetch.enable.target", {
+    target: summarizeDebuggee(target),
+    patternCount: patterns.length,
+  });
+}
+
+function buildFetchPatterns(): Array<{
+  urlPattern: string;
+  resourceType?: string;
+  requestStage: "Request" | "Response";
+}> {
+  const patterns: Array<{
+    urlPattern: string;
+    resourceType?: string;
+    requestStage: "Request" | "Response";
+  }> = [];
+  const seen = new Set<string>();
+
+  for (const rule of currentProxyRules()) {
+    if (!rule.enabled) {
+      continue;
+    }
+    const urlPattern = fetchUrlPatternForRule(rule);
+    for (const stage of fetchStagesForRule(rule)) {
+      const requestStage = stage === "request" ? "Request" : "Response";
+      const key = `${urlPattern}\n${requestStage}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      patterns.push({
+        urlPattern,
+        requestStage,
+      });
+    }
+  }
+
+  if (patterns.length === 0 && proxyRules.size > 0) {
+    proxyLog(
+      "fetch.patterns.empty",
+      {
+        ruleCount: proxyRules.size,
+        rules: currentProxyRules().map(summarizeProxyRule),
+        hint: "规则没有 request/response 动作，CDP 不会暂停任何请求",
+      },
+      "warn",
+    );
+  }
+
+  return patterns;
+}
+
+function fetchUrlPatternForRule(rule: DebuggerProxyRule): string {
+  if (rule.urlPattern?.trim()) {
+    return fetchUrlPatternFromMatcher(rule.urlPattern.trim(), "pattern");
+  }
+  if (rule.urlContains?.trim()) {
+    return fetchUrlPatternFromMatcher(rule.urlContains.trim(), "contains");
+  }
+  if (rule.regexFilter?.trim()) {
+    return "*";
+  }
+  return "*";
+}
+
+function fetchUrlPatternFromMatcher(
+  matcher: string,
+  source: "pattern" | "contains",
+): string {
+  const withoutQuery = matcher.split(/[?#]/, 1)[0]?.trim() ?? "";
+  const base = withoutQuery || matcher.trim();
+  if (!base) {
+    return "*";
+  }
+  if (source === "contains") {
+    return `*${base}*`;
+  }
+  if (base !== matcher.trim() && !base.endsWith("*")) {
+    return `${base}*`;
+  }
+  return base;
+}
+
+function fetchStagesForRule(rule: DebuggerProxyRule): DebuggerProxyStage[] {
+  const stages = new Set<DebuggerProxyStage>();
+  if (rule.requestHeaders?.length || shouldFulfillAtRequest(rule)) {
+    stages.add("request");
+  }
+  if (hasResponseAction(rule)) {
+    stages.add("response");
+  }
+  return Array.from(stages);
+}
+
+function shouldFulfillAtRequest(rule: DebuggerProxyRule): boolean {
+  return (
+    rule.mockStage === "request" &&
+    (rule.responseBody !== undefined ||
+      rule.responseBodyBase64 !== undefined ||
+      rule.statusCode !== undefined ||
+      Boolean(rule.responseHeaders?.length))
+  );
+}
+
+function hasResponseAction(rule: DebuggerProxyRule): boolean {
+  return (
+    rule.mockStage !== "request" &&
+    (rule.responseBody !== undefined ||
+      rule.responseBodyBase64 !== undefined ||
+      rule.statusCode !== undefined ||
+      Boolean(rule.responseHeaders?.length) ||
+      Boolean(rule.contentType))
+  );
+}
+
+async function handleFetchRequestPaused(
+  source: DebuggerTarget,
+  event: FetchRequestPausedEvent,
+): Promise<void> {
+  const session = activeSession;
+  const eventSession = session
+    ? ({
+        ...session,
+        target: source,
+      } satisfies NetworkSession)
+    : undefined;
+  if (!eventSession) {
+    proxyLog("fetch.handle.noSession", summarizeFetchPause(event, "request"));
+    await continuePausedRequestOnSource(source, event.requestId).catch((error) => {
+      proxyLog(
+        "fetch.continue.noSession.fail",
+        { requestId: event.requestId, error: errorMessage(error) },
+        "warn",
+      );
+    });
+    return;
+  }
+
+  const stage = isResponsePausedEvent(event) ? "response" : "request";
+  const allRules = Array.from(proxyRules.values());
+  const rules = allRules
+    .filter((rule) => matchesProxyRule(rule, event, stage))
+    .sort(compareProxyRules);
+  const ruleDiagnostics = allRules.map((rule) => ({
+    ...summarizeProxyRule(rule),
+    match: rules.some((matched) => matched.id === rule.id),
+    mismatch: explainProxyRuleMismatch(rule, event, stage),
+  }));
+
+  proxyLog("fetch.pause", {
+    ...summarizeFetchPause(event, stage),
+    source: summarizeDebuggee(source),
+    sessionAttached: session?.attached,
+    sessionFetchEnabled: session?.fetchEnabled,
+    matchedRuleIds: rules.map((rule) => rule.id),
+    ruleDiagnostics,
+  });
+
+  const recordMiss = rules.length === 0 && proxyRules.size > 0;
+  const willRecordMiss = recordMiss && shouldRecordProxyMiss(event);
+  if (recordMiss) {
+    proxyLog("fetch.match.none", {
+      url: event.request.url,
+      stage,
+      willRecordMiss,
+      missFilterReason: willRecordMiss
+        ? undefined
+        : describeProxyMissFilterReason(event),
+    });
+  }
+  if (willRecordMiss) {
+    recordProxyMiss(event, stage);
+  }
+
+  if (!session?.attached) {
+    const matchedRule = rules[0];
+    if (matchedRule) {
+      recordProxyHit(
+        matchedRule,
+        event,
+        stage,
+        "fail",
+        "调试器未附着，无法改写请求",
+      );
+    }
+    await continueFetchRequest(eventSession, event.requestId, source).catch((error) => {
+      proxyLog(
+        "fetch.continue.afterUnattached.fail",
+        { requestId: event.requestId, error: errorMessage(error) },
+        "warn",
+      );
+    });
+    return;
+  }
+
+  try {
+    if (stage === "request") {
+      await handleRequestStagePaused(eventSession, source, event, rules);
+      return;
+    }
+    await handleResponseStagePaused(eventSession, source, event, rules);
+  } catch (error) {
+    for (const rule of rules) {
+      recordProxyHit(rule, event, stage, "fail", errorMessage(error));
+    }
+    await continuePausedRequestOnSource(source, event.requestId).catch(
+      (continueError) => {
+        proxyLog(
+          "fetch.continue.afterHandlerError.fail",
+          {
+            requestId: event.requestId,
+            error: errorMessage(continueError),
+          },
+          "warn",
+        );
+      },
+    );
+    proxyLog(
+      "fetch.handle.error",
+      { requestId: event.requestId, error: errorMessage(error) },
+      "error",
+    );
+  }
+}
+
+async function handleRequestStagePaused(
+  session: NetworkSession,
+  source: DebuggerTarget,
+  event: FetchRequestPausedEvent,
+  rules: DebuggerProxyRule[],
+): Promise<void> {
+  const fulfillRule = rules.find(shouldFulfillAtRequest);
+  if (fulfillRule) {
+    proxyLog("fetch.request.fulfill", {
+      ruleId: fulfillRule.id,
+      url: event.request.url,
+    });
+    await fulfillFetchRequest(session, event, fulfillRule, "request", source);
+    recordProxyHit(fulfillRule, event, "request", "fulfill");
+    return;
+  }
+
+  const headerRules = rules.filter((rule) => rule.requestHeaders?.length);
+  if (headerRules.length === 0) {
+    proxyLog("fetch.request.continue", {
+      requestId: event.requestId,
+      url: event.request.url,
+      matchedWithoutAction: rules.map((rule) => rule.id),
+    });
+    await continueFetchRequest(session, event.requestId, source);
+    return;
+  }
+
+  const requestHeaders = headerRules.reduce(
+    (headers, rule) =>
+      applyHeaderModifications(headers, rule.requestHeaders ?? []),
+    toHeaderEntries(event.request.headers),
+  );
+  await sendFetchCommand(
+    session,
+    "Fetch.continueRequest",
+    {
+      requestId: event.requestId,
+      headers: requestHeaders,
+    },
+    source,
+  );
+
+  for (const rule of headerRules) {
+    recordProxyHit(rule, event, "request", "continue");
+  }
+}
+
+async function handleResponseStagePaused(
+  session: NetworkSession,
+  source: DebuggerTarget,
+  event: FetchRequestPausedEvent,
+  rules: DebuggerProxyRule[],
+): Promise<void> {
+  const responseRules = rules.filter(hasResponseAction);
+  if (responseRules.length === 0) {
+    proxyLog("fetch.response.continue", {
+      requestId: event.requestId,
+      url: event.request.url,
+      matchedWithoutResponseAction: rules.map((rule) => rule.id),
+    });
+    await continueFetchRequest(session, event.requestId, source);
+    return;
+  }
+
+  const bodyRule = responseRules.find(
+    (rule) =>
+      rule.responseBody !== undefined || rule.responseBodyBase64 !== undefined,
+  );
+  const statusRule = responseRules.find((rule) => rule.statusCode !== undefined);
+  const contentTypeRule = responseRules.find((rule) => rule.contentType);
+  let headers = sanitizeHeaderEntries(event.responseHeaders ?? []);
+
+  for (const rule of responseRules) {
+    headers = applyHeaderModifications(headers, rule.responseHeaders ?? []);
+  }
+
+  if (bodyRule) {
+    headers = prepareHeadersForBodyReplacement(
+      headers,
+      bodyRule,
+      contentTypeRule?.contentType,
+    );
+  } else if (contentTypeRule?.contentType) {
+    headers = applyHeaderModifications(headers, [
+      {
+        header: "content-type",
+        operation: "set",
+        value: contentTypeRule.contentType,
+      },
+    ]);
+  }
+
+  const params: Record<string, unknown> = {
+    requestId: event.requestId,
+    responseCode: statusRule?.statusCode ?? event.responseStatusCode ?? 200,
+    responseHeaders: sanitizeHeaderEntries(headers),
+  };
+  const responsePhrase = statusRule?.responsePhrase ?? event.responseStatusText;
+  if (responsePhrase) {
+    params.responsePhrase = responsePhrase;
+  }
+
+  if (bodyRule) {
+    params.body = responseBodyBase64(bodyRule);
+  }
+
+  proxyLog("fetch.response.fulfill", {
+    requestId: event.requestId,
+    url: event.request.url,
+    ruleIds: responseRules.map((rule) => rule.id),
+    statusCode: params.responseCode,
+    hasBody: Boolean(params.body),
+  });
+  await sendFetchCommand(session, "Fetch.fulfillRequest", params, source);
+
+  for (const rule of responseRules) {
+    recordProxyHit(rule, event, "response", "fulfill");
+  }
+}
+
+async function continueFetchRequest(
+  session: NetworkSession,
+  requestId: string,
+  source?: DebuggerTarget,
+): Promise<void> {
+  await sendFetchCommand(
+    session,
+    "Fetch.continueRequest",
+    {
+      requestId,
+    },
+    source,
+  );
+}
+
+async function continuePausedRequestOnSource(
+  source: DebuggerTarget,
+  requestId: string,
+): Promise<void> {
+  await debuggerSendCommand(source, "Fetch.continueRequest", {
+    requestId,
+  });
+}
+
+async function fulfillFetchRequest(
+  session: NetworkSession,
+  event: FetchRequestPausedEvent,
+  rule: DebuggerProxyRule,
+  stage: DebuggerProxyStage,
+  source?: DebuggerTarget,
+): Promise<void> {
+  let headers = applyHeaderModifications([], rule.responseHeaders ?? []);
+  if (rule.contentType) {
+    headers = applyHeaderModifications(headers, [
+      {
+        header: "content-type",
+        operation: "set",
+        value: rule.contentType,
+      },
+    ]);
+  }
+  headers = prepareHeadersForBodyReplacement(headers, rule, rule.contentType);
+
+  const params: Record<string, unknown> = {
+    requestId: event.requestId,
+    responseCode:
+      rule.statusCode ?? (stage === "response" ? event.responseStatusCode : 200),
+    responseHeaders: sanitizeHeaderEntries(headers),
+    body: responseBodyBase64(rule),
+  };
+  const responsePhrase = rule.responsePhrase ?? event.responseStatusText;
+  if (responsePhrase) {
+    params.responsePhrase = responsePhrase;
+  }
+
+  await sendFetchCommand(session, "Fetch.fulfillRequest", params, source);
+}
+
+async function sendFetchCommand(
+  session: NetworkSession,
+  method: "Fetch.continueRequest" | "Fetch.fulfillRequest",
+  params: Record<string, unknown>,
+  preferredSource?: DebuggerTarget,
+): Promise<unknown> {
+  const errors: string[] = [];
+  const targets = preferredSource
+    ? [preferredSource]
+    : fetchCommandTargets(session);
+  for (const target of targets) {
+    try {
+      return await debuggerSendCommand(target, method, params);
+    } catch (error) {
+      errors.push(`${debuggeeLabel(target)}: ${errorMessage(error)}`);
+    }
+  }
+  const joined = errors.join(" | ");
+  if (
+    method === "Fetch.continueRequest" &&
+    isDebuggerDetachedError(joined)
+  ) {
+    proxyLog("fetch.command.skipDetached", {
+      method,
+      requestId: params.requestId,
+      errors,
+    }, "warn");
+    return undefined;
+  }
+  proxyLog(
+    "fetch.command.fail",
+    { method, requestId: params.requestId, errors },
+    "warn",
+  );
+  throw new Error(joined);
+}
+
+function fetchCommandTargets(session: NetworkSession): DebuggerTarget[] {
+  return uniqueDebuggeeTargets([
+    session.target,
+    ...[...childDebuggerSessions.values()].map((child) => child.target),
+    activeSession?.target,
+    session.targetInfo?.id ? { targetId: session.targetInfo.id } : undefined,
+    { tabId: session.tabId },
+  ].filter(isDebuggerTarget));
+}
+
+function isDebuggerTarget(target: DebuggerTarget | undefined): target is DebuggerTarget {
+  return Boolean(target?.tabId || target?.targetId || target?.extensionId);
+}
+
+function debuggeeLabel(target: DebuggerTarget): string {
+  const sessionSuffix = target.sessionId ? `, sessionId=${target.sessionId}` : "";
+  if (target.targetId) {
+    return `targetId=${target.targetId}${sessionSuffix}`;
+  }
+  if (target.tabId) {
+    return `tabId=${target.tabId}${sessionSuffix}`;
+  }
+  return `extensionId=${target.extensionId ?? "unknown"}${sessionSuffix}`;
+}
+
+function currentProxyRules(): DebuggerProxyRule[] {
+  return Array.from(proxyRules.values()).sort(compareProxyRules);
+}
+
+function compareProxyRules(a: DebuggerProxyRule, b: DebuggerProxyRule): number {
+  const priorityDelta = (b.priority ?? 1) - (a.priority ?? 1);
+  return priorityDelta || a.createdAt.localeCompare(b.createdAt);
+}
+
+function proxyStatus(): DebuggerProxyStatus {
+  return {
+    attached: activeSession?.attached ?? false,
+    fetchEnabled: activeSession?.fetchEnabled ?? false,
+    tabId: activeSession?.tabId,
+    protocolVersion: PROTOCOL_VERSION,
+    ruleCount: proxyRules.size,
+    hitCount: proxyHits.length,
+  };
+}
+
+async function ensureProxyStateLoaded(): Promise<void> {
+  if (proxyStateLoaded) {
+    return;
+  }
+
+  const stored = await readSessionStorage<StoredProxyState>(
+    PROXY_STATE_STORAGE_KEY,
+  );
+  proxyRules.clear();
+  for (const rule of stored?.rules ?? []) {
+    proxyRules.set(rule.id, migrateStoredProxyRule(rule));
+  }
+  proxyEnabled = Boolean(stored?.enabled);
+  const storedHits = await readSessionStorage<DebuggerProxyHit[]>(
+    PROXY_HITS_STORAGE_KEY,
+  );
+  if (storedHits?.length) {
+    proxyHits = storedHits.slice(-MAX_PROXY_HITS);
+  }
+  proxyStateLoaded = true;
+  proxyLog("proxy.state.loaded", {
+    proxyEnabled,
+    ruleCount: proxyRules.size,
+    rules: currentProxyRules().map(summarizeProxyRule),
+    hitCount: proxyHits.length,
+  });
+}
+
+async function saveProxyState(): Promise<void> {
+  await writeSessionStorage(PROXY_STATE_STORAGE_KEY, {
+    enabled: proxyEnabled,
+    rules: currentProxyRules(),
+  } satisfies StoredProxyState);
+}
+
+function readSessionStorage<T>(key: string): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    chrome.storage.session.get(key, (items) => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        resolve(undefined);
+        return;
+      }
+      resolve(items[key] as T | undefined);
+    });
+  });
+}
+
+function writeSessionStorage(key: string, value: unknown): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.session.set({ [key]: value }, () => {
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+}
+
+function isResponsePausedEvent(event: FetchRequestPausedEvent): boolean {
+  return (
+    event.responseStatusCode !== undefined ||
+    event.responseErrorReason !== undefined
+  );
+}
+
+function explainProxyRuleMismatch(
+  rule: DebuggerProxyRule,
+  event: FetchRequestPausedEvent,
+  stage: DebuggerProxyStage,
+): string | undefined {
+  if (!rule.enabled) {
+    return "rule_disabled";
+  }
+  const stages = fetchStagesForRule(rule);
+  if (!stages.includes(stage)) {
+    return `stage_mismatch:rule_stages=${stages.join(",")},pause_stage=${stage}`;
+  }
+  if (
+    rule.method &&
+    rule.method.toLowerCase() !== event.request.method.toLowerCase()
+  ) {
+    return `method_mismatch:rule=${rule.method},request=${event.request.method}`;
+  }
+  if (
+    rule.resourceType &&
+    rule.resourceType.toLowerCase() !== event.resourceType?.toLowerCase()
+  ) {
+    return `resourceType_mismatch:rule=${rule.resourceType},request=${event.resourceType ?? "unknown"}`;
+  }
+  if (
+    rule.urlContains &&
+    !urlContainsMatches(rule.urlContains, event.request.url)
+  ) {
+    return `urlContains_mismatch:needle=${rule.urlContains}`;
+  }
+  if (rule.regexFilter) {
+    try {
+      if (!new RegExp(rule.regexFilter).test(event.request.url)) {
+        return `regex_mismatch:${rule.regexFilter}`;
+      }
+    } catch {
+      return `regex_invalid:${rule.regexFilter}`;
+    }
+  }
+  if (rule.urlPattern && !urlPatternMatches(rule.urlPattern, event.request.url)) {
+    return `urlPattern_mismatch:pattern=${rule.urlPattern}`;
+  }
+  return undefined;
+}
+
+function describeProxyMissFilterReason(
+  event: FetchRequestPausedEvent,
+): string {
+  if (event.resourceType === "Document") {
+    return "skip_document";
+  }
+  const url = event.request.url.toLowerCase();
+  const enabledRules = currentProxyRules().filter((rule) => rule.enabled);
+  if (enabledRules.length === 0) {
+    return "no_enabled_rules";
+  }
+  const hints = enabledRules
+    .map((rule) => proxyRuleUrlHint(rule))
+    .filter((hint): hint is string => Boolean(hint));
+  if (hints.length === 0) {
+    return "would_record_but_filtered"; // shouldn't happen if shouldRecord returns false
+  }
+  if (!hints.some((hint) => url.includes(hint))) {
+    return `url_not_matching_hints:${hints.join("|")}`;
+  }
+  return "unknown_filter";
+}
+
+function matchesProxyRule(
+  rule: DebuggerProxyRule,
+  event: FetchRequestPausedEvent,
+  stage: DebuggerProxyStage,
+): boolean {
+  return explainProxyRuleMismatch(rule, event, stage) === undefined;
+}
+
+function normalizeProxyMatcherFields(
+  input: DebuggerProxyRuleInput,
+): Pick<DebuggerProxyRuleInput, "urlPattern" | "urlContains" | "regexFilter"> {
+  if (input.regexFilter?.trim()) {
+    return { regexFilter: input.regexFilter.trim() };
+  }
+
+  const rawPattern = input.urlPattern?.trim();
+  if (
+    rawPattern &&
+    (/^[a-z][a-z0-9+.-]*:\/\//i.test(rawPattern) || rawPattern.startsWith("*://"))
+  ) {
+    return { urlPattern: rawPattern };
+  }
+
+  const containsSource = input.urlContains?.trim() || rawPattern;
+  if (containsSource) {
+    return { urlContains: containsSource.replace(/^\*+|\*+$/g, "") };
+  }
+
+  return {};
+}
+
+function migrateStoredProxyRule(rule: DebuggerProxyRule): DebuggerProxyRule {
+  const matcher = normalizeProxyMatcherFields(rule);
+  const hasInlineMock =
+    rule.responseBody !== undefined ||
+    rule.responseBodyBase64 !== undefined ||
+    rule.statusCode !== undefined ||
+    Boolean(rule.contentType);
+  return {
+    ...rule,
+    urlPattern: matcher.urlPattern,
+    urlContains: matcher.urlContains,
+    regexFilter: matcher.regexFilter,
+    mockStage: rule.mockStage ?? (hasInlineMock ? "response" : undefined),
+  };
+}
+
+function urlPatternMatches(pattern: string, url: string): boolean {
+  const trimmed = pattern.trim();
+  if (!trimmed || trimmed === "*") {
+    return true;
+  }
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) || trimmed.startsWith("*://")) {
+    const escaped = trimmed
+      .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*/g, ".*");
+    return new RegExp(`^${escaped}$`).test(url);
+  }
+
+  const fragment = trimmed.replace(/^\*+|\*+$/g, "");
+  if (!fragment) {
+    return true;
+  }
+  return url.toLowerCase().includes(fragment.toLowerCase());
+}
+
+function shouldRecordProxyMiss(event: FetchRequestPausedEvent): boolean {
+  if (event.resourceType === "Document") {
+    return false;
+  }
+
+  const noisyTypes = new Set([
+    "Image",
+    "Stylesheet",
+    "Font",
+    "Media",
+    "Script",
+  ]);
+  if (event.resourceType && noisyTypes.has(event.resourceType)) {
+    return false;
+  }
+
+  return true;
+}
+
+function urlContainsMatches(needle: string, url: string): boolean {
+  const fragment = needle.trim().toLowerCase();
+  if (!fragment) {
+    return true;
+  }
+
+  const lower = url.toLowerCase();
+  let searchFrom = 0;
+  while (searchFrom < lower.length) {
+    const idx = lower.indexOf(fragment, searchFrom);
+    if (idx < 0) {
+      return false;
+    }
+    const after = lower.charAt(idx + fragment.length);
+    if (after === "" || after === "?" || after === "#") {
+      return true;
+    }
+    if (after !== "/") {
+      searchFrom = idx + 1;
+      continue;
+    }
+    searchFrom = idx + 1;
+  }
+  return false;
+}
+
+function proxyRuleUrlHint(rule: DebuggerProxyRule): string | undefined {
+  if (rule.urlContains?.trim()) {
+    return rule.urlContains.trim().toLowerCase();
+  }
+  if (rule.urlPattern?.trim()) {
+    return rule.urlPattern.trim().replace(/^\*+|\*+$/g, "").toLowerCase();
+  }
+  return undefined;
+}
+
+function applyHeaderModifications(
+  headers: HeaderEntry[],
+  modifications: DebuggerProxyHeaderModification[],
+): HeaderEntry[] {
+  let next = sanitizeHeaderEntries(headers);
+
+  for (const modification of modifications) {
+    const headerName = modification.header.trim();
+    if (!headerName || headerName.startsWith(":")) {
+      continue;
+    }
+    const key = headerKey(headerName);
+    const existing = next.find((header) => headerKey(header.name) === key);
+
+    if (modification.operation === "remove") {
+      next = next.filter((header) => headerKey(header.name) !== key);
+      continue;
+    }
+
+    if (modification.operation === "append" && existing) {
+      existing.value = existing.value
+        ? `${existing.value}, ${modification.value ?? ""}`
+        : (modification.value ?? "");
+      continue;
+    }
+
+    next = next.filter((header) => headerKey(header.name) !== key);
+    next.push({
+      name: headerName,
+      value: modification.value ?? "",
+    });
+  }
+
+  return next;
+}
+
+function prepareHeadersForBodyReplacement(
+  headers: HeaderEntry[],
+  rule: DebuggerProxyRule,
+  contentType?: string,
+): HeaderEntry[] {
+  let next = applyHeaderModifications(headers, [
+    { header: "content-encoding", operation: "remove" },
+    { header: "transfer-encoding", operation: "remove" },
+    { header: "content-length", operation: "remove" },
+  ]);
+
+  const resolvedContentType =
+    contentType ?? rule.contentType ?? inferContentType(rule.responseBody);
+  if (resolvedContentType) {
+    next = applyHeaderModifications(next, [
+      {
+        header: "content-type",
+        operation: "set",
+        value: resolvedContentType,
+      },
+    ]);
+  }
+
+  const length = responseBodyByteLength(rule);
+  if (length !== undefined) {
+    next = applyHeaderModifications(next, [
+      {
+        header: "content-length",
+        operation: "set",
+        value: String(length),
+      },
+    ]);
+  }
+
+  return next;
+}
+
+function inferContentType(body: string | undefined): string | undefined {
+  if (!body) {
+    return undefined;
+  }
+  const trimmed = body.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return "application/json; charset=utf-8";
+  }
+  if (trimmed.startsWith("<")) {
+    return "text/html; charset=utf-8";
+  }
+  return "text/plain; charset=utf-8";
+}
+
+function responseBodyBase64(rule: DebuggerProxyRule): string {
+  if (rule.responseBodyBase64 !== undefined) {
+    return rule.responseBodyBase64;
+  }
+  return utf8ToBase64(rule.responseBody ?? "");
+}
+
+function responseBodyByteLength(rule: DebuggerProxyRule): number | undefined {
+  if (rule.responseBody !== undefined) {
+    return new TextEncoder().encode(rule.responseBody).length;
+  }
+  if (rule.responseBodyBase64 !== undefined) {
+    return base64ByteLength(rule.responseBodyBase64);
+  }
+  return undefined;
+}
+
+function utf8ToBase64(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ByteLength(value: string): number {
+  const normalized = value.replace(/\s/g, "");
+  const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
+}
+
+function toHeaderEntries(headers: Record<string, unknown> | undefined): HeaderEntry[] {
+  if (!headers) {
+    return [];
+  }
+
+  return sanitizeHeaderEntries(Object.entries(headers).map(([name, value]) => ({
+    name,
+    value: String(value),
+  })));
+}
+
+function headerKey(name: string): string {
+  return name.toLowerCase();
+}
+
+function sanitizeHeaderEntries(headers: HeaderEntry[]): HeaderEntry[] {
+  return headers
+    .map((header) => ({
+      name: String(header.name ?? "").trim(),
+      value: String(header.value ?? ""),
+    }))
+    .filter((header) => Boolean(header.name) && !header.name.startsWith(":"));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function recordProxyHit(
+  rule: DebuggerProxyRule,
+  event: FetchRequestPausedEvent,
+  stage: DebuggerProxyStage,
+  action: DebuggerProxyHit["action"],
+  note?: string,
+): void {
+  const now = new Date().toISOString();
+  const stored = proxyRules.get(rule.id) ?? rule;
+  stored.hitCount = (stored.hitCount ?? 0) + 1;
+  stored.lastHitAt = now;
+  proxyRules.set(stored.id, stored);
+  proxyHits.push({
+    id: `hit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    ruleId: stored.id,
+    stage,
+    url: event.request.url,
+    method: event.request.method,
+    resourceType: event.resourceType,
+    statusCode: event.responseStatusCode,
+    action,
+    requestId: event.requestId,
+    networkId: event.networkId,
+    matchedAt: now,
+    note,
+  });
+  proxyHits = proxyHits.slice(-MAX_PROXY_HITS);
+  scheduleProxyStateBroadcast();
+  proxyLog("proxy.hit.recorded", {
+    ruleId: stored.id,
+    hitCount: stored.hitCount,
+    stage,
+    action,
+    url: event.request.url,
+    note,
+    totalHits: proxyHits.length,
+  });
+}
+
+function recordProxyMiss(
+  event: FetchRequestPausedEvent,
+  stage: DebuggerProxyStage,
+): void {
+  proxyHits.push({
+    id: `miss-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    ruleId: "__miss__",
+    stage,
+    url: event.request.url,
+    method: event.request.method,
+    resourceType: event.resourceType,
+    statusCode: event.responseStatusCode,
+    action: "miss",
+    requestId: event.requestId,
+    networkId: event.networkId,
+    matchedAt: new Date().toISOString(),
+    note: describeProxyMiss(event, stage),
+  });
+  proxyHits = proxyHits.slice(-MAX_PROXY_HITS);
+  scheduleProxyStateBroadcast();
+  proxyLog("proxy.miss.recorded", {
+    url: event.request.url,
+    stage,
+    note: describeProxyMiss(event, stage),
+    totalHits: proxyHits.length,
+  });
+}
+
+function persistProxyHits(): Promise<void> {
+  return writeSessionStorage(PROXY_HITS_STORAGE_KEY, proxyHits);
+}
+
+function describeProxyMiss(
+  event: FetchRequestPausedEvent,
+  stage: DebuggerProxyStage,
+): string {
+  const activeRules = currentProxyRules().filter((rule) => rule.enabled);
+  if (activeRules.length === 0) {
+    return "没有启用的代理规则。";
+  }
+
+  const stageMatches = activeRules.filter((rule) =>
+    fetchStagesForRule(rule).includes(stage),
+  );
+  if (stageMatches.length === 0) {
+    return `当前请求处于 ${stage} 阶段，但规则监听的是其他阶段。`;
+  }
+
+  const methodMatches = stageMatches.filter(
+    (rule) =>
+      !rule.method ||
+      rule.method.toLowerCase() === event.request.method.toLowerCase(),
+  );
+  if (methodMatches.length === 0) {
+    return `HTTP method 不匹配：${event.request.method}。`;
+  }
+
+  const typeMatches = methodMatches.filter(
+    (rule) =>
+      !rule.resourceType ||
+      rule.resourceType.toLowerCase() === event.resourceType?.toLowerCase(),
+  );
+  if (typeMatches.length === 0) {
+    return `resourceType 不匹配：${event.resourceType ?? "unknown"}。`;
+  }
+
+  return "URL 不匹配；请检查 urlPattern/urlContains/regexFilter。";
+}
+
+function normalizeScreenshotClip(clip: ScreenshotClip): ScreenshotClip {
+  return {
+    x: Math.max(0, Math.round(clip.x * 100) / 100),
+    y: Math.max(0, Math.round(clip.y * 100) / 100),
+    width: Math.max(1, Math.round(clip.width * 100) / 100),
+    height: Math.max(1, Math.round(clip.height * 100) / 100),
+  };
+}
+
+function handleRuntimeConsoleAPICalled(
+  event: RuntimeConsoleApiCalledEvent,
+): void {
+  const session = activeSession;
+  if (!session) {
+    return;
+  }
+
+  const timestampMs = event.timestamp ?? Date.now();
+  const frame = event.stackTrace?.callFrames?.[0];
+  pushConsoleMessage(session, {
+    id: `console-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    level: consoleTypeToLevel(event.type),
+    type: event.type,
+    text: event.args.map(remoteObjectText).join(" "),
+    url: frame?.url,
+    lineNumber: frame?.lineNumber,
+    columnNumber: frame?.columnNumber,
+    timestamp: new Date(timestampMs).toISOString(),
+    timestampMs,
+  });
+}
+
+function handleLogEntryAdded(event: LogEntryAddedEvent): void {
+  const session = activeSession;
+  if (!session) {
+    return;
+  }
+
+  const entry = event.entry;
+  const timestampMs = entry.timestamp ?? Date.now();
+  pushConsoleMessage(session, {
+    id: `log-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    level: logLevelToConsoleLevel(entry.level),
+    type: entry.source,
+    text: entry.text,
+    url: entry.url,
+    lineNumber: entry.lineNumber,
+    timestamp: new Date(timestampMs).toISOString(),
+    timestampMs,
+  });
+}
+
+function pushConsoleMessage(
+  session: NetworkSession,
+  message: ConsoleMessageRecord,
+): void {
+  session.consoleMessages.push(message);
+  session.consoleMessages = session.consoleMessages.slice(-MAX_CONSOLE_MESSAGES);
+}
+
+function consoleTypeToLevel(
+  type: RuntimeConsoleApiCalledEvent["type"],
+): BrowserConsoleMessage["level"] {
+  switch (type) {
+    case "error":
+    case "assert":
+      return "error";
+    case "warning":
+    case "warn":
+      return "warning";
+    case "debug":
+      return "debug";
+    case "log":
+    case "info":
+    default:
+      return "info";
+  }
+}
+
+function logLevelToConsoleLevel(
+  level: LogEntryAddedEvent["entry"]["level"],
+): BrowserConsoleMessage["level"] {
+  switch (level) {
+    case "error":
+      return "error";
+    case "warning":
+      return "warning";
+    case "verbose":
+      return "debug";
+    case "info":
+    default:
+      return "info";
+  }
+}
+
+function consoleLevelWeight(level: BrowserConsoleMessage["level"]): number {
+  switch (level) {
+    case "error":
+      return 0;
+    case "warning":
+      return 1;
+    case "info":
+      return 2;
+    case "debug":
+    default:
+      return 3;
+  }
+}
+
+function remoteObjectText(remoteObject: RuntimeRemoteObject): string {
+  if (remoteObject.value !== undefined) {
+    return String(remoteObject.value);
+  }
+  if (remoteObject.unserializableValue !== undefined) {
+    return remoteObject.unserializableValue;
+  }
+  if (remoteObject.description) {
+    return remoteObject.description;
+  }
+  return remoteObject.type;
+}
+
+function handleRequestWillBeSent(event: NetworkRequestWillBeSentEvent): void {
+  const session = requireNetworkSession();
+  if (event.type === "Document") {
+    session.pageStartedAt = Date.now();
+  }
+  const existing = session.requests.get(event.requestId);
+  const record: NetworkRequestRecord = {
+    ...(existing ?? {}),
+    requestId: event.requestId,
+    url: event.request.url,
+    method: event.request.method,
+    resourceType: event.type,
+    documentUrl: event.documentURL,
+    requestHeaders: normalizeHeaders(event.request.headers),
+    requestPostData: event.request.postData,
+    startedAt: event.timestamp,
+    initiatorType: event.initiator?.type,
+  };
+
+  if (!existing) {
+    session.requestOrder.push(event.requestId);
+  }
+  session.requests.set(event.requestId, record);
+  trimNetworkRequests(session);
+}
+
+function handleResponseReceived(event: NetworkResponseReceivedEvent): void {
+  const session = requireNetworkSession();
+  const existing = session.requests.get(event.requestId);
+  if (!existing) {
+    return;
+  }
+
+  existing.resourceType = event.type ?? existing.resourceType;
+  existing.status = event.response.status;
+  existing.statusText = event.response.statusText;
+  existing.mimeType = event.response.mimeType;
+  existing.responseHeaders = normalizeHeaders(event.response.headers);
+  existing.fromDiskCache = event.response.fromDiskCache;
+  existing.fromServiceWorker = event.response.fromServiceWorker;
+  existing.remoteAddress = event.response.remoteIPAddress
+    ? `${event.response.remoteIPAddress}:${event.response.remotePort ?? ""}`
+    : undefined;
+}
+
+function handleLoadingFinished(event: NetworkLoadingFinishedEvent): void {
+  const session = requireNetworkSession();
+  const existing = session.requests.get(event.requestId);
+  if (!existing) {
+    return;
+  }
+
+  existing.finishedAt = event.timestamp;
+  existing.encodedDataLength = event.encodedDataLength;
+}
+
+function handleLoadingFailed(event: NetworkLoadingFailedEvent): void {
+  const session = requireNetworkSession();
+  const existing = session.requests.get(event.requestId);
+  if (!existing) {
+    return;
+  }
+
+  existing.finishedAt = event.timestamp;
+  existing.failed = true;
+  existing.errorText = event.errorText;
+}
+
+function matchesNetworkFilter(
+  request: NetworkRequestRecord,
+  input: DebuggerNetworkListInput,
+): boolean {
+  if (
+    input.urlContains &&
+    !request.url.toLowerCase().includes(input.urlContains.toLowerCase())
+  ) {
+    return false;
+  }
+  if (
+    input.method &&
+    request.method.toLowerCase() !== input.method.toLowerCase()
+  ) {
+    return false;
+  }
+  if (
+    input.resourceType &&
+    request.resourceType?.toLowerCase() !== input.resourceType.toLowerCase()
+  ) {
+    return false;
+  }
+  if (input.statusMin !== undefined && (request.status ?? 0) < input.statusMin) {
+    return false;
+  }
+  if (
+    input.statusMax !== undefined &&
+    (request.status ?? Number.POSITIVE_INFINITY) > input.statusMax
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function toNetworkSummary(
+  request: NetworkRequestRecord,
+): DebuggerNetworkRequestSummary {
+  return {
+    requestId: request.requestId,
+    url: request.url,
+    method: request.method,
+    resourceType: request.resourceType,
+    status: request.status,
+    statusText: request.statusText,
+    mimeType: request.mimeType,
+    fromDiskCache: request.fromDiskCache,
+    fromServiceWorker: request.fromServiceWorker,
+    encodedDataLength: request.encodedDataLength,
+    startedAt: request.startedAt,
+    finishedAt: request.finishedAt,
+    durationMs:
+      request.finishedAt === undefined
+        ? undefined
+        : Math.round((request.finishedAt - request.startedAt) * 1000),
+    failed: request.failed,
+    errorText: request.errorText,
+  };
+}
+
+function clearNetworkRequests(): void {
+  activeSession?.requests.clear();
+  if (activeSession) {
+    activeSession.requestOrder = [];
+  }
+}
+
+function trimNetworkRequests(session: NetworkSession): void {
+  while (session.requestOrder.length > session.maxEntries) {
+    const requestId = session.requestOrder.shift();
+    if (requestId) {
+      session.requests.delete(requestId);
+    }
+  }
+}
+
+function networkStatus(): DebuggerNetworkStatus {
+  return {
+    attached: activeSession?.attached ?? false,
+    networkEnabled: activeSession?.networkEnabled ?? false,
+    tabId: activeSession?.tabId,
+    protocolVersion: PROTOCOL_VERSION,
+    requestCount: activeSession?.requests.size ?? 0,
+    maxEntries: activeSession?.maxEntries ?? DEFAULT_MAX_NETWORK_ENTRIES,
+    preservedLog: activeSession?.preservedLog ?? true,
+    observationSessionId: activeSession?.observationSessionId,
+    observationStartedAt: activeSession?.observationStartedAt,
+  };
+}
+
+function requireNetworkSession(): NetworkSession {
+  if (!activeSession?.attached) {
+    throw new Error("Chrome debugger is not attached. Start Network recording first.");
+  }
+  return activeSession;
+}
+
+function getPendingTabUrl(tab: chrome.tabs.Tab): string | undefined {
+  return (tab as chrome.tabs.Tab & { pendingUrl?: string }).pendingUrl;
+}
+
+function normalizeHeaders(
+  headers: Record<string, unknown> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) {
+    return undefined;
+  }
+
+  return Object.fromEntries(
+    Object.entries(headers).map(([key, value]) => [key, String(value)]),
+  );
+}
+
+interface NetworkRequestWillBeSentEvent {
+  requestId: string;
+  documentURL?: string;
+  request: {
+    url: string;
+    method: string;
+    headers?: Record<string, unknown>;
+    postData?: string;
+  };
+  timestamp: number;
+  type?: string;
+  initiator?: {
+    type?: string;
+  };
+}
+
+interface NetworkResponseReceivedEvent {
+  requestId: string;
+  timestamp: number;
+  type?: string;
+  response: {
+    status: number;
+    statusText: string;
+    headers?: Record<string, unknown>;
+    mimeType?: string;
+    fromDiskCache?: boolean;
+    fromServiceWorker?: boolean;
+    remoteIPAddress?: string;
+    remotePort?: number;
+  };
+}
+
+interface NetworkLoadingFinishedEvent {
+  requestId: string;
+  timestamp: number;
+  encodedDataLength?: number;
+}
+
+interface NetworkLoadingFailedEvent {
+  requestId: string;
+  timestamp: number;
+  errorText?: string;
+}
+
+interface PageLayoutMetrics {
+  contentSize: {
+    x?: number;
+    y?: number;
+    width: number;
+    height: number;
+  };
+  cssContentSize?: {
+    x?: number;
+    y?: number;
+    width: number;
+    height: number;
+  };
+}
+
+interface RuntimeRemoteObject {
+  type: string;
+  value?: unknown;
+  unserializableValue?: string;
+  description?: string;
+}
+
+interface RuntimeConsoleApiCalledEvent {
+  type:
+    | "log"
+    | "debug"
+    | "info"
+    | "error"
+    | "warning"
+    | "warn"
+    | "dir"
+    | "dirxml"
+    | "table"
+    | "trace"
+    | "clear"
+    | "startGroup"
+    | "startGroupCollapsed"
+    | "endGroup"
+    | "assert"
+    | "profile"
+    | "profileEnd"
+    | "count"
+    | "timeEnd";
+  args: RuntimeRemoteObject[];
+  timestamp?: number;
+  stackTrace?: {
+    callFrames?: Array<{
+      url?: string;
+      lineNumber?: number;
+      columnNumber?: number;
+    }>;
+  };
+}
+
+interface LogEntryAddedEvent {
+  entry: {
+    source?: string;
+    level: "verbose" | "info" | "warning" | "error";
+    text: string;
+    timestamp?: number;
+    url?: string;
+    lineNumber?: number;
+  };
+}
+
+interface HeaderEntry {
+  name: string;
+  value: string;
+}
+
+interface TargetAttachedToTargetEvent {
+  sessionId: string;
+  targetInfo?: CdpTargetInfo;
+  waitingForDebugger?: boolean;
+}
+
+interface CdpTargetInfo {
+  targetId: string;
+  type: string;
+  url: string;
+  parentFrameId?: string;
+}
+
+interface PageFrameTreeResult {
+  frameTree: CdpFrameTreeNode;
+}
+
+interface TargetDetachedFromTargetEvent {
+  sessionId: string;
+  targetId?: string;
+}
+
+interface FetchRequestPausedEvent {
+  requestId: string;
+  request: {
+    url: string;
+    method: string;
+    headers?: Record<string, unknown>;
+    postData?: string;
+  };
+  frameId?: string;
+  resourceType?: string;
+  responseErrorReason?: string;
+  responseStatusCode?: number;
+  responseStatusText?: string;
+  responseHeaders?: HeaderEntry[];
+  networkId?: string;
+  redirectedRequestId?: string;
+}

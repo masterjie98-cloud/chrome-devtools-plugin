@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "AI DevTools Assistant",
+  "version": "0.1.0",
+  "description": "AI-assisted Chrome sidePanel for DOM inspection, safe page tools, request header rules, and mock scaffolding.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "activeTab",
+    "cookies",
+    "debugger",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "downloads",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "tabs",
+    "webNavigation",
+    "windows"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "assets/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AI DevTools Assistant"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["assets/content.js"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["mocks/*.json"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://* http://* ws://127.0.0.1:17321 ws://localhost:17321"
+  }
+}
