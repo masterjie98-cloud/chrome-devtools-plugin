@@ -426,6 +426,7 @@ test("page context is sent as untrusted user data and never placed in the system
     await streamAiChat({
       config: {
         ...DEFAULT_AI_CONFIG,
+        fastAgentMode: false,
         enableTools: false,
       },
       messages: [],
@@ -776,6 +777,7 @@ function semanticNode(
 ) {
   return {
     ref,
+    targetRef: `sr1_1234abcd_${ref}`,
     role,
     name,
     selector,

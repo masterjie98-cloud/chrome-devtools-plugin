@@ -50,6 +50,81 @@ export interface DomRectSnapshot {
   height: number;
 }
 
+export const DEFAULT_COMPUTED_STYLE_PROPERTIES = [
+  "display",
+  "position",
+  "top",
+  "right",
+  "bottom",
+  "left",
+  "visibility",
+  "opacity",
+  "z-index",
+  "width",
+  "height",
+  "min-width",
+  "min-height",
+  "max-width",
+  "max-height",
+  "margin",
+  "margin-top",
+  "margin-right",
+  "margin-bottom",
+  "margin-left",
+  "padding",
+  "padding-top",
+  "padding-right",
+  "padding-bottom",
+  "padding-left",
+  "border",
+  "border-radius",
+  "box-sizing",
+  "overflow",
+  "overflow-x",
+  "overflow-y",
+  "transform",
+  "flex",
+  "flex-direction",
+  "flex-wrap",
+  "align-items",
+  "justify-content",
+  "gap",
+  "grid-template-columns",
+  "grid-template-rows",
+  "grid-column",
+  "grid-row",
+] as const;
+
+export const SUPPORTED_COMPUTED_STYLE_PROPERTIES = [
+  ...DEFAULT_COMPUTED_STYLE_PROPERTIES,
+  "align-content",
+  "align-self",
+  "justify-self",
+  "order",
+  "color",
+  "background-color",
+  "font-family",
+  "font-size",
+  "font-style",
+  "font-weight",
+  "line-height",
+  "letter-spacing",
+  "text-align",
+  "text-decoration",
+  "text-overflow",
+  "text-transform",
+  "white-space",
+  "word-break",
+  "overflow-wrap",
+  "box-shadow",
+  "outline",
+  "object-fit",
+  "object-position",
+] as const;
+
+export type ComputedStyleProperty =
+  (typeof SUPPORTED_COMPUTED_STYLE_PROPERTIES)[number];
+
 export interface DomSummaryNode {
   tagName: string;
   selector: string;
@@ -101,6 +176,8 @@ export interface DomQueryInput {
   includeText?: boolean;
   includeOuterHTML?: boolean;
   includeComputedStyle?: boolean;
+  /** Explicit bounded computed-style projection. Defaults to layout properties. */
+  computedStyleProperties?: ComputedStyleProperty[];
   /**
    * Max chars for element text. Set 0 to disable truncation for this query.
    */
@@ -119,6 +196,11 @@ export interface DomQueryResult {
   truncated?: boolean;
   elements: DomElementInfo[];
   error?: string;
+}
+
+export interface DomQueryBatchResult {
+  version: "dom-query-batch-v1";
+  results: DomQueryResult[];
 }
 
 export interface HighlightElementInput {

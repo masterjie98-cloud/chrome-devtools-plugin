@@ -5,6 +5,16 @@ export type ToolApprovalDecision =
   | "allow_once"
   | "allow_conversation_origin";
 
+export type ExecutionApprovalMode = "ask" | "agent" | "full";
+
+export interface ConversationExecutionApproval {
+  mode: Exclude<ExecutionApprovalMode, "ask">;
+  conversationId: string;
+  origin: string;
+  sessionId: string;
+  egressDestinations: string[];
+}
+
 export interface AgentConversationOriginApprovalScope {
   toolName: string;
   policyClass: string;
@@ -27,6 +37,7 @@ export interface AgentConversationOriginApprovalGrant {
 export type AgentConversationOriginInvalidationReason =
   | "conversation_changed"
   | "origin_changed"
+  | "profile_changed"
   | "provider_changed"
   | "hub_disconnected";
 
@@ -35,6 +46,62 @@ const CONVERSATION_ORIGIN_POLICY_CLASSES = new Set([
   "reversible_write",
   "page_action",
 ]);
+
+export function createConversationExecutionApproval(
+  mode: ExecutionApprovalMode,
+  current: {
+    conversationId: string;
+    pageUrl?: string;
+    sessionId?: string;
+    egressDestinations: string[];
+  },
+): ConversationExecutionApproval | null {
+  const origin = getApprovalTargetOrigin(current.pageUrl);
+  if (
+    mode === "ask" ||
+    !current.conversationId ||
+    !current.sessionId ||
+    !origin
+  ) {
+    return null;
+  }
+  return {
+    mode,
+    conversationId: current.conversationId,
+    origin,
+    sessionId: current.sessionId,
+    egressDestinations: normalizeDestinations(current.egressDestinations),
+  };
+}
+
+export function executionApprovalModeAllows(
+  mode: ExecutionApprovalMode,
+  approvalMode: string | undefined,
+): boolean {
+  if (mode === "full") {
+    return (
+      approvalMode === "task_grant" ||
+      approvalMode === "decision_barrier" ||
+      approvalMode === "always"
+    );
+  }
+  return mode === "agent" && approvalMode === "task_grant";
+}
+
+export function matchesConversationExecutionApproval(
+  approval: ConversationExecutionApproval,
+  current: {
+    conversationId: string;
+    targetUrl?: string;
+    sessionId?: string;
+  },
+): boolean {
+  return (
+    approval.conversationId === current.conversationId &&
+    approval.origin === getApprovalTargetOrigin(current.targetUrl) &&
+    approval.sessionId === current.sessionId
+  );
+}
 
 export function createAgentConversationOriginApprovalGrant(
   conversationId: string,
@@ -98,10 +165,11 @@ export function getApprovalTargetOrigin(
 }
 
 export function getAgentConversationOriginInvalidationReason(
-  grant: AgentConversationOriginApprovalGrant,
+  grant: AgentConversationOriginApprovalGrant | ConversationExecutionApproval,
   current: {
     conversationId: string;
     pageUrl?: string;
+    sessionId?: string;
     hubConnected: boolean;
     egressDestinations: string[];
   },
@@ -114,6 +182,9 @@ export function getAgentConversationOriginInvalidationReason(
     getApprovalTargetOrigin(current.pageUrl) !== grant.origin
   ) {
     return "origin_changed";
+  }
+  if (current.sessionId && current.sessionId !== grant.sessionId) {
+    return "profile_changed";
   }
   if (
     !arraysEqual(

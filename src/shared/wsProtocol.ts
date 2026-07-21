@@ -4,6 +4,7 @@ import type {
   PageSnapshot,
   ScreenshotCaptureResult,
 } from "./dom";
+import { SUPPORTED_COMPUTED_STYLE_PROPERTIES } from "./dom";
 import type { AgentSessionSnapshot } from "./agentSession";
 import {
   SANITIZE_LIMITS,
@@ -34,7 +35,7 @@ import type {
 export const MCP_WS_URL = "ws://127.0.0.1:17321";
 // Bump whenever an extension-visible tool/resource schema changes so a newly
 // loaded extension cannot silently keep using an older daemon process.
-export const WS_PROTOCOL_VERSION = 5;
+export const WS_PROTOCOL_VERSION = 6;
 export const WS_HEARTBEAT_INTERVAL_MS = 15_000;
 
 export const WS_COMMANDS = {
@@ -612,55 +613,14 @@ export type McpWsAck =
       error: string;
     };
 
-const LAYOUT_STYLE_KEYS = new Set([
-  "display",
-  "position",
-  "top",
-  "right",
-  "bottom",
-  "left",
-  "visibility",
-  "opacity",
-  "z-index",
-  "width",
-  "height",
-  "min-width",
-  "min-height",
-  "max-width",
-  "max-height",
-  "margin",
-  "margin-top",
-  "margin-right",
-  "margin-bottom",
-  "margin-left",
-  "padding",
-  "padding-top",
-  "padding-right",
-  "padding-bottom",
-  "padding-left",
-  "border",
-  "border-radius",
-  "box-sizing",
-  "overflow",
-  "overflow-x",
-  "overflow-y",
-  "transform",
-  "flex",
-  "flex-direction",
-  "flex-wrap",
-  "align-items",
-  "justify-content",
-  "gap",
-  "grid-template-columns",
-  "grid-template-rows",
-  "grid-column",
-  "grid-row",
-]);
+const COMPUTED_STYLE_PROPERTY_SET = new Set<string>(
+  SUPPORTED_COMPUTED_STYLE_PROPERTIES,
+);
 
 export function sanitizeElementForMcp(element: DomElementInfo): DomElementInfo {
   const computedStyle = Object.fromEntries(
     Object.entries(element.computedStyle)
-      .filter(([key]) => LAYOUT_STYLE_KEYS.has(key))
+      .filter(([key]) => COMPUTED_STYLE_PROPERTY_SET.has(key))
       .map(([key, value]) => [key, sanitizeText(value, 240)]),
   );
 
@@ -804,6 +764,9 @@ function sanitizeSemanticSnapshotNode(
 ): SemanticSnapshotNode {
   return {
     ref: /^s\d{1,6}$/.test(node.ref) ? node.ref : "s0",
+    targetRef: /^sr1_[a-f0-9]{8}_s\d{1,6}$/.test(node.targetRef)
+      ? node.targetRef
+      : "sr1_00000000_s0",
     role: sanitizeText(node.role, 80),
     name: sanitizeText(node.name, 240),
     selector: sanitizeText(node.selector, 400),

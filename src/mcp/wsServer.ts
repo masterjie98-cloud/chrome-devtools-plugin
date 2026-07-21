@@ -3043,17 +3043,17 @@ function buildApprovalPreview(
   const sideEffects: string[] = [];
   if (policy.sensitive) {
     egress.push(
-      "The approved result may contain sensitive browser data and be returned to the requesting Agent.",
+      "批准后，结果可能包含敏感浏览器数据并返回给发起请求的 Agent。",
     );
   }
   if (args.includeValues === true) {
-    egress.push("Cookie or storage values were explicitly requested.");
+    egress.push("本次请求明确要求读取 Cookie 或 Storage 的值。");
   }
   if (policy.mutatesBrowser) {
-    sideEffects.push("This call can change the selected page or browser state.");
+    sideEffects.push("该调用可能改变当前页面或浏览器状态。");
   }
   if (policy.destructive) {
-    sideEffects.push("The change may navigate, delete, close, or persist state.");
+    sideEffects.push("该操作可能导航、删除、关闭或持久化页面状态。");
   }
   return {
     summary: `${toolName} (${policy.policyClass})`,

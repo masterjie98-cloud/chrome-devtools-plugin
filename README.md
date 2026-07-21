@@ -16,6 +16,8 @@ Codex installation, pairing, verification, and shareable onboarding steps are in
 [`docs/codex-mcp-integration.md`](docs/codex-mcp-integration.md).
 Manual Chrome/Profile/frame validation is documented in
 [`docs/manual-browser-validation.md`](docs/manual-browser-validation.md).
+The default task-oriented MCP protocol and evaluation are documented in
+[`docs/smart-mcp-kernel.md`](docs/smart-mcp-kernel.md).
 Record only sanitized results in
 [`docs/browser-validation-results.md`](docs/browser-validation-results.md); it
 starts as `not-run` so unexecuted browser checks cannot be mistaken for proof.
@@ -40,6 +42,13 @@ For a production-style run, build once and start the compiled JavaScript:
 ```bash
 npm run build
 npm run daemon:start
+```
+
+On macOS, the same compiled daemon can run as a user LaunchAgent:
+
+```bash
+npm run daemon:install-service
+npm run daemon:status
 ```
 
 Print the daemon pairing token explicitly:
@@ -105,7 +114,8 @@ locations only when needed:
 - `AI_DEVTOOLS_ALLOWED_EXTENSION_IDS` — optional comma-separated Chrome
   extension ID allowlist
 - `AI_DEVTOOLS_DAEMON_PORT` — daemon listener port
-- `AI_DEVTOOLS_MCP_TOOL_PROFILE` — `inspect`, `read`, or `full` (default)
+- `AI_DEVTOOLS_MCP_TOOL_PROFILE` — `smart` (default), `inspect`, `read`, or
+  `full`
 - `AI_DEVTOOLS_STATE_PATH` — sanitized daemon state JSON path
 - `AI_DEVTOOLS_ARTIFACT_DIR` — binary artifact directory
 
@@ -125,10 +135,20 @@ collaboration state never grants browser permissions and does not bypass normal
 approval for page, browser, cookie, storage, network-body, screenshot, or other
 sensitive operations.
 
-`browser_snapshot` returns a fresh, accessibility-oriented snapshot for the
+`browser_observe` is the preferred fresh page entrypoint. `browser_act` executes
+one bounded current-page stage, and `browser_verify` checks the outcome from one
+fresh read. `browser_debug_activity` combines an approved compact Network digest
+and sanitized console evidence only when both sources belong to the adapter's
+same selected tab; a target change or mixed-tab recorder fails closed instead of
+merging unrelated evidence. The default `smart` profile exposes these
+task-oriented tools plus routing and explicit screenshot tools; use `full` only
+when an expert workflow needs the primitive surface.
+
+`browser_snapshot` remains the expert-compatible accessibility-oriented snapshot for the
 adapter's bound Chrome Profile and selected tab/frame/document. Nodes include a
-stable page-local `ref`, semantic role/name, selector, state, and viewport
-bounds. Use `limit` and the returned `nextCursor` for pagination. If the page's
+stable page-local `ref`, an actionable target-bound `targetRef`, semantic
+role/name, selector, state, and viewport bounds. Prefer `targetRef` in later
+actions. Use `limit` and the returned `nextCursor` for pagination. If the page's
 semantic structure changes, reusing an old cursor fails with
 `STALE_SNAPSHOT_CURSOR`; start again without a cursor. The older
 `browser_get_page_context` tool remains available for bounded text/DOM-summary

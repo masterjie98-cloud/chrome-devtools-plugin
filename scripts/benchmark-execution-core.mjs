@@ -18,6 +18,10 @@ if (!tabUrlPrefix || !/^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?\//.test(t
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: ["dist/mcp/server.js"],
+  env: {
+    ...process.env,
+    AI_DEVTOOLS_MCP_TOOL_PROFILE: "full",
+  },
 });
 const client = new Client({
   name: "execution-core-benchmark",

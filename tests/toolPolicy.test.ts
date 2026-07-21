@@ -111,6 +111,12 @@ test("dynamic approval modes distinguish cleanup, task grants, and decision barr
     getToolPolicy(MCP_TOOL_NAMES.BROWSER_NETWORK_REQUESTS).approvalMode,
     "decision_barrier",
   );
+  const debugActivity = getToolPolicy(
+    MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+  );
+  assert.equal(debugActivity.approvalMode, "task_grant");
+  assert.equal(debugActivity.capability, "page.observe.network_digest");
+  assert.equal(debugActivity.sensitive, false);
   assert.equal(
     getToolPolicy(MCP_TOOL_NAMES.BROWSER_CLICK, { selector: "#save" })
       .approvalMode,

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createConversationExecutionApproval,
   createAgentConversationOriginApprovalGrant,
   createAgentToolIdempotencyKey,
+  executionApprovalModeAllows,
   getAgentConversationOriginInvalidationReason,
   getApprovalTargetOrigin,
+  matchesConversationExecutionApproval,
   matchesAgentConversationOriginApproval,
 } from "../src/sidepanel/agentRunApprovals";
 
@@ -33,6 +36,83 @@ const baseScope = {
   },
   egressDestinations: ["AI Provider: https://provider.example"],
 };
+
+test("three execution approval modes preserve the risk boundary", () => {
+  assert.equal(executionApprovalModeAllows("ask", "task_grant"), false);
+  assert.equal(executionApprovalModeAllows("ask", "always"), false);
+  assert.equal(executionApprovalModeAllows("agent", "task_grant"), true);
+  assert.equal(executionApprovalModeAllows("agent", "decision_barrier"), false);
+  assert.equal(executionApprovalModeAllows("full", "decision_barrier"), true);
+  assert.equal(executionApprovalModeAllows("full", "always"), true);
+  assert.equal(executionApprovalModeAllows("full", undefined), false);
+  assert.equal(executionApprovalModeAllows("full", "unknown"), false);
+});
+
+test("execution approval is bound to the active chat, origin, and profile", () => {
+  const approval = createConversationExecutionApproval("agent", {
+    conversationId: "conversation-1",
+    pageUrl: "https://example.test/form",
+    sessionId: "profile-session-1",
+    egressDestinations: ["AI Provider: https://provider.example"],
+  });
+  assert.ok(approval);
+  assert.equal(
+    matchesConversationExecutionApproval(approval, {
+      conversationId: "conversation-1",
+      targetUrl: "https://example.test/next",
+      sessionId: "profile-session-1",
+    }),
+    true,
+  );
+  assert.equal(
+    matchesConversationExecutionApproval(approval, {
+      conversationId: "conversation-2",
+      targetUrl: "https://example.test/next",
+      sessionId: "profile-session-1",
+    }),
+    false,
+  );
+  assert.equal(
+    matchesConversationExecutionApproval(approval, {
+      conversationId: "conversation-1",
+      targetUrl: "https://other.test/next",
+      sessionId: "profile-session-1",
+    }),
+    false,
+  );
+  assert.equal(
+    matchesConversationExecutionApproval(approval, {
+      conversationId: "conversation-1",
+      targetUrl: "https://example.test/next",
+      sessionId: "profile-session-2",
+    }),
+    false,
+  );
+});
+
+test("ask mode and incomplete page context cannot create persistent execution approval", () => {
+  const current = {
+    conversationId: "conversation-1",
+    pageUrl: "https://example.test/form",
+    sessionId: "profile-session-1",
+    egressDestinations: [],
+  };
+  assert.equal(createConversationExecutionApproval("ask", current), null);
+  assert.equal(
+    createConversationExecutionApproval("full", {
+      ...current,
+      pageUrl: undefined,
+    }),
+    null,
+  );
+  assert.equal(
+    createConversationExecutionApproval("full", {
+      ...current,
+      sessionId: undefined,
+    }),
+    null,
+  );
+});
 
 test("conversation-origin approval matches other eligible tools and revisions", () => {
   const grant = createAgentConversationOriginApprovalGrant(
@@ -176,6 +256,7 @@ test("active conversation-origin approval reports every automatic invalidation b
   const current = {
     conversationId: "conversation-1",
     pageUrl: "https://example.test/next",
+    sessionId: "profile-session-1",
     hubConnected: true,
     egressDestinations: [...baseScope.egressDestinations],
   };
@@ -197,6 +278,13 @@ test("active conversation-origin approval reports every automatic invalidation b
       pageUrl: "https://other.test/",
     }),
     "origin_changed",
+  );
+  assert.equal(
+    getAgentConversationOriginInvalidationReason(grant, {
+      ...current,
+      sessionId: "profile-session-2",
+    }),
+    "profile_changed",
   );
   assert.equal(
     getAgentConversationOriginInvalidationReason(grant, {

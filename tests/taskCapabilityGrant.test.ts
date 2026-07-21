@@ -73,6 +73,42 @@ test("a task grant can cover low-risk actions but never a decision barrier", () 
   assert.equal(approvalModeNeedsDecision(submit.approvalMode, true), true);
 });
 
+test("an MCP task grant covers sanitized activity digests without covering sensitive reads", () => {
+  const mcpGrant: TaskCapabilityGrant = {
+    ...grant,
+    principals: ["mcp"],
+    requesterClientNames: ["codex-mcp-adapter"],
+    egressDestinations: [
+      "MCP 客户端：后续模型或数据出站目标由该客户端配置",
+    ],
+    capabilities: ["page.observe.network_digest"],
+  };
+  const debugPolicy = getToolPolicy("browser_debug_activity");
+  assert.equal(
+    matchesTaskCapabilityGrant(mcpGrant, {
+      ...context,
+      requesterRole: "mcp",
+      requesterClientName: "codex-mcp-adapter",
+      egressDestinations: [
+        "MCP 客户端：后续模型或数据出站目标由该客户端配置",
+      ],
+      policy: debugPolicy,
+    }),
+    true,
+  );
+  assert.equal(
+    approvalModeNeedsDecision(debugPolicy.approvalMode, true),
+    false,
+  );
+  assert.equal(
+    approvalModeNeedsDecision(
+      getToolPolicy("browser_storage_state").approvalMode,
+      true,
+    ),
+    true,
+  );
+});
+
 test("expired and revoked grants fail closed", () => {
   assert.equal(
     matchesTaskCapabilityGrant(grant, {

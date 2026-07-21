@@ -7,6 +7,7 @@ export type SemanticCheckedState = boolean | "mixed";
 
 export interface SemanticSnapshotNode {
   ref: string;
+  targetRef: string;
   role: string;
   name: string;
   selector: string;
@@ -30,7 +31,10 @@ export interface SemanticSnapshotNode {
   };
 }
 
-export type SemanticSnapshotCandidate = Omit<SemanticSnapshotNode, "ref">;
+export type SemanticSnapshotCandidate = Omit<
+  SemanticSnapshotNode,
+  "ref" | "targetRef"
+>;
 
 export interface SemanticSnapshotCollection {
   version: "semantic-snapshot-v1";
@@ -69,6 +73,7 @@ export function paginateSemanticSnapshot(
   const nodes = candidates.slice(offset, end).map((node, index) => ({
     ...node,
     ref: `s${offset + index + 1}`,
+    targetRef: createSnapshotTargetRef(fingerprint, offset + index + 1),
   }));
   const hasMore = end < candidates.length;
   const base: Omit<SemanticSnapshotCollection, "stats"> = {
@@ -92,6 +97,17 @@ export function paginateSemanticSnapshot(
       outputChars: JSON.stringify(base).length,
     },
   };
+}
+
+export function createSnapshotTargetRef(
+  fingerprint: string,
+  ordinal: number,
+): string {
+  return `sr1_${fingerprint}_s${ordinal}`;
+}
+
+export function isSnapshotTargetRef(value: string): boolean {
+  return /^sr1_[a-f0-9]{8}_s\d{1,6}$/.test(value);
 }
 
 export function fingerprintSemanticSnapshot(

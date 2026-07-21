@@ -33,6 +33,10 @@ if (!phase || !phases.has(phase)) {
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: ["dist/mcp/server.js"],
+  env: {
+    ...process.env,
+    AI_DEVTOOLS_MCP_TOOL_PROFILE: "full",
+  },
 });
 const client = new Client({
   name: "execution-core-regression",
@@ -165,43 +169,61 @@ function safeOrigin(value) {
 }
 
 async function runOrdinaryRegression() {
-  const baseline = await call("browser_snapshot", {
+  const baseline = await call("browser_observe", {
     limit: 60,
     mode: "interactive",
     sourceLimit: 2000,
   });
+  assertToolSuccess(baseline, "baseline observation");
   const baselineRevision = Number(
     baseline.structuredContent?.observation?.domRevision ?? 0,
   );
+  const baselineNodes = baseline.structuredContent?.snapshot?.nodes;
+  const targetRef = (name, selector) => {
+    const ref = Array.isArray(baselineNodes)
+      ? baselineNodes.find(
+          (node) => node?.name === name || node?.selector === selector,
+        )?.targetRef
+      : undefined;
+    if (typeof ref !== "string") {
+      throw new Error(`Missing targetRef for ${name} (${selector}).`);
+    }
+    return ref;
+  };
 
   process.stdout.write(
     "WAITING_FOR_TASK_APPROVAL: choose current conversation/domain, then allow.\n",
   );
-  const stage = await call("browser_execute_action_stage", {
+  const stage = await call("browser_act", {
     actions: [
-      { id: "name", type: "fill", selector: "#benchmark-name", value: "Ada" },
+      {
+        id: "name",
+        type: "fill",
+        ref: targetRef("姓名", "#benchmark-name"),
+        value: "Ada",
+      },
       {
         id: "team",
         type: "fill",
-        selector: "#benchmark-team",
+        ref: targetRef("团队", "#benchmark-team"),
         value: "Execution Core",
       },
       {
         id: "role",
         type: "select",
-        selector: "#benchmark-role",
+        ref: targetRef("角色", "#benchmark-role"),
         values: ["developer"],
       },
       {
         id: "note",
         type: "fill",
-        selector: "#benchmark-note",
+        ref: targetRef("备注", "#benchmark-note"),
         value: "v5 regression",
       },
       {
         id: "drawer",
         type: "click",
-        selector: "#open-drawer",
+        ref: targetRef("打开抽屉", "#open-drawer"),
         dependsOn: ["name", "team", "role", "note"],
         expectedOutcome: "#drawer becomes visible",
       },
@@ -214,30 +236,60 @@ async function runOrdinaryRegression() {
     maxEntries: 100,
   });
   assertToolSuccess(networkStart, "Network start");
-  const networkClick = await call("browser_click", {
-    selector: "#network-action",
-  });
-  assertToolSuccess(networkClick, "Network action");
-  await call("browser_wait_for", { time: 0.25 });
-  const networkDigest = await call("browser_network_requests", {
-    digestOnly: true,
-    limit: 50,
-  });
-  assertToolSuccess(networkDigest, "Network digest");
-  const networkStop = await call("browser_network_stop_recording", {});
-  assertToolSuccess(networkStop, "Network stop");
-
-  const delta = await call("browser_snapshot", {
+  const afterDrawer = await call("browser_observe", {
     limit: 60,
     mode: "interactive",
     sourceLimit: 2000,
     ...(baselineRevision > 0 ? { sinceRevision: baselineRevision } : {}),
   });
-  assertToolSuccess(delta, "incremental snapshot");
+  assertToolSuccess(afterDrawer, "post-action observation");
+  const afterDrawerNodes = afterDrawer.structuredContent?.snapshot?.nodes;
+  const networkRef = Array.isArray(afterDrawerNodes)
+    ? afterDrawerNodes.find((node) => node?.name === "请求状态")?.targetRef
+    : undefined;
+  if (typeof networkRef !== "string") {
+    throw new Error("Missing fresh targetRef for 请求状态.");
+  }
+  const networkClick = await call("browser_act", {
+    actions: [
+      {
+        id: "network",
+        type: "click",
+        ref: networkRef,
+        expectedOutcome: "status becomes network-complete",
+      },
+    ],
+  });
+  assertToolSuccess(networkClick, "Network action");
+  await call("browser_wait_for", { time: 0.25 });
+  const debugActivity = await call("browser_debug_activity", {
+    includeNetwork: true,
+    includeConsole: true,
+    networkLimit: 50,
+    consoleLimit: 20,
+  });
+  assertToolSuccess(debugActivity, "debug activity");
+  const networkStop = await call("browser_network_stop_recording", {});
+  assertToolSuccess(networkStop, "Network stop");
+
+  const verification = await call("browser_verify", {
+    ...(baselineRevision > 0 ? { sinceRevision: baselineRevision } : {}),
+    checks: [
+      { id: "drawer", type: "text_contains", value: "抽屉操作 1" },
+      { id: "network", type: "text_contains", value: "network-complete" },
+    ],
+  });
+  assertToolSuccess(verification, "outcome verification");
+  if (verification.structuredContent?.passed !== true) {
+    throw new Error(
+      `Outcome verification failed: ${JSON.stringify(verification.structuredContent)}`,
+    );
+  }
 
   const stageData = stage.structuredContent ?? {};
-  const digest = networkDigest.structuredContent ?? {};
-  const observation = delta.structuredContent?.observation ?? {};
+  const activity = debugActivity.structuredContent ?? {};
+  const digest = activity.network ?? {};
+  const verified = verification.structuredContent ?? {};
   return {
     actionStage: {
       completed: stageData.completed,
@@ -251,8 +303,12 @@ async function runOrdinaryRegression() {
     },
     domDelta: {
       baselineRevision,
-      currentRevision: observation.domRevision ?? null,
-      delta: observation.delta ?? null,
+      currentRevision: verified.domRevision ?? null,
+      delta: verified.delta ?? null,
+    },
+    verification: {
+      passed: verified.passed,
+      checks: verified.checks,
     },
   };
 }

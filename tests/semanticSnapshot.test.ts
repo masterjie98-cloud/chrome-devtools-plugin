@@ -19,6 +19,13 @@ test("semantic snapshots provide stable refs and cursor pagination", () => {
   );
 
   assert.deepEqual(first.nodes.map((node) => node.ref), ["s1", "s2"]);
+  assert.deepEqual(
+    first.nodes.map((node) => node.targetRef),
+    [
+      `sr1_${first.fingerprint}_s1`,
+      `sr1_${first.fingerprint}_s2`,
+    ],
+  );
   assert.equal(first.pagination.hasMore, true);
   assert.equal(first.pagination.returnedCount, 2);
   assert.equal(first.pagination.collectedCount, 3);

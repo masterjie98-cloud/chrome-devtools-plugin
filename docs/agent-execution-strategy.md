@@ -108,9 +108,9 @@ separate unrestricted executor.
   triggering calls.
 - Screenshot failure and attachment-cap exhaustion fall back to fresh DOM evidence;
   Safe Retry disables the fast path so it cannot silently resend an image.
-- The profile setting defaults off. First enable and Provider-origin changes
-  explicitly confirm the possible screenshot destination, but enabling the
-  setting does not itself capture an image. The current local single-user
+- The profile setting defaults on for DOM-first orchestration. Provider-origin
+  changes still confirm the possible screenshot destination, but enabling the
+  setting or sending a message does not itself capture an image. The current local single-user
   implementation keeps this consent Profile-persistent, so the user must turn
   it off before opening pages they do not want sent to that Provider.
 

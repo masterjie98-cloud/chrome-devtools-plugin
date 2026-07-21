@@ -320,6 +320,13 @@ test("representative MCP output schemas reject shape drift", () => {
         argumentsSha256: "a".repeat(64),
         revision: 1,
         outcome: "completed",
+        approvalWaitMs: 1200,
+        queueWaitMs: 18,
+        executorMs: 42,
+        transportMs: 7,
+        totalMs: 1267,
+        resultChars: 481,
+        payloadBytes: 912,
       },
       {
         id: "event-2",
@@ -360,9 +367,19 @@ test("representative MCP output schemas reject shape drift", () => {
     }).success,
     false,
   );
+  assert.equal(
+    MCP_TOOL_OUTPUT_SCHEMAS[
+      MCP_TOOL_NAMES.BROWSER_GET_AUDIT_EVENTS
+    ].safeParse({
+      ...auditOutput,
+      events: [{ ...auditOutput.events[0], executorMs: -1 }],
+    }).success,
+    false,
+  );
 });
 
 test("MCP tool profiles reduce model-visible capability without changing policy", () => {
+  const smart = runtimeToolsForProfile("smart");
   const inspect = runtimeToolsForProfile("inspect");
   const read = runtimeToolsForProfile("read");
   const full = runtimeToolsForProfile("full");
@@ -378,7 +395,18 @@ test("MCP tool profiles reduce model-visible capability without changing policy"
   );
   assert.equal(inspect.length < read.length, true);
   assert.equal(read.length < full.length, true);
-  assert.equal(parseMcpToolProfile(undefined), "full");
+  assert.equal(smart.length, 10);
+  assert.deepEqual(
+    smart.slice(0, 5).map((tool) => tool.definition.name),
+    [
+      MCP_TOOL_NAMES.BROWSER_STATUS,
+      MCP_TOOL_NAMES.BROWSER_OBSERVE,
+      MCP_TOOL_NAMES.BROWSER_ACT,
+      MCP_TOOL_NAMES.BROWSER_VERIFY,
+      MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+    ],
+  );
+  assert.equal(parseMcpToolProfile(undefined), "smart");
   assert.throws(() => parseMcpToolProfile("admin"), /Invalid/);
 });
 
@@ -399,6 +427,18 @@ test("canonical MCP Zod inputs reject unknown properties", () => {
   assert.equal(
     MCP_TOOL_INPUT_SCHEMAS[MCP_TOOL_NAMES.BROWSER_SNAPSHOT].safeParse({
       limit: 101,
+    }).success,
+    false,
+  );
+  assert.equal(
+    MCP_TOOL_INPUT_SCHEMAS[MCP_TOOL_NAMES.BROWSER_CLICK].safeParse({
+      ref: "sr1_deadbeef_s12",
+    }).success,
+    true,
+  );
+  assert.equal(
+    MCP_TOOL_INPUT_SCHEMAS[MCP_TOOL_NAMES.BROWSER_CLICK].safeParse({
+      ref: "s12",
     }).success,
     false,
   );

@@ -44,6 +44,7 @@ export interface CompressedSelectedElement {
 
 export interface CompressedExecutionControl {
   ref: string;
+  targetRef: string;
   role: string;
   name: string;
   selector: string;
@@ -204,6 +205,7 @@ function compressExecutionControl(
 ): CompressedExecutionControl {
   return {
     ref: node.ref,
+    targetRef: node.targetRef,
     role: node.role,
     name: node.name,
     selector: node.selector,

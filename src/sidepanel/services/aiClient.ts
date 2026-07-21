@@ -1,4 +1,5 @@
 import type { DomElementInfo, PageSnapshot } from "../../shared/dom";
+import { SUPPORTED_COMPUTED_STYLE_PROPERTIES } from "../../shared/dom";
 import type {
   CollaborationItem,
   CollaborationWorkspaceSnapshot,
@@ -1399,6 +1400,11 @@ function toPseudoToolCall(
   }
 
   const candidateEntries: Array<[string, unknown]> = [
+    [MCP_TOOL_NAMES.BROWSER_STATUS, value.browser_status],
+    [MCP_TOOL_NAMES.BROWSER_OBSERVE, value.browser_observe],
+    [MCP_TOOL_NAMES.BROWSER_ACT, value.browser_act],
+    [MCP_TOOL_NAMES.BROWSER_VERIFY, value.browser_verify],
+    [MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY, value.browser_debug_activity],
     [MCP_TOOL_NAMES.BROWSER_QUERY_DOM, value.browser_query_dom],
     ["query_dom", value.query_dom],
     [MCP_TOOL_NAMES.BROWSER_HIGHLIGHT_ELEMENT, value.browser_highlight_element],
@@ -1591,35 +1597,8 @@ function normalizeAiToolArguments(
         ),
       };
     }
-    case MCP_TOOL_NAMES.BROWSER_QUERY_DOM: {
-      const query =
-        readString(rawArguments.query) || readString(rawArguments.selector);
-      const maxTextLength = readNonNegativeInt(rawArguments.maxTextLength);
-      const maxOuterHTMLLength = readNonNegativeInt(
-        rawArguments.maxOuterHTMLLength,
-      );
-      return {
-        ...(query ? { query } : {}),
-        queryType:
-          rawArguments.queryType === "className"
-            ? "className"
-            : rawArguments.queryType === "xpath"
-              ? "xpath"
-              : "selector",
-        limit: readPositiveInt(rawArguments.limit, 5),
-        ...(typeof rawArguments.includeText === "boolean"
-          ? { includeText: rawArguments.includeText }
-          : {}),
-        ...(typeof rawArguments.includeOuterHTML === "boolean"
-          ? { includeOuterHTML: rawArguments.includeOuterHTML }
-          : {}),
-        ...(typeof rawArguments.includeComputedStyle === "boolean"
-          ? { includeComputedStyle: rawArguments.includeComputedStyle }
-          : {}),
-        ...(maxTextLength !== undefined ? { maxTextLength } : {}),
-        ...(maxOuterHTMLLength !== undefined ? { maxOuterHTMLLength } : {}),
-      };
-    }
+    case MCP_TOOL_NAMES.BROWSER_QUERY_DOM:
+      return normalizeDomQueryArguments(rawArguments);
     case MCP_TOOL_NAMES.BROWSER_HIGHLIGHT_ELEMENT: {
       const selector = readString(rawArguments.selector);
       return {
@@ -2002,12 +1981,71 @@ function normalizeScreenshotArguments(
     ...(readPositiveInt(rawArguments.quality, 0)
       ? { quality: readPositiveInt(rawArguments.quality, 0) }
       : {}),
-    ...(readString(rawArguments.filename)
-      ? { filename: readString(rawArguments.filename) }
+  };
+}
+
+function normalizeDomQueryArguments(
+  rawArguments: Record<string, unknown>,
+): Record<string, unknown> {
+  if (Array.isArray(rawArguments.queries)) {
+    const queries = rawArguments.queries
+      .filter(
+        (value): value is Record<string, unknown> =>
+          Boolean(value) && typeof value === "object" && !Array.isArray(value),
+      )
+      .slice(0, 12)
+      .map((value) => normalizeDomQueryItem(value, false))
+      .filter((value) => typeof value.query === "string");
+    return queries.length > 0 ? { queries } : {};
+  }
+  return normalizeDomQueryItem(rawArguments, true);
+}
+
+function normalizeDomQueryItem(
+  rawArguments: Record<string, unknown>,
+  allowSelectorAlias: boolean,
+): Record<string, unknown> {
+  const query =
+    readString(rawArguments.query) ||
+    (allowSelectorAlias ? readString(rawArguments.selector) : "");
+  const maxTextLength = readNonNegativeInt(rawArguments.maxTextLength);
+  const maxOuterHTMLLength = readNonNegativeInt(
+    rawArguments.maxOuterHTMLLength,
+  );
+  const computedStyleProperties = Array.isArray(
+    rawArguments.computedStyleProperties,
+  )
+    ? Array.from(
+        new Set(
+          rawArguments.computedStyleProperties
+            .map(readString)
+            .filter(Boolean),
+        ),
+      ).slice(0, SUPPORTED_COMPUTED_STYLE_PROPERTIES.length)
+    : [];
+  return {
+    ...(query ? { query } : {}),
+    queryType:
+      rawArguments.queryType === "className"
+        ? "className"
+        : rawArguments.queryType === "xpath"
+          ? "xpath"
+          : "selector",
+    limit: readPositiveInt(rawArguments.limit, 5),
+    ...(typeof rawArguments.includeText === "boolean"
+      ? { includeText: rawArguments.includeText }
       : {}),
-    ...(typeof rawArguments.saveToDownloads === "boolean"
-      ? { saveToDownloads: rawArguments.saveToDownloads }
+    ...(typeof rawArguments.includeOuterHTML === "boolean"
+      ? { includeOuterHTML: rawArguments.includeOuterHTML }
       : {}),
+    ...(typeof rawArguments.includeComputedStyle === "boolean"
+      ? { includeComputedStyle: rawArguments.includeComputedStyle }
+      : {}),
+    ...(computedStyleProperties.length > 0
+      ? { computedStyleProperties }
+      : {}),
+    ...(maxTextLength !== undefined ? { maxTextLength } : {}),
+    ...(maxOuterHTMLLength !== undefined ? { maxOuterHTMLLength } : {}),
   };
 }
 
@@ -2335,17 +2373,17 @@ function buildSystemPrompt(config: AiConfig): string {
     "You do have MCP page tools. When the user asks to inspect, highlight, hide, restyle, or change an element, call the relevant MCP tool instead of saying you lack permission.",
     "Never narrate a future tool step in prose when you can emit the tool call immediately. Do not say 'let me inspect' or 'I will query the DOM' without the actual tool call.",
     "Network and debugger tools are local extension tools attached only to the active tab. Do not use or ask for browser-wide list_pages/select_page.",
-    "Structured browser actions are implemented internally: use browser_snapshot, browser_execute_action_stage, browser_navigate, browser_navigate_back, browser_navigate_forward, browser_click, browser_fill_form, browser_type, browser_press_key, browser_select_option, browser_drag, browser_wait_for, browser_console_messages, browser_storage_state, and browser_take_screenshot as needed. Selector-based actions accept native browser CSS only; never emit Playwright/jQuery text selectors such as :has-text(), :contains(), text=, locator chaining, or XPath.",
+    "Use browser_status for connectivity, browser_observe for one fresh bounded live page read, browser_act for a bounded current-page action stage, browser_verify for deterministic post-action checks, and browser_debug_activity for compact Network plus console evidence. Prefer actionable targetRef values from browser_observe/browser_snapshot over copying CSS selectors. Expert primitive tools remain available when the high-level protocol cannot express the task. Selector-based actions accept native browser CSS only; never emit Playwright/jQuery text selectors such as :has-text(), :contains(), text=, locator chaining, or XPath.",
     ...(config.fastAgentMode
       ? [
-          "Fast execution mode is enabled. No page screenshot is attached automatically when the user sends a message. Begin with browser_snapshot mode=interactive and a bounded sourceLimit. When multiple current-page targets and values are already known, use one browser_execute_action_stage so independent fill/select actions run as a local batch and ordered clicks/waits stay explicit barriers; do not spend one model round per field. During your Observe phase, call browser_take_screenshot yourself only when current visual geometry, layout, occlusion, or rendering would materially reduce task uncertainty; pure DOM, text, style-value, and Network tasks should not capture an image by default. After visual observation is explicitly activated, use only the latest checkpoint after navigation, overlays, large DOM changes, uncertain action outcomes, or final visual criteria.",
+          "Fast execution mode is enabled. No page screenshot is attached automatically when the user sends a message. Begin with browser_observe mode=interactive and a bounded sourceLimit. When multiple current-page targets and values are already known, use one browser_act so independent fill/select actions run as a local batch and ordered clicks/waits stay explicit barriers; do not spend one model round per field. Verify with browser_verify. During Observe, call browser_take_screenshot yourself only when current visual geometry, layout, occlusion, or rendering would materially reduce task uncertainty; pure DOM, text, style-value, and Network tasks should not capture an image by default. After visual observation is explicitly activated, use only the latest checkpoint after navigation, overlays, large DOM changes, uncertain action outcomes, or final visual criteria.",
         ]
       : []),
     "Arbitrary page-side JavaScript execution is disabled until a deadline-bound isolated executor is available.",
     "For Network debugging or a task action likely to send a request, call browser_network_start_recording before the relevant action, then call browser_network_requests with digestOnly=true once after the action barrier. Use its activityDigest with DOM, route, and visual evidence; repeated heartbeat-like GET/HEAD groups are noise, not proof of progress. Request raw rows or request/response bodies only when the user explicitly needs detailed Network debugging.",
     "For request supervision, request-header rewrites, response interception, and response body mocks, use browser_proxy_upsert_rule plus browser_proxy_enable. Do not claim network interception or response mocking is unavailable when browser_proxy_upsert_rule is present in the tool list. Prefer CDP proxy rules over static DNR when the user asks to intercept or replace live page requests.",
     "For API mock data, create a browser_proxy_upsert_rule with urlContains/urlPattern, method, optional resourceType, responseBody or responseBodyBase64, contentType, statusCode, and mockStage; then call browser_proxy_enable and reload or reproduce the request.",
-    "When multiple tools look similar, prefer the canonical Playwright-compatible names exposed in the tool list. Use browser_network_requests instead of browser_network_list_requests, and browser_snapshot instead of browser_get_page_context.",
+    "When multiple tools look similar, prefer browser_observe over browser_snapshot/browser_get_page_context, browser_act over individual same-stage actions, browser_verify over ad hoc repeat reads, and browser_network_requests over browser_network_list_requests.",
     "When full DOM is needed, call browser_query_dom with query 'html' or 'body', limit 1, and maxOuterHTMLLength 0.",
     "When the user is asking about the current page, gather evidence with the available tools before giving a final answer.",
     buildAgentExecutionStrategyPrompt(),

@@ -56,6 +56,7 @@ import type {
   ScreenshotCaptureInput,
   ScreenshotCaptureResult,
 } from "./dom";
+import { SUPPORTED_COMPUTED_STYLE_PROPERTIES } from "./dom";
 import { isSupportedTrustedKey } from "./trustedKeyboard";
 import type {
   DebuggerDetachInput,
@@ -1761,9 +1762,61 @@ function validateDomQuery(args: Record<string, unknown>): string | null {
 
   if (
     args.limit !== undefined &&
-    (!Number.isInteger(args.limit) || Number(args.limit) <= 0)
+    (!Number.isInteger(args.limit) ||
+      Number(args.limit) <= 0 ||
+      Number(args.limit) > 100)
   ) {
-    return "limit must be a positive integer.";
+    return "limit must be an integer between 1 and 100.";
+  }
+
+  for (const flag of [
+    "includeText",
+    "includeOuterHTML",
+    "includeComputedStyle",
+  ] as const) {
+    if (args[flag] !== undefined && typeof args[flag] !== "boolean") {
+      return `${flag} must be a boolean.`;
+    }
+  }
+
+  for (const limitName of [
+    "maxTextLength",
+    "maxOuterHTMLLength",
+  ] as const) {
+    if (
+      args[limitName] !== undefined &&
+      (!Number.isInteger(args[limitName]) || Number(args[limitName]) < 0)
+    ) {
+      return `${limitName} must be a non-negative integer.`;
+    }
+  }
+
+  if (args.computedStyleProperties !== undefined) {
+    if (
+      !Array.isArray(args.computedStyleProperties) ||
+      args.computedStyleProperties.length === 0 ||
+      args.computedStyleProperties.length >
+        SUPPORTED_COMPUTED_STYLE_PROPERTIES.length
+    ) {
+      return "computedStyleProperties must be a non-empty bounded array.";
+    }
+    const supported = new Set<string>(SUPPORTED_COMPUTED_STYLE_PROPERTIES);
+    if (
+      args.computedStyleProperties.some(
+        (property) => typeof property !== "string" || !supported.has(property),
+      )
+    ) {
+      return "computedStyleProperties contains an unsupported property.";
+    }
+    if (
+      new Set(args.computedStyleProperties).size !==
+      args.computedStyleProperties.length
+    ) {
+      return "computedStyleProperties must be unique.";
+    }
+    if (args.includeComputedStyle === false) {
+      return "computedStyleProperties cannot be used when includeComputedStyle is false.";
+    }
   }
 
   return null;

@@ -12,6 +12,7 @@ import {
   DownloadOutlined,
   DownOutlined,
   EditOutlined,
+  ExclamationCircleOutlined,
   FileSearchOutlined,
   GlobalOutlined,
   HistoryOutlined,
@@ -28,6 +29,7 @@ import {
 } from "@ant-design/icons";
 import Button from "antd/es/button";
 import Drawer from "antd/es/drawer";
+import Dropdown from "antd/es/dropdown";
 import Empty from "antd/es/empty";
 import Image from "antd/es/image";
 import Input from "antd/es/input";
@@ -46,7 +48,10 @@ import {
   type AgentRunBudgetExtensionDecision,
   type AgentRunBudgetExtensionRequest,
 } from "../../shared/agentRunBudget";
-import type { ToolApprovalDecision } from "../agentRunApprovals";
+import type {
+  ExecutionApprovalMode,
+  ToolApprovalDecision,
+} from "../agentRunApprovals";
 import { getChatShortcutState } from "../chatShortcutState";
 import { getAssistantDisplayContent } from "../services/assistantContent";
 import type {
@@ -54,7 +59,6 @@ import type {
   ChatConversationSummary,
   ChatMessage,
   ChatSendMode,
-  ConversationOriginApprovalStatus,
   PendingToolApproval,
   QueuedChatSubmission,
 } from "../types";
@@ -77,7 +81,8 @@ interface ChatPanelProps {
   streamingMessageId?: string;
   pendingToolApproval?: PendingToolApproval | null;
   pendingBudgetExtension?: AgentRunBudgetExtensionRequest | null;
-  conversationOriginApproval?: ConversationOriginApprovalStatus | null;
+  executionApprovalMode: ExecutionApprovalMode;
+  executionApprovalOrigin?: string;
   queuedMessages: QueuedChatSubmission[];
   delegatedTasks: DelegatedTaskSnapshot[];
   delegatedInboxTasks: DelegatedTaskSnapshot[];
@@ -113,7 +118,7 @@ interface ChatPanelProps {
   onResolveBudgetExtension: (
     decision: AgentRunBudgetExtensionDecision,
   ) => void;
-  onRevokeConversationOriginApproval: () => void;
+  onChangeExecutionApprovalMode: (mode: ExecutionApprovalMode) => void;
   onReadPage: () => void;
   onPickElement: () => void;
   onCancelElementPick: () => void;
@@ -140,7 +145,8 @@ export function ChatPanel({
   streamingMessageId,
   pendingToolApproval,
   pendingBudgetExtension,
-  conversationOriginApproval,
+  executionApprovalMode,
+  executionApprovalOrigin,
   queuedMessages,
   delegatedTasks,
   delegatedInboxTasks,
@@ -165,7 +171,7 @@ export function ChatPanel({
   onDraftChange,
   onResolveToolApproval,
   onResolveBudgetExtension,
-  onRevokeConversationOriginApproval,
+  onChangeExecutionApprovalMode,
   onReadPage,
   onPickElement,
   onCancelElementPick,
@@ -690,12 +696,11 @@ export function ChatPanel({
             onResolve={onResolveToolApproval}
           />
         ) : null}
-        {conversationOriginApproval ? (
-          <ConversationOriginApprovalBar
-            approval={conversationOriginApproval}
-            onRevoke={onRevokeConversationOriginApproval}
-          />
-        ) : null}
+        <ExecutionApprovalModeBar
+          mode={executionApprovalMode}
+          origin={executionApprovalOrigin}
+          onChange={onChangeExecutionApprovalMode}
+        />
         <div className={`chat-composer ${composerFocused ? "chat-composer-focused" : ""}`}>
         {queuedMessages.length ? (
           <div className="chat-queue" aria-label="待发送消息队列">
@@ -1157,10 +1162,24 @@ function ToolApprovalCard({
   const titleId = `tool-approval-title-${approval.id}`;
   const descriptionId = `tool-approval-description-${approval.id}`;
   const cardRef = useRef<HTMLElement>(null);
+  const [argumentsExpanded, setArgumentsExpanded] = useState(false);
+  const formattedArguments = useMemo(
+    () => formatApprovalArguments(approval.arguments),
+    [approval.arguments],
+  );
 
   useEffect(() => {
     cardRef.current?.focus({ preventScroll: true });
+    setArgumentsExpanded(false);
   }, [approval.id]);
+
+  const isDecisionBarrier =
+    approval.approvalMode === "decision_barrier" ||
+    approval.approvalMode === "always";
+  const policyDescription = formatApprovalPolicyDescription(
+    approval,
+    isDecisionBarrier,
+  );
 
   return (
     <section
@@ -1186,10 +1205,23 @@ function ToolApprovalCard({
         >
           Agent 正在等待授权，确认前不会继续执行这个操作。
         </Typography.Paragraph>
+        <div
+          className={`tool-approval-policy ${
+            isDecisionBarrier ? "is-decision-barrier" : "is-task-grant"
+          }`}
+          role="note"
+        >
+          <strong>
+            {isDecisionBarrier
+              ? "高风险操作 · 必须逐次确认"
+              : "普通操作 · 可由当前聊天授权覆盖"}
+          </strong>
+          <span>{policyDescription}</span>
+        </div>
         {approval.allowForConversationOriginAvailable &&
         approval.conversationOrigin ? (
           <div className="tool-approval-run-scope" role="note">
-            选择“此聊天自动允许”后，当前聊天可在
+            选择“替我审批并继续”后，当前聊天可在
             <strong> {approval.conversationOrigin} </strong>
             自动批准普通页面操作、视觉观察和聚合 Network 证据。切换聊天、域名、
             Profile、Provider 或关闭开关后立即失效；提交、发送、删除、敏感字段、
@@ -1233,9 +1265,34 @@ function ToolApprovalCard({
             ))}
           </div>
         ) : null}
-        <pre className="tool-approval-args">
-          {formatApprovalArguments(approval.arguments)}
-        </pre>
+        <div className="tool-approval-args-section">
+          <div className="tool-approval-args-heading">
+            <Typography.Text strong>操作参数</Typography.Text>
+            <Typography.Text type="secondary">
+              {formattedArguments.length} 字符
+            </Typography.Text>
+            <Button
+              type="text"
+              size="small"
+              icon={argumentsExpanded ? <DownOutlined /> : <RightOutlined />}
+              onClick={() => setArgumentsExpanded((current) => !current)}
+              aria-expanded={argumentsExpanded}
+              aria-controls={`tool-approval-args-${approval.id}`}
+            >
+              {argumentsExpanded ? "收起" : "展开"}
+            </Button>
+          </div>
+          {argumentsExpanded ? (
+            <pre
+              id={`tool-approval-args-${approval.id}`}
+              className="tool-approval-args"
+              tabIndex={0}
+              aria-label={`${approval.toolName} 操作参数`}
+            >
+              {formattedArguments}
+            </pre>
+          ) : null}
+        </div>
         <div className="tool-approval-actions">
           <Button danger onClick={() => onResolve("deny")}>拒绝</Button>
           <Button onClick={() => onResolve("allow_once")}>仅本次允许</Button>
@@ -1247,7 +1304,7 @@ function ToolApprovalCard({
                 onClick={() => onResolve("allow_conversation_origin")}
                 aria-label={`此聊天在 ${approval.conversationOrigin} 自动允许页面操作`}
               >
-                此聊天自动允许
+                替我审批并继续
               </Button>
             </Tooltip>
           ) : null}
@@ -1257,54 +1314,112 @@ function ToolApprovalCard({
   );
 }
 
-function ConversationOriginApprovalBar({
-  approval,
-  onRevoke,
+function ExecutionApprovalModeBar({
+  mode,
+  origin,
+  onChange,
 }: {
-  approval: ConversationOriginApprovalStatus;
-  onRevoke: () => void;
+  mode: ExecutionApprovalMode;
+  origin?: string;
+  onChange: (mode: ExecutionApprovalMode) => void;
 }) {
+  const options: Array<{
+    key: ExecutionApprovalMode;
+    title: string;
+    description: string;
+    icon: ReactNode;
+  }> = [
+    {
+      key: "ask",
+      title: "请求批准",
+      description: "受控读取、页面修改和外部副作用始终询问",
+      icon: <ExclamationCircleOutlined />,
+    },
+    {
+      key: "agent",
+      title: "替我审批",
+      description: "普通可恢复操作自动继续，风险操作仍请求批准",
+      icon: <SafetyCertificateOutlined />,
+    },
+    {
+      key: "full",
+      title: "完全访问权限",
+      description: "当前聊天与当前域名内不再逐次询问",
+      icon: <GlobalOutlined />,
+    },
+  ];
+  const active = options.find((option) => option.key === mode) ?? options[0]!;
+
   return (
-    <div
-      className="conversation-origin-approval"
-      role="status"
-      aria-live="polite"
+    <Dropdown
+      trigger={["click"]}
+      placement="topRight"
+      menu={{
+        selectable: true,
+        selectedKeys: [mode],
+        items: options.map((option) => ({
+          key: option.key,
+          icon: option.icon,
+          label: (
+            <span className="execution-approval-menu-label">
+              <strong>{option.title}</strong>
+              <span>{option.description}</span>
+            </span>
+          ),
+        })),
+        onClick: ({ key }) => onChange(key as ExecutionApprovalMode),
+      }}
     >
-      <div className="conversation-origin-approval-copy">
-        <GlobalOutlined />
-        <span>
-          <strong>自动允许已开启</strong>
-          <span className="conversation-origin-approval-origin">
-            {approval.origin} · 仅当前聊天
+      <button
+        type="button"
+        className={`execution-approval-mode is-${mode}`}
+        aria-label={`切换执行审批模式，当前为${active.title}`}
+        aria-haspopup="menu"
+      >
+        <span className="execution-approval-mode-copy" aria-live="polite">
+          {active.icon}
+          <span>
+            <strong>{active.title}</strong>
+            <span className="execution-approval-mode-scope">
+              {mode === "ask"
+                ? active.description
+                : `${origin ?? "当前页面"} · 当前聊天`}
+            </span>
           </span>
         </span>
-      </div>
-      <label className="conversation-origin-approval-toggle">
-        <span>开启</span>
-        <Switch
-          size="small"
-          checked
-          onChange={(checked) => {
-            if (!checked) {
-              onRevoke();
-            }
-          }}
-          aria-label={`关闭 ${approval.origin} 的当前聊天自动允许`}
-        />
-      </label>
-    </div>
+        <span className="execution-approval-mode-chevron" aria-hidden="true">
+          <DownOutlined />
+        </span>
+      </button>
+    </Dropdown>
   );
 }
 
 function formatApprovalArguments(args: Record<string, unknown>): string {
   try {
-    const serialized = JSON.stringify(args ?? {}, null, 2);
-    return serialized.length > 1600
-      ? `${serialized.slice(0, 1600)}\n...已截断`
-      : serialized;
+    return JSON.stringify(args ?? {}, null, 2);
   } catch {
     return "{}";
   }
+}
+
+function formatApprovalPolicyDescription(
+  approval: PendingToolApproval,
+  isDecisionBarrier: boolean,
+): string {
+  if (isDecisionBarrier) {
+    return "运行时将提交、发送、删除、持久化、敏感输入或无法确认目标语义的操作视为高风险；当前聊天授权不会跳过本次确认。";
+  }
+  if (approval.toolName === "browser_debug_activity") {
+    return "只读取聚合后的 Network 活动摘要和脱敏 Console；不包含原始请求、响应体、Header 或 Storage 值。";
+  }
+  if (approval.toolName === "browser_take_screenshot") {
+    return "读取当前页面像素作为视觉证据，不会保存到 Chrome 下载目录。";
+  }
+  if (approval.policyClass === "page_action") {
+    return "当前调用属于普通页面交互；授权后，同一聊天和域名内的同类低风险操作可自动执行。";
+  }
+  return "当前调用属于受限的页面证据读取或可撤销操作，可由同一聊天和域名的普通操作授权覆盖。";
 }
 
 function renderRichContent(content: string): ReactNode {

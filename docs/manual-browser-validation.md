@@ -241,20 +241,23 @@ fall back to synthetic DOM events.
    Provider origin without path, query, or API key. For a Codex/MCP request, it
    must say that downstream egress is managed by the MCP client instead of
    displaying the extension's Provider.
-9. In the embedded Agent, request an eligible page action and choose
-   `此聊天自动允许`. Expected: a persistent strip above the composer shows the
-   normalized HTTP(S) origin and an enabled revoke switch. Request another
-   eligible tool in a later reply on the same origin. It must not show another
-   card, but daemon audit must still record a separate approval and the executor
-   must receive a fresh single-use grant.
-10. Turn the strip switch off and request another eligible action. Expected: a
-    new card appears. Enable it again, then switch to another saved chat or move
-    the page to another origin (a path-only change is not enough). Expected: the
-    strip disappears and the next eligible request requires confirmation.
-11. Confirm `此聊天自动允许` is absent for a Codex/MCP requester and for
-    destructive, arbitrary-execution, open-world, unknown-policy, unbound-target,
-    and non-HTTP(S) requests. Navigation, cookie mutation, and proxy/DNR mutation
-    continue to require one-time approval.
+9. Confirm the execution approval strip is always visible and defaults to
+   `请求批准`. Trigger an eligible page action, switch to `替我审批` while its card
+   is waiting, and confirm the pending ordinary operation continues. A later
+   same-origin `task_grant` request from either embedded AI or MCP must not show a
+   card, while `decision_barrier` and `always` requests must still stop.
+   Open the card's `操作参数`: the JSON viewport must have a usable height,
+   support keyboard focus and independent scrolling, and disappear completely
+   after `收起`. The approval strip itself is one full-width trigger with no
+   nested secondary button.
+10. Switch to `完全访问权限` and approve the explicit mode choice. Trigger one
+    ordinary operation and one decision-barrier operation on the same origin.
+    Neither should show a per-tool card; daemon audit must still record separate
+    approvals and each executor dispatch must receive a fresh single-use grant.
+11. Switch back to `请求批准`, then change saved chat, page origin, Chrome Profile,
+    Provider, and Hub connection in separate runs. Expected: every change resets
+    an automatic mode to `请求批准`. A path-only navigation stays in scope; an
+    unbound target or non-HTTP(S) page can never enable an automatic mode.
 12. In AI settings, set `单段工具轮数` to `1` and keep `自动压缩并续跑` on.
     Run a task that needs at least two distinct read-only tool rounds. Expected:
     the Agent reports that it is entering another execution segment, performs
@@ -554,6 +557,10 @@ least three times.
    origin/path and no query or fragment.
 4. Confirm no request/response body, header, post data, Cookie, or Authorization
    value appears in the digest or worksheet.
+5. With Network recording attached to tab A, select tab B and call
+   `browser_debug_activity`. Expected: `STALE_CONTEXT` identifies the mismatched
+   source tab. It must never return Network evidence from A beside Console
+   evidence from B.
 
 Failure conditions:
 
@@ -562,6 +569,8 @@ Failure conditions:
 - query/fragment, headers, post data, or bodies appear in `activityDigest`;
 - repeated heartbeat rows crowd out the action request;
 - the Agent polls Network continuously instead of reading at decision barriers.
+- `browser_debug_activity` merges evidence from different tabs or silently
+  relabels an old recorder as the selected target.
 
 ### 5.3 Verify recoverable Agent budget checkpoints
 

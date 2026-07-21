@@ -20,6 +20,7 @@ import { WS_CLIENT_IDENTITIES } from "../../shared/wsClientIdentity";
 
 interface BrowserStateHubState {
   connected: boolean;
+  sessionId?: string;
   activeTab?: ActiveTabSnapshot;
   selectedElement?: DomElementInfo;
   pageContext?: PageSnapshot;
@@ -124,7 +125,11 @@ export function useBrowserStateHub(): BrowserStateHubState {
             break;
           }
           reconnectAttempt = 0;
-          setState((current) => ({ ...current, connected: true }));
+          setState((current) => ({
+            ...current,
+            connected: true,
+            sessionId: parsed.payload?.sessionId as string,
+          }));
           if (heartbeatTimer !== undefined) {
             window.clearInterval(heartbeatTimer);
           }

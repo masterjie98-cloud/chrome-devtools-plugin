@@ -38,6 +38,9 @@ import {
 interface AiSettingsDrawerProps {
   open: boolean;
   profilesState: AiProfilesState;
+  bridgeConnected: boolean;
+  activeTargetLabel?: string;
+  pageContextSynced: boolean;
   onClose: () => void;
   onSave: (state: AiProfilesState) => Promise<void>;
 }
@@ -51,11 +54,14 @@ type ConfigFormValues = AiConfig & { profileName: string };
 export function AiSettingsDrawer({
   open,
   profilesState,
+  bridgeConnected,
+  activeTargetLabel,
+  pageContextSynced,
   onClose,
   onSave,
 }: AiSettingsDrawerProps) {
   const [form] = Form.useForm<ConfigFormValues>();
-  const { modal } = AntApp.useApp();
+  const { modal, message } = AntApp.useApp();
   const supportsVision = Boolean(
     Form.useWatch("supportsVision", { form, preserve: true }),
   );
@@ -76,6 +82,7 @@ export function AiSettingsDrawer({
   const [detecting, setDetecting] = useState(false);
   const [bridgeToken, setBridgeToken] = useState("");
   const [installationId, setInstallationId] = useState("");
+  const [savingBridge, setSavingBridge] = useState(false);
   const [submitError, setSubmitError] = useState<string>();
 
   useEffect(() => {
@@ -195,6 +202,20 @@ export function AiSettingsDrawer({
     }
   };
 
+  const saveLocalConnection = async () => {
+    setSavingBridge(true);
+    try {
+      await saveBridgeToken(bridgeToken);
+      message.success("本机连接凭据已保存，Bridge 会自动重连。");
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : "本机连接凭据保存失败。",
+      );
+    } finally {
+      setSavingBridge(false);
+    }
+  };
+
   return (
     <Drawer
       title="AI 配置"
@@ -250,6 +271,34 @@ export function AiSettingsDrawer({
           连接
         </Typography.Text>
 
+        <div className="settings-connection-status">
+          <div className="settings-connection-status__header">
+            <div>
+              <Typography.Text strong>本机连接中心</Typography.Text>
+              <Typography.Paragraph type="secondary">
+                这里只确认扩展与本地 daemon；Codex/Claude/Cursor 是否已注册需在对应客户端检查。
+              </Typography.Paragraph>
+            </div>
+            <Tag color={bridgeConnected ? "success" : "default"}>
+              {bridgeConnected ? "Bridge 已连接" : "Bridge 未连接"}
+            </Tag>
+          </div>
+          <div className="settings-connection-status__grid">
+            <span>当前页面</span>
+            <Typography.Text ellipsis={{ tooltip: activeTargetLabel }}>
+              {activeTargetLabel || "尚未同步目标"}
+            </Typography.Text>
+            <span>页面上下文</span>
+            <Typography.Text type={pageContextSynced ? "success" : "secondary"}>
+              {pageContextSynced ? "已同步" : "等待首次观察"}
+            </Typography.Text>
+            <span>MCP 客户端</span>
+            <Typography.Text>
+              在项目目录运行 <Typography.Text code copyable={{ text: "npm run client:config" }}>npm run client:config</Typography.Text>
+            </Typography.Text>
+          </div>
+        </div>
+
         <Form.Item
           label="本地 Bridge Token"
           extra="先在项目目录运行 npm run daemon:token，再把输出粘贴到这里。Token 仅保存在当前 Chrome Profile。"
@@ -261,6 +310,15 @@ export function AiSettingsDrawer({
             autoComplete="off"
           />
         </Form.Item>
+
+        <Button
+          block
+          loading={savingBridge}
+          onClick={() => void saveLocalConnection()}
+          style={{ marginBottom: 16 }}
+        >
+          保存本机连接并重连
+        </Button>
 
         <Form.Item label="Chrome Profile Installation ID">
           <Typography.Text code copyable={{ text: installationId }}>
@@ -398,12 +456,12 @@ export function AiSettingsDrawer({
           </div>
 
           <Form.Item name="fastAgentMode" valuePropName="checked">
-            <Switch disabled={!supportsVision} />
+            <Switch />
           </Form.Item>
           <div>
             <Typography.Text>极速执行（DOM + 按需视觉）</Typography.Text>
             <Typography.Paragraph type="secondary">
-              首轮只提供有界 DOM 执行图，不自动截图。Agent 判断视觉信息确有帮助时才主动请求截图；进入视觉观察后，页面状态变化可刷新最新检查点并发送到 {providerOrigin}。模型不支持图片时不可开启。
+              默认开启。首轮提供有界 DOM 执行图，不自动截图；模型支持图片且 Agent 判断视觉信息有帮助时，才主动请求截图并在页面变化后刷新检查点。视觉内容会发送到 {providerOrigin}。
             </Typography.Paragraph>
           </div>
         </div>
@@ -638,9 +696,7 @@ function applyCapabilityProbeResult(
         includeImageHistory: result.supportsVision
           ? profile.config.includeImageHistory
           : false,
-        fastAgentMode: result.supportsVision
-          ? profile.config.fastAgentMode
-          : false,
+        fastAgentMode: profile.config.fastAgentMode,
         enableWebSearch: result.supportsWebSearch,
         capabilityDetection: {
           checkedAt: result.checkedAt,

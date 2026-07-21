@@ -30,3 +30,14 @@ export function getApprovalEgressDestinations(
 
   return [];
 }
+
+export function getConversationApprovalEgressDestinations(
+  requesterRole: Extract<WsClientRole, "ui" | "mcp">,
+  aiProviderUrl: string,
+): string[] {
+  return getApprovalEgressDestinations({
+    requesterRole,
+    toolName: "browser_click",
+    aiProviderUrl,
+  });
+}

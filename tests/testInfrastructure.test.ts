@@ -12,7 +12,7 @@ import {
 import { createTestDataDirectory } from "./helpers/tempDataDir";
 
 test("protocol fixtures centralize token, version, timestamp, and deterministic IDs", () => {
-  assert.equal(WS_PROTOCOL_VERSION, 5);
+  assert.equal(WS_PROTOCOL_VERSION, 6);
   const createId = createDeterministicIdFactory("message");
   assert.equal(createId(), "message-1");
   assert.equal(createId(), "message-2");

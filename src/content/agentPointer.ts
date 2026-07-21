@@ -56,7 +56,7 @@ export async function presentAgentPointer(
   runtime.host.style.setProperty("display", "block", "important");
   runtime.stage.dataset.action = normalized.action;
 
-  await moveStage(runtime, normalized.point);
+  moveStage(runtime, normalized.point);
   showActionEffect(runtime, normalized);
   scheduleHide(runtime);
   return { action: normalized.action, shown: true };
@@ -155,10 +155,10 @@ function getOrCreateRuntime(): AgentPointerRuntime {
   return runtime;
 }
 
-async function moveStage(
+function moveStage(
   runtime: AgentPointerRuntime,
   point: PointerPoint,
-): Promise<void> {
+): void {
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")
     .matches;
   const isFirstMove = !runtime.positioned;
@@ -184,9 +184,6 @@ async function moveStage(
   runtime.stage.classList.add("is-visible");
   runtime.point = point;
   runtime.positioned = true;
-  if (duration > 0) {
-    await delay(duration);
-  }
 }
 
 function getIntroPoint(point: PointerPoint): PointerPoint {
@@ -269,10 +266,6 @@ function clearRuntimeTimers(runtime: AgentPointerRuntime): void {
 
 function translate(point: PointerPoint): string {
   return `translate3d(${point.x}px, ${point.y}px, 0)`;
-}
-
-function delay(durationMs: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, durationMs));
 }
 
 function pointerStyles(): string {

@@ -82,6 +82,13 @@ const redactedAuditEventSchema = z
     egressDestination: z
       .enum(["extension_agent", "mcp_adapter"])
       .optional(),
+    approvalWaitMs: z.number().int().nonnegative().max(64 * 1024 * 1024).optional(),
+    queueWaitMs: z.number().int().nonnegative().max(64 * 1024 * 1024).optional(),
+    executorMs: z.number().int().nonnegative().max(64 * 1024 * 1024).optional(),
+    transportMs: z.number().int().nonnegative().max(64 * 1024 * 1024).optional(),
+    totalMs: z.number().int().nonnegative().max(64 * 1024 * 1024).optional(),
+    resultChars: z.number().int().nonnegative().max(64 * 1024 * 1024).optional(),
+    payloadBytes: z.number().int().nonnegative().max(64 * 1024 * 1024).optional(),
   })
   .strict();
 
@@ -160,17 +167,51 @@ const semanticSnapshotSchema = outputObject({
   }),
 });
 
-const domQuerySchema = outputObject({
+const domQueryResultSchema = outputObject({
   query: outputString,
   queryType: z.enum(["selector", "className", "xpath"]),
   count: z.number().int().nonnegative(),
   elements: outputArray,
 });
 
+const domQuerySchema = outputObject({
+  query: outputString.optional(),
+  queryType: z.enum(["selector", "className", "xpath"]).optional(),
+  count: z.number().int().nonnegative().optional(),
+  elements: outputArray.optional(),
+  version: z.literal("dom-query-batch-v1").optional(),
+  results: z.array(domQueryResultSchema).min(1).max(12).optional(),
+}).superRefine((value, context) => {
+  const isSingle = value.query !== undefined;
+  const isBatch = value.version === "dom-query-batch-v1";
+  if (isSingle === isBatch) {
+    context.addIssue({
+      code: "custom",
+      message: "DOM query output must be either one result or a batch result.",
+    });
+  }
+  if (
+    isSingle &&
+    (value.queryType === undefined ||
+      value.count === undefined ||
+      value.elements === undefined)
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Single DOM query output is incomplete.",
+    });
+  }
+  if (isBatch && value.results === undefined) {
+    context.addIssue({
+      code: "custom",
+      message: "Batch DOM query output requires results.",
+    });
+  }
+});
+
 const screenshotSchema = outputObject({
   capturedAt: outputString,
   mimeType: z.enum(["image/png", "image/jpeg"]),
-  dataUrl: outputString,
 });
 
 const tabListSchema = outputObject({ tabs: outputArray });
@@ -335,6 +376,41 @@ const dnrMutationSchema = outputObject({
 });
 
 export const MCP_TOOL_OUTPUT_SCHEMAS = {
+  [MCP_TOOL_NAMES.BROWSER_STATUS]: outputObject({
+    version: z.literal("browser-status-v1"),
+    sessionId: outputString,
+    browserConnected: z.boolean(),
+    pluginConnected: z.boolean(),
+    pageContextSynced: z.boolean(),
+    activeTab: nullableUnknown,
+    currentConversationId: outputString,
+    revision: z.number().int().nonnegative(),
+  }),
+  [MCP_TOOL_NAMES.BROWSER_OBSERVE]: semanticSnapshotSchema,
+  [MCP_TOOL_NAMES.BROWSER_ACT]: outputObject({
+    version: z.literal("action-stage-v1"),
+    completed: z.number().int().nonnegative(),
+    requested: z.number().int().positive().max(20),
+    stoppedAt: outputString.nullable(),
+    barrierReached: z.boolean(),
+    requiresVerification: z.boolean(),
+    results: outputArray,
+  }),
+  [MCP_TOOL_NAMES.BROWSER_VERIFY]: outputObject({
+    version: z.literal("browser-verification-v1"),
+    passed: z.boolean(),
+    page: z.unknown(),
+    target: nullableUnknown,
+    domRevision: z.number().int().nonnegative(),
+    delta: nullableUnknown,
+    checks: outputArray,
+  }),
+  [MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY]: outputObject({
+    version: z.literal("browser-debug-activity-v1"),
+    capturedAt: outputString,
+    network: nullableUnknown,
+    console: nullableUnknown,
+  }),
   [MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT]: selectedElementSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST]: contextDigestSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_PLUGIN_CONVERSATION]: outputObject({

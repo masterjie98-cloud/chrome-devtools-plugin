@@ -32,8 +32,31 @@ import type {
   RedactedAuditEvent,
 } from "../daemon/store/stateStore";
 import { isSupportedTrustedKey } from "../shared/trustedKeyboard";
+import { isSnapshotTargetRef } from "../shared/semanticSnapshot";
+import {
+  SUPPORTED_COMPUTED_STYLE_PROPERTIES,
+  type ComputedStyleProperty,
+  type DomQueryInput,
+  type DomQueryResult,
+} from "../shared/dom";
 
 const noArgSchema = z.object({});
+interface SnapshotReferenceBinding {
+  selector: string;
+}
+
+interface SnapshotReferenceSet {
+  fingerprint: string;
+  target: import("../shared/wsProtocol").ActiveTabSnapshot;
+  mode: "interactive" | "outline" | "full";
+  sourceLimit: number;
+  references: Map<string, SnapshotReferenceBinding>;
+}
+
+const SNAPSHOT_REFERENCE_SESSION_LIMIT = 32;
+// Approval may stay pending indefinitely. References are capacity-bounded and
+// always revalidated against a live target/fingerprint instead of expiring by time.
+const snapshotReferencesBySession = new Map<string, SnapshotReferenceSet>();
 const semanticSnapshotInputSchema = z
   .object({
     cursor: z.string().regex(/^ss1_[a-f0-9]{8}_\d{1,6}$/).optional(),
@@ -74,20 +97,89 @@ const auditPageInputSchema = z
     outcome: z.enum(["approved", "denied", "completed", "failed"]).optional(),
   })
   .strict();
+const computedStylePropertiesSchema = z
+  .array(z.enum(SUPPORTED_COMPUTED_STYLE_PROPERTIES))
+  .min(1)
+  .max(SUPPORTED_COMPUTED_STYLE_PROPERTIES.length)
+  .refine((value) => new Set(value).size === value.length, {
+    message: "computedStyleProperties must be unique",
+  });
+
+const domQueryInputShape = {
+  query: z.string().min(1),
+  queryType: z.enum(["selector", "className", "xpath"]).optional(),
+  limit: z.number().int().positive().max(100).optional(),
+  includeText: z.boolean().optional(),
+  includeOuterHTML: z.boolean().optional(),
+  includeComputedStyle: z.boolean().optional(),
+  computedStyleProperties: computedStylePropertiesSchema.optional(),
+  maxTextLength: z.number().int().min(0).optional(),
+  maxOuterHTMLLength: z.number().int().min(0).optional(),
+};
+
+const domQueryItemSchema = z
+  .object(domQueryInputShape)
+  .strict()
+  .refine(
+    (value) =>
+      value.includeComputedStyle !== false ||
+      value.computedStyleProperties === undefined,
+    {
+      message:
+        "computedStyleProperties cannot be used when includeComputedStyle is false",
+    },
+  );
+
 const queryDomSchema = z
   .object({
+    ...domQueryInputShape,
     query: z.string().min(1).optional(),
     selector: z.string().min(1).optional(),
-    queryType: z.enum(["selector", "className", "xpath"]).optional(),
-    limit: z.number().int().positive().max(100).optional(),
-    includeText: z.boolean().optional(),
-    includeOuterHTML: z.boolean().optional(),
-    includeComputedStyle: z.boolean().optional(),
-    maxTextLength: z.number().int().min(0).optional(),
-    maxOuterHTMLLength: z.number().int().min(0).optional(),
+    queries: z.array(domQueryItemSchema).min(1).max(12).optional(),
   })
-  .refine((value) => Boolean(value.query || value.selector), {
-    message: "query or selector is required",
+  .strict()
+  .superRefine((value, context) => {
+    const hasSingleQuery = Boolean(value.query || value.selector);
+    if (hasSingleQuery === Boolean(value.queries)) {
+      context.addIssue({
+        code: "custom",
+        message: "provide exactly one of query/selector or queries",
+      });
+    }
+    if (
+      value.includeComputedStyle === false &&
+      value.computedStyleProperties !== undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["computedStyleProperties"],
+        message:
+          "computedStyleProperties cannot be used when includeComputedStyle is false",
+      });
+    }
+    if (value.queries) {
+      const requestedResults = value.queries.reduce(
+        (total, query) => total + (query.limit ?? 5),
+        0,
+      );
+      if (requestedResults > 100) {
+        context.addIssue({
+          code: "custom",
+          path: ["queries"],
+          message: "DOM query batches are limited to 100 requested results",
+        });
+      }
+      value.queries.forEach((query, index) => {
+        if (query.maxTextLength === 0 || query.maxOuterHTMLLength === 0) {
+          context.addIssue({
+            code: "custom",
+            path: ["queries", index],
+            message:
+              "unbounded text or outerHTML is only allowed for a single DOM query",
+          });
+        }
+      });
+    }
   });
 
 const highlightElementSchema = z.object({
@@ -102,26 +194,26 @@ const screenshotSchema = z.object({
   element: z.string().min(1).optional(),
   fullPage: z.boolean().optional(),
   quality: z.number().int().min(0).max(100).optional(),
-  filename: z.string().min(1).optional(),
-  saveToDownloads: z.boolean().optional(),
 });
 
 const elementTargetShape = {
+  ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
   selector: z.string().min(1).optional(),
   target: z.string().min(1).optional(),
   element: z.string().min(1).optional(),
 };
 
 const formControlTargetShape = {
+  ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
   selector: z.string().min(1).max(2000).optional(),
   target: z.string().min(1).max(2000).optional(),
   element: z.string().min(1).max(2000).optional(),
 };
 
 const elementTargetSchema = z.object(elementTargetShape).refine(
-  (value) => Boolean(value.selector || value.target || value.element),
+  (value) => Boolean(value.ref || value.selector || value.target || value.element),
   {
-    message: "selector or target is required",
+    message: "selector or target is required; targetRef may be supplied as ref",
   },
 );
 
@@ -132,8 +224,8 @@ const clickSchema = z
     doubleClick: z.boolean().optional(),
     decisionBarrier: z.boolean().optional(),
   })
-  .refine((value) => Boolean(value.selector || value.target || value.element), {
-    message: "selector or target is required",
+  .refine((value) => Boolean(value.ref || value.selector || value.target || value.element), {
+    message: "selector or target is required; targetRef may be supplied as ref",
   });
 
 const hoverSchema = elementTargetSchema;
@@ -147,14 +239,15 @@ const typeTextSchema = z
     replace: z.boolean().optional(),
     decisionBarrier: z.boolean().optional(),
   })
-  .refine((value) => Boolean(value.selector || value.target || value.element), {
-    message: "selector or target is required",
+  .refine((value) => Boolean(value.ref || value.selector || value.target || value.element), {
+    message: "selector or target is required; targetRef may be supplied as ref",
   })
   .refine((value) => !value.slowly || Array.from(value.text).length <= 500, {
     message: "slowly typed text is limited to 500 Unicode characters",
   });
 
 const pressKeySchema = z.object({
+  ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
   selector: z.string().min(1).optional(),
   target: z.string().min(1).optional(),
   key: z.string().min(1).max(40),
@@ -170,8 +263,8 @@ const selectOptionSchema = z
     values: z.array(z.string().min(1).max(4000)).min(1).max(50),
   })
   .strict()
-  .refine((value) => Boolean(value.selector || value.target || value.element), {
-    message: "selector or target is required",
+  .refine((value) => Boolean(value.ref || value.selector || value.target || value.element), {
+    message: "selector or target is required; targetRef may be supplied as ref",
   })
   .refine((value) => new Set(value.values).size === value.values.length, {
     message: "option values must be unique",
@@ -219,16 +312,18 @@ const targetFrameSchema = z.object({
 
 const dragSchema = z
   .object({
+    sourceRef: z.string().refine(isSnapshotTargetRef, "invalid source snapshot ref").optional(),
     source: z.string().min(1).optional(),
     sourceSelector: z.string().min(1).optional(),
+    targetRef: z.string().refine(isSnapshotTargetRef, "invalid target snapshot ref").optional(),
     target: z.string().min(1).optional(),
     targetSelector: z.string().min(1).optional(),
   })
-  .refine((value) => Boolean(value.source || value.sourceSelector), {
-    message: "source or sourceSelector is required",
+  .refine((value) => Boolean(value.sourceRef || value.source || value.sourceSelector), {
+    message: "sourceRef, source, or sourceSelector is required",
   })
-  .refine((value) => Boolean(value.target || value.targetSelector), {
-    message: "target or targetSelector is required",
+  .refine((value) => Boolean(value.targetRef || value.target || value.targetSelector), {
+    message: "targetRef, target, or targetSelector is required",
   });
 
 const fillFormFieldSchema = z
@@ -245,8 +340,8 @@ const fillFormFieldSchema = z
   .strict()
   .refine(
     (value) =>
-      Boolean(value.selector || value.target || value.element || value.name),
-    { message: "field selector, target, element, or name is required" },
+      Boolean(value.ref || value.selector || value.target || value.element || value.name),
+    { message: "field ref, selector, target, element, or name is required" },
   )
   .refine(
     (value) =>
@@ -290,39 +385,53 @@ const actionStageSchema = z
           actionStageMetadataSchema.extend({
             id: z.string().min(1).max(80),
             type: z.literal("fill"),
-            selector: z.string().min(1).max(1000),
+            ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
+            selector: z.string().min(1).max(1000).optional(),
             value: z.union([
               z.string().max(4000),
               z.boolean(),
               z.array(z.string().max(4000)).min(1).max(50),
             ]),
-          }).strict(),
+          }).strict().refine(
+            (value) => Boolean(value.ref || value.selector),
+            { message: "fill action requires ref or selector" },
+          ),
           actionStageMetadataSchema.extend({
             id: z.string().min(1).max(80),
             type: z.literal("select"),
-            selector: z.string().min(1).max(1000),
+            ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
+            selector: z.string().min(1).max(1000).optional(),
             values: z.array(z.string().max(4000)).min(1).max(50),
-          }).strict(),
+          }).strict().refine(
+            (value) => Boolean(value.ref || value.selector),
+            { message: "select action requires ref or selector" },
+          ),
           actionStageMetadataSchema.extend({
             id: z.string().min(1).max(80),
             type: z.literal("click"),
-            selector: z.string().min(1).max(1000),
-          }).strict(),
+            ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
+            selector: z.string().min(1).max(1000).optional(),
+          }).strict().refine(
+            (value) => Boolean(value.ref || value.selector),
+            { message: "click action requires ref or selector" },
+          ),
           actionStageMetadataSchema.extend({
             id: z.string().min(1).max(80),
             type: z.literal("press_key"),
+            ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
             selector: z.string().min(1).max(1000).optional(),
             key: z.string().min(1).max(40),
           }).strict(),
           actionStageMetadataSchema.extend({
             id: z.string().min(1).max(80),
             type: z.literal("wait"),
+            ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
             selector: z.string().min(1).max(1000).optional(),
             time: z.number().positive().max(60).optional(),
             timeoutMs: z.number().int().min(100).max(60000).optional(),
           }).strict().refine(
-            (value) => value.selector !== undefined || value.time !== undefined,
-            { message: "wait action requires selector or time" },
+            (value) => value.ref !== undefined || value.selector !== undefined || value.time !== undefined,
+            { message: "wait action requires ref, selector, or time" },
           ),
         ]),
       )
@@ -356,6 +465,72 @@ const actionStageSchema = z
       }
     });
   });
+
+const verifyCheckSchema = z
+  .object({
+    id: z.string().min(1).max(80),
+    type: z.enum([
+      "url_contains",
+      "title_contains",
+      "text_contains",
+      "target_present",
+      "target_state",
+    ]),
+    value: z.string().min(1).max(1000).optional(),
+    ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
+    selector: z.string().min(1).max(1000).optional(),
+    nameContains: z.string().min(1).max(240).optional(),
+    disabled: z.boolean().optional(),
+    checked: z.boolean().optional(),
+    selected: z.boolean().optional(),
+    expanded: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      (value.type === "url_contains" ||
+        value.type === "title_contains" ||
+        value.type === "text_contains") &&
+      !value.value
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["value"],
+        message: `${value.type} requires value`,
+      });
+    }
+    if (
+      (value.type === "target_present" || value.type === "target_state") &&
+      !value.ref &&
+      !value.selector
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["ref"],
+        message: `${value.type} requires ref or selector`,
+      });
+    }
+  });
+
+const browserVerifySchema = z
+  .object({
+    sinceRevision: z.number().int().nonnegative().optional(),
+    checks: z.array(verifyCheckSchema).min(1).max(20),
+  })
+  .strict();
+
+const debugActivitySchema = z
+  .object({
+    includeNetwork: z.boolean().optional(),
+    includeConsole: z.boolean().optional(),
+    networkLimit: z.number().int().min(1).max(100).optional(),
+    consoleLimit: z.number().int().min(1).max(200).optional(),
+  })
+  .strict()
+  .refine(
+    (value) => value.includeNetwork !== false || value.includeConsole !== false,
+    { message: "includeNetwork and includeConsole cannot both be false" },
+  );
 
 const coordinateSchema = z.object({
   x: z.number(),
@@ -585,6 +760,11 @@ const removeCssPatchSchema = z.object({
 });
 
 const MCP_TOOL_INPUT_SCHEMA_BASE: Record<McpToolName, ZodTypeAny> = {
+  [MCP_TOOL_NAMES.BROWSER_STATUS]: noArgSchema,
+  [MCP_TOOL_NAMES.BROWSER_OBSERVE]: semanticSnapshotInputSchema,
+  [MCP_TOOL_NAMES.BROWSER_ACT]: actionStageSchema,
+  [MCP_TOOL_NAMES.BROWSER_VERIFY]: browserVerifySchema,
+  [MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY]: debugActivitySchema,
   [MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT]: noArgSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST]: noArgSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_PLUGIN_CONVERSATION]: conversationPageInputSchema,
@@ -684,15 +864,20 @@ export const MCP_RUNTIME_TOOL_REGISTRY: readonly McpRuntimeToolRegistration[] =
       executeMcpToolData(definition.name, args, pluginBridge),
   }));
 
-export type McpToolProfile = "inspect" | "read" | "full";
+export type McpToolProfile = "smart" | "inspect" | "read" | "full";
 
 export function parseMcpToolProfile(value: string | undefined): McpToolProfile {
-  const normalized = value?.trim().toLowerCase() || "full";
-  if (normalized === "inspect" || normalized === "read" || normalized === "full") {
+  const normalized = value?.trim().toLowerCase() || "smart";
+  if (
+    normalized === "smart" ||
+    normalized === "inspect" ||
+    normalized === "read" ||
+    normalized === "full"
+  ) {
     return normalized;
   }
   throw new Error(
-    `Invalid AI_DEVTOOLS_MCP_TOOL_PROFILE: ${value}. Expected inspect, read, or full.`,
+    `Invalid AI_DEVTOOLS_MCP_TOOL_PROFILE: ${value}. Expected smart, inspect, read, or full.`,
   );
 }
 
@@ -701,6 +886,23 @@ export function runtimeToolsForProfile(
 ): readonly McpRuntimeToolRegistration[] {
   if (profile === "full") {
     return MCP_RUNTIME_TOOL_REGISTRY;
+  }
+  if (profile === "smart") {
+    const smartTools = new Set<McpToolName>([
+      MCP_TOOL_NAMES.BROWSER_STATUS,
+      MCP_TOOL_NAMES.BROWSER_OBSERVE,
+      MCP_TOOL_NAMES.BROWSER_ACT,
+      MCP_TOOL_NAMES.BROWSER_VERIFY,
+      MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
+      MCP_TOOL_NAMES.BROWSER_LIST_TABS,
+      MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB,
+      MCP_TOOL_NAMES.BROWSER_LIST_FRAMES,
+      MCP_TOOL_NAMES.BROWSER_SET_TARGET_FRAME,
+    ]);
+    return MCP_RUNTIME_TOOL_REGISTRY.filter((registration) =>
+      smartTools.has(registration.definition.name),
+    );
   }
   const allowed =
     profile === "inspect"
@@ -774,7 +976,7 @@ export function registerProxyMcpTools(
   },
   options: { profile?: McpToolProfile } = {},
 ): void {
-  for (const registration of runtimeToolsForProfile(options.profile ?? "full")) {
+  for (const registration of runtimeToolsForProfile(options.profile ?? "smart")) {
     const { definition } = registration;
     server.registerTool(
       definition.name,
@@ -824,9 +1026,33 @@ export async function executeMcpToolData(
     throw new Error(`Unsupported MCP tool: ${toolName}`);
   }
 
-  const parsedArgs = parseMcpToolArgs(normalizedToolName, rawArgs);
+  let parsedArgs = parseMcpToolArgs(normalizedToolName, rawArgs);
+  parsedArgs = await resolveSnapshotReferences(
+    normalizedToolName,
+    parsedArgs,
+    pluginBridge,
+    context.sessionId,
+  );
 
   switch (normalizedToolName) {
+    case MCP_TOOL_NAMES.BROWSER_STATUS:
+      return readBrowserStatus(context.sessionId);
+    case MCP_TOOL_NAMES.BROWSER_OBSERVE:
+      return readSemanticSnapshot(pluginBridge, parsedArgs, context.sessionId);
+    case MCP_TOOL_NAMES.BROWSER_ACT:
+      return executeActionStage(pluginBridge, parsedArgs);
+    case MCP_TOOL_NAMES.BROWSER_VERIFY:
+      return verifyBrowserState(
+        pluginBridge,
+        parsedArgs,
+        context.sessionId,
+      );
+    case MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY:
+      return readDebugActivity(
+        pluginBridge,
+        parsedArgs,
+        context.sessionId,
+      );
     case MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT:
       return readSelectedElementResource(context.sessionId);
     case MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST:
@@ -846,43 +1072,7 @@ export async function executeMcpToolData(
     case MCP_TOOL_NAMES.BROWSER_SNAPSHOT:
       return readSemanticSnapshot(pluginBridge, parsedArgs, context.sessionId);
     case MCP_TOOL_NAMES.BROWSER_QUERY_DOM:
-      return proxyBrowserTool(pluginBridge, {
-        id: createMessageId(),
-        toolName: TOOL_NAMES.DOM_QUERY,
-        args: {
-          query:
-            (parsedArgs.query as string | undefined) ??
-            (parsedArgs.selector as string),
-          queryType:
-            parsedArgs.queryType === "className"
-              ? "className"
-              : parsedArgs.queryType === "xpath"
-                ? "xpath"
-                : "selector",
-          limit:
-            typeof parsedArgs.limit === "number" ? parsedArgs.limit : undefined,
-          includeText:
-            typeof parsedArgs.includeText === "boolean"
-              ? parsedArgs.includeText
-              : undefined,
-          includeOuterHTML:
-            typeof parsedArgs.includeOuterHTML === "boolean"
-              ? parsedArgs.includeOuterHTML
-              : undefined,
-          includeComputedStyle:
-            typeof parsedArgs.includeComputedStyle === "boolean"
-              ? parsedArgs.includeComputedStyle
-              : undefined,
-          maxTextLength:
-            typeof parsedArgs.maxTextLength === "number"
-              ? parsedArgs.maxTextLength
-              : undefined,
-          maxOuterHTMLLength:
-            typeof parsedArgs.maxOuterHTMLLength === "number"
-              ? parsedArgs.maxOuterHTMLLength
-              : undefined,
-        },
-      });
+      return executeDomQueryRequest(pluginBridge, parsedArgs);
     case MCP_TOOL_NAMES.BROWSER_START_ELEMENT_PICKER:
       return proxyBrowserTool(pluginBridge, {
         id: createMessageId(),
@@ -1335,6 +1525,320 @@ export async function executeMcpToolData(
   }
 }
 
+async function executeDomQueryRequest(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+): Promise<DomQueryResult | { version: "dom-query-batch-v1"; results: DomQueryResult[] }> {
+  const batch = Array.isArray(args.queries)
+    ? (args.queries as Array<Record<string, unknown>>)
+    : undefined;
+  if (!batch) {
+    return executeSingleDomQuery(pluginBridge, args);
+  }
+
+  const results = await Promise.all(
+    batch.map((query) => executeSingleDomQuery(pluginBridge, query)),
+  );
+  return {
+    version: "dom-query-batch-v1",
+    results,
+  };
+}
+
+async function executeSingleDomQuery(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+): Promise<DomQueryResult> {
+  return proxyBrowserTool(pluginBridge, {
+    id: createMessageId(),
+    toolName: TOOL_NAMES.DOM_QUERY,
+    args: toInternalDomQueryInput(args),
+  }) as Promise<DomQueryResult>;
+}
+
+function toInternalDomQueryInput(args: Record<string, unknown>): DomQueryInput {
+  const computedStyleProperties = Array.isArray(args.computedStyleProperties)
+    ? (args.computedStyleProperties as ComputedStyleProperty[])
+    : undefined;
+  return {
+    query:
+      (args.query as string | undefined) ??
+      (args.selector as string),
+    queryType:
+      args.queryType === "className"
+        ? "className"
+        : args.queryType === "xpath"
+          ? "xpath"
+          : "selector",
+    limit: typeof args.limit === "number" ? args.limit : undefined,
+    includeText:
+      typeof args.includeText === "boolean" ? args.includeText : undefined,
+    includeOuterHTML:
+      typeof args.includeOuterHTML === "boolean"
+        ? args.includeOuterHTML
+        : undefined,
+    includeComputedStyle:
+      typeof args.includeComputedStyle === "boolean"
+        ? args.includeComputedStyle
+        : undefined,
+    computedStyleProperties,
+    maxTextLength:
+      typeof args.maxTextLength === "number" ? args.maxTextLength : undefined,
+    maxOuterHTMLLength:
+      typeof args.maxOuterHTMLLength === "number"
+        ? args.maxOuterHTMLLength
+        : undefined,
+  };
+}
+
+function readBrowserStatus(sessionId?: string): Record<string, unknown> {
+  const state = getBrowserStateSnapshot(sessionId);
+  return {
+    version: "browser-status-v1",
+    sessionId: state.sessionId,
+    browserConnected: state.browserConnected,
+    pluginConnected: state.pluginConnected,
+    pageContextSynced: Boolean(state.pageContext),
+    activeTab: state.activeTab ?? null,
+    currentConversationId: state.currentConversationId,
+    revision: state.revision,
+    lastSeenAt: state.lastSeenAt,
+    stateUpdatedAt: state.stateUpdatedAt,
+    artifactCapturedAt: state.artifactCapturedAt,
+  };
+}
+
+async function verifyBrowserState(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+  sessionId?: string,
+): Promise<Record<string, unknown>> {
+  const value = await proxyBrowserTool(pluginBridge, {
+    id: createMessageId(),
+    toolName: TOOL_NAMES.DOM_GET_PAGE_INFO,
+    args: {
+      limit: 100,
+      // Verification must include non-interactive status text (for example
+      // aria-live regions), while the source walk remains bounded.
+      mode: "full",
+      sourceLimit: 2_000,
+      ...(typeof args.sinceRevision === "number"
+        ? { sinceRevision: args.sinceRevision }
+        : {}),
+    },
+  });
+  if (!isSemanticPageSnapshot(value)) {
+    throw new Error(
+      "VERIFY_CONTEXT_UNAVAILABLE: reload the extension and retry browser_verify.",
+    );
+  }
+  const state = getBrowserStateSnapshot(sessionId);
+  const target = value.provenance?.target ?? state.activeTab;
+  if (value.provenance?.target && state.activeTab &&
+      !sameBrowserTarget(value.provenance.target, state.activeTab)) {
+    throw new Error(
+      "STALE_CONTEXT: verification snapshot does not match the selected browser target.",
+    );
+  }
+  registerSnapshotReferences(
+    pluginBridge,
+    state.sessionId,
+    value,
+    target,
+  );
+  const nodes = value.semanticSnapshot.nodes;
+  const checks = (args.checks as Array<Record<string, unknown>>).map((check) => {
+    const type = check.type as string;
+    const id = check.id as string;
+    const expected = check.value as string | undefined;
+    if (type === "url_contains") {
+      return {
+        id,
+        type,
+        passed: value.url.includes(expected ?? ""),
+        actual: value.url,
+      };
+    }
+    if (type === "title_contains") {
+      return {
+        id,
+        type,
+        passed: value.title.includes(expected ?? ""),
+        actual: value.title,
+      };
+    }
+    if (type === "text_contains") {
+      return {
+        id,
+        type,
+        passed: value.visibleText.includes(expected ?? ""),
+        actualExcerpt: value.visibleText.slice(0, 1000),
+      };
+    }
+    const selector = check.selector as string;
+    const node = nodes.find((candidate) => candidate.selector === selector);
+    if (type === "target_present") {
+      return {
+        id,
+        type,
+        passed: Boolean(node),
+        selector,
+        actual: node
+          ? { role: node.role, name: node.name, targetRef: node.targetRef }
+          : null,
+      };
+    }
+    const stateExpectations = {
+      ...(typeof check.nameContains === "string"
+        ? { nameContains: check.nameContains }
+        : {}),
+      ...(typeof check.disabled === "boolean"
+        ? { disabled: check.disabled }
+        : {}),
+      ...(typeof check.checked === "boolean"
+        ? { checked: check.checked }
+        : {}),
+      ...(typeof check.selected === "boolean"
+        ? { selected: check.selected }
+        : {}),
+      ...(typeof check.expanded === "boolean"
+        ? { expanded: check.expanded }
+        : {}),
+    };
+    const passed = Boolean(
+      node &&
+        (stateExpectations.nameContains === undefined ||
+          node.name.includes(stateExpectations.nameContains)) &&
+        (stateExpectations.disabled === undefined ||
+          node.disabled === stateExpectations.disabled) &&
+        (stateExpectations.checked === undefined ||
+          node.checked === stateExpectations.checked) &&
+        (stateExpectations.selected === undefined ||
+          node.selected === stateExpectations.selected) &&
+        (stateExpectations.expanded === undefined ||
+          node.expanded === stateExpectations.expanded),
+    );
+    return {
+      id,
+      type,
+      passed,
+      selector,
+      expected: stateExpectations,
+      actual: node
+        ? {
+            role: node.role,
+            name: node.name,
+            targetRef: node.targetRef,
+            disabled: node.disabled,
+            checked: node.checked,
+            selected: node.selected,
+            expanded: node.expanded,
+          }
+        : null,
+    };
+  });
+  return {
+    version: "browser-verification-v1",
+    passed: checks.every((check) => check.passed),
+    page: {
+      url: value.url,
+      title: value.title,
+      capturedAt: value.capturedAt,
+    },
+    target: target ?? null,
+    domRevision: value.domRevision ?? 0,
+    delta: value.delta ?? null,
+    checks,
+  };
+}
+
+async function readDebugActivity(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+  sessionId?: string,
+): Promise<Record<string, unknown>> {
+  const stateBeforeRead = getBrowserStateSnapshot(sessionId);
+  const targetBeforeRead = stateBeforeRead.activeTab;
+  if (!targetBeforeRead || typeof targetBeforeRead.tabId !== "number") {
+    throw new Error(
+      "TARGET_NOT_FOUND: browser_debug_activity requires a selected browser target.",
+    );
+  }
+  const includeNetwork = args.includeNetwork !== false;
+  const includeConsole = args.includeConsole !== false;
+  const [network, consoleMessages] = await Promise.all([
+    includeNetwork
+      ? proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.DEBUGGER_NETWORK_LIST,
+          args: {
+            digestOnly: true,
+            limit:
+              typeof args.networkLimit === "number"
+                ? args.networkLimit
+                : 50,
+          },
+        }).catch((error) => ({
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      : Promise.resolve(null),
+    includeConsole
+      ? proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.BROWSER_CONSOLE_MESSAGES,
+          args: {
+            limit:
+              typeof args.consoleLimit === "number"
+                ? args.consoleLimit
+                : 50,
+          },
+        }).catch((error) => ({
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      : Promise.resolve(null),
+  ]);
+  const stateAfterRead = getBrowserStateSnapshot(sessionId);
+  if (!sameBrowserTarget(targetBeforeRead, stateAfterRead.activeTab)) {
+    throw new Error(
+      "STALE_CONTEXT: the selected browser target changed while browser_debug_activity was collecting evidence; retry the observation.",
+    );
+  }
+  assertDebugActivityTarget("Network", network, targetBeforeRead.tabId);
+  assertDebugActivityTarget("Console", consoleMessages, targetBeforeRead.tabId);
+  return {
+    version: "browser-debug-activity-v1",
+    capturedAt: new Date().toISOString(),
+    network,
+    console: consoleMessages,
+  };
+}
+
+function assertDebugActivityTarget(
+  label: "Network" | "Console",
+  value: unknown,
+  expectedTabId: number,
+): void {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    ("error" in value && typeof value.error === "string") ||
+    ("attached" in value && value.attached === false)
+  ) {
+    return;
+  }
+  const tabId = "tabId" in value ? value.tabId : undefined;
+  if (typeof tabId !== "number") {
+    throw new Error(
+      `TARGET_PROVENANCE_MISSING: ${label} activity did not identify its source tab.`,
+    );
+  }
+  if (tabId !== expectedTabId) {
+    throw new Error(
+      `STALE_CONTEXT: ${label} activity belongs to tab ${tabId}, but the selected target is tab ${expectedTabId}; restart capture on the selected tab and retry.`,
+    );
+  }
+}
+
 export function parseMcpToolArgs(
   toolName: McpToolName,
   rawArgs: Record<string, unknown>,
@@ -1526,7 +2030,7 @@ async function readSemanticSnapshot(
       "STALE_CONTEXT: semantic snapshot provenance does not match the browser session state; retry browser_snapshot.",
     );
   }
-  return {
+  const result = {
     version: "browser-semantic-snapshot-v1",
     page: {
       url: value.url,
@@ -1560,6 +2064,230 @@ async function readSemanticSnapshot(
       truncated: value.truncated,
     },
   };
+  registerSnapshotReferences(
+    pluginBridge,
+    stateAfterRead.sessionId,
+    value,
+    capturedTarget ??
+      stateBeforeRead.activeTab ??
+      stateAfterRead.activeTab,
+  );
+  return result;
+}
+
+function registerSnapshotReferences(
+  _pluginBridge: PluginWebSocketServer,
+  sessionId: string,
+  page: import("../shared/dom").PageSnapshot & {
+    semanticSnapshot: import("../shared/semanticSnapshot").SemanticSnapshotCollection;
+  },
+  target: import("../shared/wsProtocol").ActiveTabSnapshot | undefined,
+): void {
+  if (!target) {
+    return;
+  }
+  const snapshot = page.semanticSnapshot;
+  const existing = snapshotReferencesBySession.get(sessionId);
+  const references =
+    existing &&
+    existing.fingerprint === snapshot.fingerprint &&
+    sameBrowserTarget(existing.target, target)
+      ? existing.references
+      : new Map<string, SnapshotReferenceBinding>();
+  for (const node of snapshot.nodes) {
+    references.set(node.targetRef, { selector: node.selector });
+  }
+  if (
+    !snapshotReferencesBySession.has(sessionId) &&
+    snapshotReferencesBySession.size >= SNAPSHOT_REFERENCE_SESSION_LIMIT
+  ) {
+    const oldestSessionId = snapshotReferencesBySession.keys().next()
+      .value as string | undefined;
+    if (oldestSessionId) {
+      snapshotReferencesBySession.delete(oldestSessionId);
+    }
+  }
+  snapshotReferencesBySession.set(sessionId, {
+    fingerprint: snapshot.fingerprint,
+    target,
+    mode: page.mode ?? "interactive",
+    sourceLimit: page.sourceLimit ?? 2000,
+    references,
+  });
+}
+
+async function resolveSnapshotReferences(
+  toolName: McpToolName,
+  args: Record<string, unknown>,
+  pluginBridge: PluginWebSocketServer,
+  sessionId?: string,
+): Promise<Record<string, unknown>> {
+  const references = collectSnapshotRefs(toolName, args);
+  if (references.length === 0) {
+    return args;
+  }
+  const state = getBrowserStateSnapshot(sessionId);
+  const referenceSet = snapshotReferencesBySession.get(state.sessionId);
+  if (!referenceSet) {
+    throw new Error(
+      "SNAPSHOT_REF_UNKNOWN: read a fresh browser_snapshot and reuse its targetRef.",
+    );
+  }
+  if (
+    !state.activeTab ||
+    !sameBrowserTarget(referenceSet.target, state.activeTab)
+  ) {
+    snapshotReferencesBySession.delete(state.sessionId);
+    throw new Error(
+      "STALE_SNAPSHOT_REF: the selected tab, frame, or document changed; read a fresh browser_snapshot.",
+    );
+  }
+
+  const live = await proxyBrowserTool(pluginBridge, {
+    id: createMessageId(),
+    toolName: TOOL_NAMES.DOM_GET_PAGE_INFO,
+    args: {
+      limit: 1,
+      mode: referenceSet.mode,
+      sourceLimit: referenceSet.sourceLimit,
+    },
+  });
+  if (
+    !isSemanticPageSnapshot(live) ||
+    live.semanticSnapshot.fingerprint !== referenceSet.fingerprint ||
+    (live.provenance?.target &&
+      !sameBrowserTarget(referenceSet.target, live.provenance.target))
+  ) {
+    snapshotReferencesBySession.delete(state.sessionId);
+    throw new Error(
+      "STALE_SNAPSHOT_REF: the page semantic structure changed; read a fresh browser_snapshot.",
+    );
+  }
+
+  const resolve = (ref: string): string => {
+    const binding = referenceSet.references.get(ref);
+    if (!binding) {
+      throw new Error(
+        "SNAPSHOT_REF_UNKNOWN: the targetRef was not returned by the latest browser_snapshot pages.",
+      );
+    }
+    return binding.selector;
+  };
+  return replaceSnapshotRefs(toolName, args, resolve);
+}
+
+function collectSnapshotRefs(
+  toolName: McpToolName,
+  args: Record<string, unknown>,
+): string[] {
+  if (
+    toolName === MCP_TOOL_NAMES.BROWSER_CLICK ||
+    toolName === MCP_TOOL_NAMES.BROWSER_HOVER ||
+    toolName === MCP_TOOL_NAMES.BROWSER_TYPE ||
+    toolName === MCP_TOOL_NAMES.BROWSER_PRESS_KEY ||
+    toolName === MCP_TOOL_NAMES.BROWSER_SELECT_OPTION
+  ) {
+    return typeof args.ref === "string" ? [args.ref] : [];
+  }
+  if (toolName === MCP_TOOL_NAMES.BROWSER_DRAG) {
+    return [args.sourceRef, args.targetRef].filter(
+      (value): value is string => typeof value === "string",
+    );
+  }
+  if (toolName === MCP_TOOL_NAMES.BROWSER_FILL_FORM) {
+    return Array.isArray(args.fields)
+      ? args.fields.flatMap((field) =>
+          field &&
+          typeof field === "object" &&
+          typeof (field as { ref?: unknown }).ref === "string"
+            ? [(field as { ref: string }).ref]
+            : [],
+        )
+      : [];
+  }
+  if (
+    toolName === MCP_TOOL_NAMES.BROWSER_EXECUTE_ACTION_STAGE ||
+    toolName === MCP_TOOL_NAMES.BROWSER_ACT
+  ) {
+    return Array.isArray(args.actions)
+      ? args.actions.flatMap((action) =>
+          action &&
+          typeof action === "object" &&
+          typeof (action as { ref?: unknown }).ref === "string"
+            ? [(action as { ref: string }).ref]
+            : [],
+        )
+      : [];
+  }
+  if (toolName === MCP_TOOL_NAMES.BROWSER_VERIFY) {
+    return Array.isArray(args.checks)
+      ? args.checks.flatMap((check) =>
+          check &&
+          typeof check === "object" &&
+          typeof (check as { ref?: unknown }).ref === "string"
+            ? [(check as { ref: string }).ref]
+            : [],
+        )
+      : [];
+  }
+  return [];
+}
+
+function replaceSnapshotRefs(
+  toolName: McpToolName,
+  args: Record<string, unknown>,
+  resolve: (ref: string) => string,
+): Record<string, unknown> {
+  const replaceTarget = (value: Record<string, unknown>) => {
+    if (typeof value.ref !== "string") {
+      return value;
+    }
+    const { ref, ...rest } = value;
+    return { ...rest, selector: resolve(ref) };
+  };
+  if (
+    toolName === MCP_TOOL_NAMES.BROWSER_CLICK ||
+    toolName === MCP_TOOL_NAMES.BROWSER_HOVER ||
+    toolName === MCP_TOOL_NAMES.BROWSER_TYPE ||
+    toolName === MCP_TOOL_NAMES.BROWSER_PRESS_KEY ||
+    toolName === MCP_TOOL_NAMES.BROWSER_SELECT_OPTION
+  ) {
+    return replaceTarget(args);
+  }
+  if (toolName === MCP_TOOL_NAMES.BROWSER_DRAG) {
+    const { sourceRef, targetRef, ...rest } = args;
+    return {
+      ...rest,
+      ...(typeof sourceRef === "string"
+        ? { sourceSelector: resolve(sourceRef) }
+        : {}),
+      ...(typeof targetRef === "string"
+        ? { targetSelector: resolve(targetRef) }
+        : {}),
+    };
+  }
+  if (toolName === MCP_TOOL_NAMES.BROWSER_FILL_FORM) {
+    return {
+      ...args,
+      fields: (args.fields as Record<string, unknown>[]).map(replaceTarget),
+    };
+  }
+  if (
+    toolName === MCP_TOOL_NAMES.BROWSER_EXECUTE_ACTION_STAGE ||
+    toolName === MCP_TOOL_NAMES.BROWSER_ACT
+  ) {
+    return {
+      ...args,
+      actions: (args.actions as Record<string, unknown>[]).map(replaceTarget),
+    };
+  }
+  if (toolName === MCP_TOOL_NAMES.BROWSER_VERIFY) {
+    return {
+      ...args,
+      checks: (args.checks as Record<string, unknown>[]).map(replaceTarget),
+    };
+  }
+  return args;
 }
 
 type ParsedActionStage = z.infer<typeof actionStageSchema>;
@@ -1869,6 +2597,9 @@ export function formatMcpToolResult(
 ): McpSuccessToolResult | McpErrorToolResult {
   const image = extractScreenshotImage(value);
   const structuredContent = toBoundedStructuredContent(value);
+  if (image) {
+    delete structuredContent.dataUrl;
+  }
   const content: McpFormattedContent = [
     {
       type: "text",

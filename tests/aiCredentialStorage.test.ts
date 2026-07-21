@@ -19,7 +19,7 @@ test("profile metadata serialization never includes an API key", () => {
   assert.equal(JSON.parse(serialized).profiles[0].config.apiKey, "");
 });
 
-test("legacy profiles default fast Agent mode to off until the user opts in", () => {
+test("legacy profiles inherit fast Agent mode as the default", () => {
   const originalLocalStorage = Object.getOwnPropertyDescriptor(
     globalThis,
     "localStorage",
@@ -49,7 +49,7 @@ test("legacy profiles default fast Agent mode to off until the user opts in", ()
 
   try {
     const loaded = loadProfilesState();
-    assert.equal(loaded.profiles[0]?.config.fastAgentMode, false);
+    assert.equal(loaded.profiles[0]?.config.fastAgentMode, true);
     const optedIn = {
       ...loaded,
       profiles: loaded.profiles.map((profile) => ({

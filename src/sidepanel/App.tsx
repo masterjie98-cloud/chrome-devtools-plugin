@@ -10,6 +10,7 @@ import type {
   BrowserTargetSetResult,
   BrowserTargetTab,
   DomElementInfo,
+  DomQueryBatchResult,
   DomQueryInput,
   DomQueryResult,
   PageSnapshot,
@@ -112,11 +113,14 @@ import {
   type StoredChatConversation,
 } from "./services/chatWorkspace";
 import {
+  createConversationExecutionApproval,
   createAgentConversationOriginApprovalGrant,
   createAgentToolIdempotencyKey,
+  executionApprovalModeAllows,
   getAgentConversationOriginInvalidationReason,
-  matchesAgentConversationOriginApproval,
-  type AgentConversationOriginApprovalGrant,
+  matchesConversationExecutionApproval,
+  type ConversationExecutionApproval,
+  type ExecutionApprovalMode,
   type ToolApprovalDecision,
 } from "./agentRunApprovals";
 import { presentToolResult } from "./toolResultPresentation";
@@ -367,9 +371,9 @@ export function App() {
   const [pendingBudgetExtension, setPendingBudgetExtension] =
     useState<AgentRunBudgetExtensionRequest | null>(null);
   const conversationOriginApprovalRef =
-    useRef<AgentConversationOriginApprovalGrant | null>(null);
+    useRef<ConversationExecutionApproval | null>(null);
   const [conversationOriginApproval, setConversationOriginApprovalState] =
-    useState<AgentConversationOriginApprovalGrant | null>(null);
+    useState<ConversationExecutionApproval | null>(null);
 
   const busy = Boolean(runningTool) || aiBusy;
   const currentPageUrl = hubState.activeTab?.url ?? pageSnapshot?.url;
@@ -384,7 +388,7 @@ export function App() {
   );
 
   const setConversationOriginApproval = (
-    grant: AgentConversationOriginApprovalGrant | null,
+    grant: ConversationExecutionApproval | null,
   ) => {
     conversationOriginApprovalRef.current = grant;
     setConversationOriginApprovalState(grant);
@@ -397,12 +401,45 @@ export function App() {
     }
     mcpBridge.revokeTaskGrant(
       currentGrant.conversationId,
-      "user_revoked_conversation_origin_grant",
+      "user_changed_execution_approval_mode",
     );
     setConversationOriginApproval(null);
     if (announce) {
-      api.info("当前聊天与域名的自动允许已关闭。");
+      api.info("已切换为请求批准，后续受控操作会再次询问。");
     }
+  };
+
+  const changeExecutionApprovalMode = (mode: ExecutionApprovalMode) => {
+    if (mode === "ask") {
+      revokeConversationOriginApproval();
+      return;
+    }
+
+    const approval = createConversationExecutionApproval(mode, {
+      conversationId: conversationIdRef.current,
+      pageUrl: currentPageUrl,
+      sessionId: hubState.sessionId,
+      egressDestinations: configuredAgentEgressDestinations,
+    });
+    if (!approval) {
+      api.warning("请先连接 Hub 并打开一个 http/https 页面，再调整审批模式。");
+      return;
+    }
+
+    setConversationOriginApproval(approval);
+    const pending = pendingToolApproval;
+    if (pending && executionApprovalModeAllows(mode, pending.approvalMode)) {
+      pendingToolApprovalResolverRef.current?.(
+        mode === "agent" && pending.allowForConversationOriginAvailable
+          ? "allow_conversation_origin"
+          : "allow_once",
+      );
+    }
+    api.success(
+      mode === "agent"
+        ? "已启用替我审批：普通操作自动继续，高风险操作仍会询问。"
+        : "已启用完全访问权限：当前聊天与当前域名内的受控操作不再逐次询问。",
+    );
   };
 
   useEffect(() => {
@@ -445,6 +482,7 @@ export function App() {
     const reason = getAgentConversationOriginInvalidationReason(grant, {
       conversationId: activeConversationId,
       pageUrl: currentPageUrl,
+      sessionId: hubState.sessionId,
       hubConnected: hubState.connected,
       egressDestinations: configuredAgentEgressDestinations,
     });
@@ -462,6 +500,8 @@ export function App() {
       api.info("已切换聊天，原域名自动允许已失效。");
     } else if (reason === "origin_changed") {
       api.info("页面域名已变化，原自动允许已失效。");
+    } else if (reason === "profile_changed") {
+      api.info("Chrome Profile 已变化，原自动允许已失效。");
     } else if (reason === "provider_changed") {
       api.info("AI Provider 已变化，原域名自动允许已失效。");
     } else {
@@ -473,6 +513,7 @@ export function App() {
     configuredAgentEgressKey,
     currentPageUrl,
     hubState.connected,
+    hubState.sessionId,
   ]);
 
   const conversationSummaries = useMemo<ChatConversationSummary[]>(
@@ -1595,6 +1636,7 @@ export function App() {
       | "preview"
       | "policyClass"
       | "approvalMode"
+      | "reason"
       | "sessionId"
       | "revision"
     >,
@@ -1628,15 +1670,38 @@ export function App() {
     const activeGrant = conversationOriginApprovalRef.current;
     if (
       activeGrant &&
-      matchesAgentConversationOriginApproval(
+      executionApprovalModeAllows(
+        activeGrant.mode,
+        approvalScope.approvalMode,
+      ) &&
+      matchesConversationExecutionApproval(
         activeGrant,
-        conversationIdRef.current,
-        approvalScope,
+        {
+          conversationId: conversationIdRef.current,
+          targetUrl: approvalScope.target?.url,
+          sessionId: approvalScope.sessionId,
+        },
       )
     ) {
+      onDecision?.(
+        activeGrant.mode === "agent"
+          ? "allow_conversation_origin"
+          : "allow_once",
+      );
       return Promise.resolve(true);
     }
-    if (activeGrant && conversationOriginGrant) {
+    if (
+      activeGrant &&
+      !matchesConversationExecutionApproval(activeGrant, {
+        conversationId: conversationIdRef.current,
+        targetUrl: approvalScope.target?.url,
+        sessionId: approvalScope.sessionId,
+      })
+    ) {
+      mcpBridge.revokeTaskGrant(
+        activeGrant.conversationId,
+        "execution_approval_scope_changed",
+      );
       setConversationOriginApproval(null);
       api.info("授权作用域已变化，后续操作需要重新确认。");
     }
@@ -1664,7 +1729,15 @@ export function App() {
                 decision === "allow_conversation_origin" &&
                 conversationOriginGrant
               ) {
-                setConversationOriginApproval(conversationOriginGrant);
+                const approval = createConversationExecutionApproval("agent", {
+                  conversationId: conversationIdRef.current,
+                  pageUrl: conversationOriginGrant.origin,
+                  sessionId: conversationOriginGrant.sessionId,
+                  egressDestinations: configuredAgentEgressDestinations,
+                });
+                if (approval) {
+                  setConversationOriginApproval(approval);
+                }
               }
               onDecision?.(decision);
               resolve(decision !== "deny");
@@ -1676,6 +1749,11 @@ export function App() {
               id: call.id,
               toolName: call.name,
               arguments: redactApprovalArguments(call.arguments),
+              policyClass:
+                context?.policyClass ?? resolvedPolicy.policyClass,
+              approvalMode:
+                context?.approvalMode ?? resolvedPolicy.approvalMode,
+              reason: context?.reason ?? resolvedPolicy.reason,
               requester: context?.requester,
               target: context?.target,
               preview: context?.preview,
@@ -2402,7 +2480,18 @@ export function App() {
         }
         return;
       case MCP_TOOL_NAMES.BROWSER_QUERY_DOM:
-        setQueryResult(data as DomQueryResult);
+        if (
+          isRecord(data) &&
+          data.version === "dom-query-batch-v1" &&
+          Array.isArray(data.results)
+        ) {
+          const lastResult = (data as unknown as DomQueryBatchResult).results.at(-1);
+          if (lastResult) {
+            setQueryResult(lastResult);
+          }
+        } else {
+          setQueryResult(data as DomQueryResult);
+        }
         return;
       case MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT:
         if (isRecord(data) && isDomElementInfo(data.selectedElement)) {
@@ -2513,7 +2602,10 @@ export function App() {
                       streamingMessageId={streamingMessageId}
                       pendingToolApproval={pendingToolApproval}
                       pendingBudgetExtension={pendingBudgetExtension}
-                      conversationOriginApproval={conversationOriginApproval}
+                      executionApprovalMode={
+                        conversationOriginApproval?.mode ?? "ask"
+                      }
+                      executionApprovalOrigin={conversationOriginApproval?.origin}
                       queuedMessages={queuedChatSubmissions}
                       delegatedTasks={conversationDelegatedTasks}
                       delegatedInboxTasks={delegatedInboxTasks}
@@ -2542,9 +2634,7 @@ export function App() {
                       onDraftChange={setChatDraft}
                       onResolveToolApproval={resolveToolApproval}
                       onResolveBudgetExtension={resolveAgentBudgetExtension}
-                      onRevokeConversationOriginApproval={() =>
-                        revokeConversationOriginApproval()
-                      }
+                      onChangeExecutionApprovalMode={changeExecutionApprovalMode}
                       onReadPage={readPage}
                       onPickElement={pickElement}
                       onCancelElementPick={cancelElementPick}
@@ -2616,6 +2706,11 @@ export function App() {
               <AiSettingsDrawer
                 open={aiSettingsOpen}
                 profilesState={profilesState}
+                bridgeConnected={hubState.connected}
+                activeTargetLabel={
+                  hubState.activeTab?.title || hubState.activeTab?.url
+                }
+                pageContextSynced={Boolean(hubState.pageContext)}
                 onClose={() => setAiSettingsOpen(false)}
                 onSave={handleSaveProfiles}
               />

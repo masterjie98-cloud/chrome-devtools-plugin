@@ -63,6 +63,14 @@ npm run daemon:allow-extension -- YOUR_EXTENSION_ID
 
 ## 4. 注册到 Codex
 
+推荐先让项目按当前电脑的真实 Node.js 和仓库路径生成配置：
+
+```bash
+npm run client:config
+```
+
+默认生成 `smart` 工具面，同时输出 Codex 命令和 Claude Desktop/Cursor JSON。
+
 先取得两个绝对路径：
 
 ```bash
@@ -144,8 +152,9 @@ sessionId、browserConnected、uiConnected 和当前页面标题。
 - `browserConnected: true` 表示扩展后台已连接 daemon。
 - `uiConnected: true` 表示侧栏已连接，可以显示和处理审批。
 - `browser_snapshot` 能返回当前选中 Profile 的页面结构。
-- 写操作、高风险读取、截图或其他受控工具可能在扩展侧栏出现审批卡；MCP
-  接入不会绕过审批。
+- 侧栏常驻三档执行审批：`请求批准`（默认逐次询问）、`替我审批`（仅普通可恢复
+  操作自动继续）、`完全访问权限`（仅当前聊天与当前域名内自动继续全部插件能力）。
+  MCP 接入服从当前档位，并且每次执行仍使用独立的一次性授权。
 
 ## 7. Codex 与插件 AI 如何协作
 
@@ -158,6 +167,11 @@ sessionId、browserConnected、uiConnected 和当前页面标题。
 2. **两个 AI 交换任务和状态：**双方把有类型的协作项写入同一个 Profile 的
    collaboration workspace。它适合任务接力、代码发现、页面样式、Network
    mock 方案和长任务状态，不适合代替一次普通的同步工具结果。
+
+`browser_take_screenshot` 只通过 MCP image content 和 Artifact 返回图片，不会
+写入 Chrome Downloads。截图文件的本地保存只能来自用户界面的显式下载操作。
+需要检查多个区域或精确视觉样式时，`browser_query_dom` 可以在一次调用中传入
+最多 12 个 `queries`，并通过 `computedStyleProperties` 请求受支持的样式字段。
 
 ### 7.1 Codex 直接要求扩展获取并返回
 
@@ -321,9 +335,10 @@ codex mcp add \
 
 `AI_DEVTOOLS_MCP_TOOL_PROFILE` 支持：
 
+- `smart`：默认；10 个面向任务的核心浏览器工具
 - `inspect`：只暴露安全只读工具
 - `read`：暴露安全只读和敏感只读工具；敏感读取仍受审批策略约束
-- `full`：暴露完整工具集，默认值
+- `full`：暴露完整专家工具集
 
 例如只接入安全只读工具：
 

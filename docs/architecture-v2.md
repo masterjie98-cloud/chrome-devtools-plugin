@@ -402,15 +402,15 @@ decision record.
   `revision`, and the exact target. The legacy `updatedAt` output remains only
   as a compatibility alias for `stateUpdatedAt`.
 
-## 7. Protocol V5
+## 7. Protocol V6
 
 ### 7.1 Handshake
 
 Client hello:
 
 ```ts
-interface ClientHelloV5 {
-  protocolVersion: 5;
+interface ClientHelloV6 {
+  protocolVersion: 6;
   clientType: "chrome-extension" | "mcp-adapter" | "sidepanel-ui";
   clientName: string;
   installationId?: string;
@@ -422,8 +422,8 @@ interface ClientHelloV5 {
 Daemon welcome:
 
 ```ts
-interface ServerWelcomeV5 {
-  protocolVersion: 5;
+interface ServerWelcomeV6 {
+  protocolVersion: 6;
   connectionId: string;
   assignedRole: "browser" | "mcp" | "ui";
   browserSessionId?: string;
@@ -436,8 +436,8 @@ The daemon assigns the role from authenticated client type and connection
 origin. A client-supplied `role` is ignored and rejected during migration.
 
 Current implementation note: the wire shape retains the migration-era
-`clientRole` field, but requires numeric `protocolVersion: 5` in every hello.
-The daemon returns version 5 in `SERVER_WELCOME`, rejects other versions with
+`clientRole` field, but requires numeric `protocolVersion: 6` in every hello.
+The daemon returns version 6 in `SERVER_WELCOME`, rejects other versions with
 `PROTOCOL_VERSION_UNSUPPORTED`, and the browser, UI, observer, and stdio adapter
 validate the welcome before treating the socket as authenticated.
 
@@ -450,7 +450,8 @@ first accept persists a conversation binding in the claim; only that plugin
 conversation may project, resume, or complete the task. Codex waiters remain
 bound to the durable task ID rather than to the plugin Chat lifecycle.
 
-V5 adds task-scoped capability grants and compact execution observations. A
+V6 retains the task-scoped capability grants and compact execution observations
+introduced in V5, and adds bounded DOM style projections and batch-query inputs. A
 grant is bound to the exact task/conversation, Profile session, origin, tab,
 requester principal/client, and egress destinations. It covers only declared
 low-risk capabilities; submit/send/delete actions, sensitive fields, arbitrary
@@ -459,8 +460,8 @@ evaluation, rule changes, and open-world egress remain decision barriers.
 ### 7.2 Message envelope
 
 ```ts
-interface ProtocolEnvelopeV5<T> {
-  protocolVersion: 5;
+interface ProtocolEnvelopeV6<T> {
+  protocolVersion: 6;
   requestId: string;
   connectionId: string;
   command: string;
@@ -576,24 +577,29 @@ An approval request contains:
 - expected side effects and reversibility
 - deadline
 
-The UI can deny, approve once, or—only for the embedded sidepanel Agent—remember
-eligible decisions for the active chat and normalized page origin. This
-conversation-origin permission is memory-only and binds `conversationId`, HTTP(S)
-scheme/host/port, authenticated Profile session, owning sidepanel instance, and
-AI Provider egress destination. Each automatic decision additionally verifies
-that the requester's server-issued connection ID equals that sidepanel's current
-authenticated tool connection. It covers `sensitive_read`,
-`reversible_write`, and `page_action` across tool names, paths, documents, and
-revisions on that origin. It is unavailable to external MCP requesters and never
-covers `destructive_write`, `arbitrary_execution`, `open_world`, unknown-policy,
-unbound-target, or non-HTTP(S) requests.
+The sidepanel exposes one always-visible execution approval selector. It starts
+in `ask` for every sidepanel lifecycle and can be changed before or during a
+task:
 
-The decision is revoked when the user disables its visible switch, changes the
-active chat, changes origin, changes Provider, disconnects the browser hub, or
-when a later request presents another Profile session. A request owned by
-another sidepanel cannot use the decision. A transparent reconnect may replace
-the owning panel's connection ID without discarding the user's chat/origin
-choice; the replacement connection must authenticate before it can match.
+- `ask` (`请求批准`) keeps every approval-gated request interactive.
+- `agent` (`替我审批`) automatically answers only `task_grant` requests. Runtime
+  `decision_barrier` and `always` policies still stop for the user.
+- `full` (`完全访问权限`) automatically answers every approval-gated browser or
+  MCP request that stays inside the selected scope. The label means full access
+  to the capabilities this extension actually exposes; it does not grant
+  arbitrary operating-system file or process access.
+
+Both automatic modes are memory-only and bind `conversationId`, normalized
+HTTP(S) scheme/host/port, authenticated Chrome Profile session, and current AI
+Provider destination. They apply consistently to embedded-Agent and MCP-origin
+requests; the daemon still records the concrete requester principal and issues a
+fresh single-use execution grant for every call. A missing target, non-HTTP(S)
+page, different Profile, or different origin cannot use either automatic mode.
+
+The mode resets to `ask` when the user chooses it, changes the active chat,
+changes origin, changes Provider, disconnects the browser hub, or when a later
+request presents another Profile session. A transparent reconnect must
+authenticate and re-establish the same scope before automation continues.
 A same-origin path, query, hash, document, or revision update does not revoke the
 decision; stale target and revision validation still fail closed independently.
 For a pending one-time approval, freshness is checked against the target fields
@@ -619,9 +625,11 @@ background independently validates it after signature verification and before
 dispatch. Unknown mappings and any read-only-to-mutation transition fail closed.
 The sidepanel UI is not a browser executor.
 
-No cross-chat, cross-origin, cross-Profile, cross-requester, cross-Provider,
-external-MCP, destructive, arbitrary-execution, open-world, or "allow all
-mutations forever" option is permitted by this design.
+No cross-chat, cross-origin, cross-Profile, cross-Provider, unbound-target, or
+permanent global authorization is permitted. `full` deliberately covers
+destructive, arbitrary-execution, and open-world policies only after the user
+selects it, only inside the current scoped lifecycle, and still uses late target
+validation plus a new single-use execution grant per call.
 
 ## 10. Untrusted context and sensitive-data egress
 
@@ -793,7 +801,7 @@ Phase 4.2 establishes these tested daemon defaults:
   provider tool-call ID. They remain stable for a retry inside one run but
   cannot collide merely because a provider restarts its call index in a later
   reply.
-- protocol version 5 negotiation with fail-closed mismatch handling
+- protocol version 6 negotiation with fail-closed mismatch handling
 - capped exponential reconnect backoff with 20% jitter for extension clients
 - five-second hello timeout and a per-role inbound-command allowlist
 - connection close after three schema/role violations in a one-minute window

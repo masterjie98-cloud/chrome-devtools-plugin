@@ -120,6 +120,7 @@ test("sanitized page context stays within the websocket schema limits", () => {
       nodes: [
         {
           ref: "s1",
+          targetRef: "sr1_1234abcd_s1",
           role: "button",
           name: "n".repeat(400),
           selector: "#long-name",

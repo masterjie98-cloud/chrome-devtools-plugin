@@ -31,9 +31,10 @@ test("screenshot MCP results use image content without base64 JSON text", () => 
   assert.ok(image && image.type === "image");
   assert.equal(image.data, base64);
   assert.equal(image.mimeType, "image/png");
+  assert.equal("dataUrl" in result.structuredContent, false);
   assert.equal(
-    result.structuredContent.dataUrl,
-    "[binary image omitted from structuredContent]",
+    (result.structuredContent.artifact as { uri?: unknown }).uri,
+    "ai-devtools://artifact/art_0123456789abcdef0123456789abcdef",
   );
   assert.equal(
     MCP_TOOL_OUTPUT_SCHEMAS[

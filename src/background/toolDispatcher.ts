@@ -1371,7 +1371,7 @@ async function saveScreenshotIfRequested(
     filename,
   };
 
-  if (!input.saveToDownloads && !input.filename) {
+  if (!shouldSaveScreenshotToDownloads(input)) {
     return next;
   }
 
@@ -1379,6 +1379,12 @@ async function saveScreenshotIfRequested(
     ...next,
     savedAs: await downloadDataUrl(screenshot.dataUrl, filename),
   };
+}
+
+export function shouldSaveScreenshotToDownloads(
+  input: ScreenshotCaptureInput,
+): boolean {
+  return input.saveToDownloads === true;
 }
 
 function defaultScreenshotFilename(type: ScreenshotCaptureInput["type"]): string {

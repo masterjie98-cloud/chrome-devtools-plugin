@@ -155,16 +155,17 @@ therefore not committed to the repository.
   composer.
 - Attachments remain subject to existing vision support and count/size limits.
 - Stop and force-send must propagate cancellation to active MCP requests.
-- “此聊天自动允许” is memory-only and limited to the active embedded sidepanel
-  chat, normalized HTTP(S) origin, Profile session, owning sidepanel instance,
-  and AI Provider destination. Each use must originate from that instance's
-  current authenticated tool connection. It applies only to sensitive reads,
-  and page actions. It never serves external MCP requests and never applies to
-  destructive, arbitrary-execution, open-world, unknown, or unbound requests.
-- The permission has a persistent visible revoke switch and expires when the
+- The always-visible execution selector defaults to `请求批准`. `替我审批` covers
+  only ordinary `task_grant` policies; `完全访问权限` covers all exposed approval
+  modes. Both automatic choices are memory-only and limited to the active chat,
+  normalized HTTP(S) origin, Profile session, and AI Provider destination. They
+  serve embedded and MCP requests, while every concrete call still receives a
+  requester-bound single-use execution grant. Unbound and non-HTTP(S) requests
+  cannot use either automatic mode.
+- The selector can change while a task is waiting and resets to `请求批准` when the
   chat, origin, Profile session, Provider, or browser-hub connection changes.
   A transparent tool-WebSocket reconnect is allowed only after the replacement
-  connection authenticates as the owning panel. Same-origin paths and revisions
+  connection authenticates. Same-origin paths and revisions
   do not preserve stale execution state; every call still passes fresh
   target/revision checks.
 - Every automatically answered request still receives a fresh daemon approval

@@ -180,6 +180,9 @@ const POLICY_TEMPLATES: Record<ToolPolicyClass, PolicyTemplate> = {
 
 const POLICY_GROUPS = {
   safe_read: [
+    MCP_TOOL_NAMES.BROWSER_STATUS,
+    MCP_TOOL_NAMES.BROWSER_OBSERVE,
+    MCP_TOOL_NAMES.BROWSER_VERIFY,
     MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT,
     MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST,
     MCP_TOOL_NAMES.BROWSER_GET_PAGE_CONTEXT,
@@ -192,6 +195,7 @@ const POLICY_GROUPS = {
     MCP_TOOL_NAMES.BROWSER_SET_TARGET_FRAME,
   ],
   sensitive_read: [
+    MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
     MCP_TOOL_NAMES.BROWSER_GET_PLUGIN_CONVERSATION,
     MCP_TOOL_NAMES.BROWSER_GET_AUDIT_EVENTS,
     MCP_TOOL_NAMES.BROWSER_GET_LAST_PLUGIN_MESSAGE,
@@ -221,6 +225,7 @@ const POLICY_GROUPS = {
     MCP_TOOL_NAMES.BROWSER_DEBUGGER_DETACH,
   ],
   page_action: [
+    MCP_TOOL_NAMES.BROWSER_ACT,
     MCP_TOOL_NAMES.BROWSER_CLICK,
     MCP_TOOL_NAMES.BROWSER_DRAG,
     MCP_TOOL_NAMES.BROWSER_FILL_FORM,
@@ -314,9 +319,20 @@ export function getToolPolicy(
 
   if (
     normalizedName === MCP_TOOL_NAMES.BROWSER_QUERY_DOM &&
-    (args.maxOuterHTMLLength === 0 || args.maxTextLength === 0)
+    containsUnboundedDomQuery(args)
   ) {
     return createPolicy(normalizedName, "sensitive_read", true);
+  }
+
+  if (normalizedName === MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY) {
+    return overridePolicy(createPolicy(normalizedName, baseClass, true), {
+      sensitive: false,
+      dataSensitivity: "page_content",
+      approvalMode: "task_grant",
+      capability: "page.observe.network_digest",
+      reason:
+        "Reads only a bounded aggregated Network digest and sanitized console messages; raw request rows, headers, and bodies remain separately protected.",
+    });
   }
 
   if (
@@ -429,6 +445,23 @@ export function getToolPolicy(
   }
 
   return createPolicy(normalizedName, baseClass, true);
+}
+
+function containsUnboundedDomQuery(args: Record<string, unknown>): boolean {
+  if (args.maxOuterHTMLLength === 0 || args.maxTextLength === 0) {
+    return true;
+  }
+  return (
+    Array.isArray(args.queries) &&
+    args.queries.some(
+      (query) =>
+        Boolean(query) &&
+        typeof query === "object" &&
+        !Array.isArray(query) &&
+        ((query as Record<string, unknown>).maxOuterHTMLLength === 0 ||
+          (query as Record<string, unknown>).maxTextLength === 0),
+    )
+  );
 }
 
 export function requiresToolApproval(

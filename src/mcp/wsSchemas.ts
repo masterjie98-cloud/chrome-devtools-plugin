@@ -51,6 +51,7 @@ const activeTabSchema = z.object({
 
 const semanticSnapshotNodeSchema = z.object({
   ref: z.string().regex(/^s\d{1,6}$/),
+  targetRef: z.string().regex(/^sr1_[a-f0-9]{8}_s\d{1,6}$/),
   role: z.string().max(80),
   name: z.string().max(240),
   selector: z.string().max(400),

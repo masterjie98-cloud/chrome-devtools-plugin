@@ -76,14 +76,13 @@ export interface PendingToolApproval {
   id: string;
   toolName: string;
   arguments: Record<string, unknown>;
+  policyClass: string;
+  approvalMode: ApprovalRequestPayload["approvalMode"];
+  reason: string;
   requester?: ApprovalRequestPayload["requester"];
   target?: ApprovalRequestPayload["target"];
   preview?: ApprovalRequestPayload["preview"];
   egressDestinations?: string[];
   conversationOrigin?: string;
   allowForConversationOriginAvailable: boolean;
-}
-
-export interface ConversationOriginApprovalStatus {
-  origin: string;
 }

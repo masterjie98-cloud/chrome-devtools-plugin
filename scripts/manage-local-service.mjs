@@ -1,0 +1,140 @@
+#!/usr/bin/env node
+
+import { access, mkdir, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+
+const action = process.argv[2] ?? "print";
+const dryRun = process.argv.includes("--dry-run");
+const label = "com.ai-devtools-assistant.daemon";
+const plistPath = resolve(
+  homedir(),
+  "Library",
+  "LaunchAgents",
+  `${label}.plist`,
+);
+const serverPath = resolve("dist/daemon/server.js");
+const logDir = resolve(
+  homedir(),
+  "Library",
+  "Logs",
+  "ai-devtools-assistant",
+);
+const stdoutPath = resolve(logDir, "daemon.log");
+const stderrPath = resolve(logDir, "daemon.error.log");
+
+if (process.platform !== "darwin") {
+  process.stderr.write(
+    "Local service installation currently supports macOS launchd only. Use npm run daemon:start on this platform.\n",
+  );
+  process.exitCode = 1;
+} else if (!["print", "install", "uninstall"].includes(action)) {
+  process.stderr.write("Use print, install, or uninstall.\n");
+  process.exitCode = 1;
+} else {
+  await main();
+}
+
+async function main() {
+  const plist = renderPlist({
+    label,
+    nodePath: process.execPath,
+    serverPath,
+    stdoutPath,
+    stderrPath,
+  });
+  if (action === "print" || dryRun) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          action,
+          dryRun,
+          plistPath,
+          serverPath,
+          label,
+        },
+        null,
+        2,
+      )}\n${plist}`,
+    );
+    return;
+  }
+  if (action === "install") {
+    await access(serverPath).catch(() => {
+      throw new Error(
+        `Missing ${serverPath}. Run npm run build before installing the service.`,
+      );
+    });
+    await mkdir(dirname(plistPath), { recursive: true });
+    await mkdir(logDir, { recursive: true });
+    await writeFile(plistPath, plist, { encoding: "utf8", mode: 0o600 });
+    runLaunchctl(["bootout", `gui/${process.getuid()}/${label}`], true);
+    runLaunchctl(["bootstrap", `gui/${process.getuid()}`, plistPath]);
+    runLaunchctl(["enable", `gui/${process.getuid()}/${label}`]);
+    process.stdout.write(
+      `Installed ${label} at ${plistPath}. Logs: ${stdoutPath}, ${stderrPath}\n`,
+    );
+    return;
+  }
+  runLaunchctl(["bootout", `gui/${process.getuid()}/${label}`], true);
+  await unlink(plistPath).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+  process.stdout.write(`Uninstalled ${label} and removed ${plistPath}.\n`);
+}
+
+function runLaunchctl(args, ignoreFailure = false) {
+  const result = spawnSync("/bin/launchctl", args, { encoding: "utf8" });
+  if (result.status !== 0 && !ignoreFailure) {
+    throw new Error(
+      `launchctl ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
+    );
+  }
+}
+
+function renderPlist({
+  label,
+  nodePath,
+  serverPath,
+  stdoutPath,
+  stderrPath,
+}) {
+  const escapeXml = (value) =>
+    value
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${escapeXml(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${escapeXml(nodePath)}</string>
+    <string>${escapeXml(serverPath)}</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${escapeXml(dirname(serverPath))}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>${escapeXml(stdoutPath)}</string>
+  <key>StandardErrorPath</key>
+  <string>${escapeXml(stderrPath)}</string>
+</dict>
+</plist>
+`;
+}

@@ -1,4 +1,11 @@
+import { SUPPORTED_COMPUTED_STYLE_PROPERTIES } from "./dom";
+
 export const MCP_TOOL_NAMES = {
+  BROWSER_STATUS: "browser_status",
+  BROWSER_OBSERVE: "browser_observe",
+  BROWSER_ACT: "browser_act",
+  BROWSER_VERIFY: "browser_verify",
+  BROWSER_DEBUG_ACTIVITY: "browser_debug_activity",
   BROWSER_GET_SELECTED_ELEMENT: "browser_get_selected_element",
   BROWSER_GET_CONTEXT_DIGEST: "browser_get_context_digest",
   BROWSER_GET_PLUGIN_CONVERSATION: "browser_get_plugin_conversation",
@@ -100,7 +107,205 @@ const NO_ARG_PARAMETERS: JsonSchemaObject = {
   additionalProperties: false,
 };
 
+const COMPUTED_STYLE_PROPERTIES_SCHEMA = {
+  type: "array",
+  minItems: 1,
+  maxItems: SUPPORTED_COMPUTED_STYLE_PROPERTIES.length,
+  uniqueItems: true,
+  items: {
+    type: "string",
+    enum: [...SUPPORTED_COMPUTED_STYLE_PROPERTIES],
+  },
+  description:
+    "Optional exact computed-style projection. Omit for the default layout subset.",
+};
+
+const DOM_QUERY_ITEM_PROPERTIES = {
+  query: {
+    type: "string",
+    description: "CSS selector, className, or xpath to query.",
+  },
+  queryType: {
+    type: "string",
+    enum: ["selector", "className", "xpath"],
+    description:
+      "Use selector for CSS selectors, className for raw class names, and xpath for XPath expressions.",
+  },
+  limit: {
+    type: "number",
+    description: "Maximum number of matched elements to return.",
+  },
+  includeText: {
+    type: "boolean",
+    description: "Whether to include element text. Defaults to true.",
+  },
+  includeOuterHTML: {
+    type: "boolean",
+    description: "Whether to include outerHTML. Defaults to true.",
+  },
+  includeComputedStyle: {
+    type: "boolean",
+    description: "Whether to include computed styles. Defaults to true.",
+  },
+  computedStyleProperties: COMPUTED_STYLE_PROPERTIES_SCHEMA,
+  maxTextLength: {
+    type: "number",
+    description: "Max text chars per element. Set 0 to disable truncation.",
+  },
+  maxOuterHTMLLength: {
+    type: "number",
+    description:
+      "Max outerHTML chars per element. Set 0 to disable truncation and retrieve full DOM for html/body.",
+  },
+} as const;
+
 export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
+  {
+    name: MCP_TOOL_NAMES.BROWSER_STATUS,
+    title: "Browser connection status",
+    description:
+      "Read the current local plugin, browser, selected target, page-sync, and conversation status without using cached page content as a substitute for a live observation.",
+    parameters: NO_ARG_PARAMETERS,
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_OBSERVE,
+    title: "Observe current page",
+    description:
+      "Preferred live page observation entrypoint. Returns a fresh bounded semantic snapshot, actionable targetRef values, target freshness, DOM revision, and mutation delta. It never captures a screenshot automatically.",
+    parameters: {
+      type: "object",
+      properties: {
+        cursor: { type: "string" },
+        limit: { type: "number", minimum: 1, maximum: 100 },
+        mode: {
+          type: "string",
+          enum: ["interactive", "outline", "full"],
+        },
+        sourceLimit: { type: "number", minimum: 100, maximum: 10000 },
+        sinceRevision: { type: "number", minimum: 0 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_ACT,
+    title: "Execute page action stage",
+    description:
+      "Preferred bounded action entrypoint. Executes up to 20 fill, select, click, key, or wait operations locally after authorization, accepts targetRef from browser_observe/browser_snapshot, batches independent form controls, and stops on failure or an explicit barrier.",
+    parameters: {
+      type: "object",
+      properties: {
+        actions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              type: {
+                type: "string",
+                enum: ["fill", "select", "click", "press_key", "wait"],
+              },
+              ref: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
+              selector: { type: "string" },
+              value: {
+                oneOf: [
+                  { type: "string" },
+                  { type: "boolean" },
+                  { type: "array", items: { type: "string" } },
+                ],
+              },
+              values: { type: "array", items: { type: "string" } },
+              key: { type: "string" },
+              time: { type: "number" },
+              timeoutMs: { type: "number" },
+              dependsOn: { type: "array", items: { type: "string" } },
+              expectedOutcome: { type: "string" },
+              barrier: { type: "boolean" },
+            },
+            required: ["id", "type"],
+            additionalProperties: false,
+          },
+        },
+        stopOnFailure: { type: "boolean" },
+        decisionBarrier: {
+          type: "boolean",
+          description:
+            "Set true only when retrying after DECISION_BARRIER_REQUIRED. Ordinary actions must omit it so an active current-chat grant can apply.",
+        },
+      },
+      required: ["actions"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_VERIFY,
+    title: "Verify browser outcome",
+    description:
+      "Verify URL, title, visible text, or semantic target state from one fresh bounded page read. Returns per-check evidence and the DOM mutation delta without mutating the page.",
+    parameters: {
+      type: "object",
+      properties: {
+        sinceRevision: { type: "number", minimum: 0 },
+        checks: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              type: {
+                type: "string",
+                enum: [
+                  "url_contains",
+                  "title_contains",
+                  "text_contains",
+                  "target_present",
+                  "target_state",
+                ],
+              },
+              value: { type: "string" },
+              ref: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
+              selector: { type: "string" },
+              nameContains: { type: "string" },
+              disabled: { type: "boolean" },
+              checked: { type: "boolean" },
+              selected: { type: "boolean" },
+              expanded: { type: "boolean" },
+            },
+            required: ["id", "type"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["checks"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+    title: "Read compact debug activity",
+    description:
+      "Read a compact current Network activity digest and sanitized console messages in one approved call. Raw response bodies are never included.",
+    parameters: {
+      type: "object",
+      properties: {
+        includeNetwork: { type: "boolean" },
+        includeConsole: { type: "boolean" },
+        networkLimit: { type: "number", minimum: 1, maximum: 100 },
+        consoleLimit: { type: "number", minimum: 1, maximum: 200 },
+      },
+      additionalProperties: false,
+    },
+  },
   {
     name: MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT,
     title: "Get selected element",
@@ -194,7 +399,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_SNAPSHOT,
     title: "Browser semantic snapshot",
     description:
-      "Read a fresh accessibility-oriented snapshot of meaningful visible page elements. Returns role, accessible name, stable selector, state, bounds, freshness, and cursor pagination. Follow nextCursor while hasMore is true; restart without a cursor after STALE_SNAPSHOT_CURSOR.",
+      "Read a fresh accessibility-oriented snapshot of meaningful visible page elements. Returns role, accessible name, stable selector, actionable targetRef, state, bounds, freshness, and cursor pagination. Prefer targetRef in later actions; it is bound to this tab/frame/document and rejected after semantic page changes. Follow nextCursor while hasMore is true; restart without a cursor after STALE_SNAPSHOT_CURSOR.",
     parameters: {
       type: "object",
       properties: {
@@ -231,54 +436,45 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_QUERY_DOM,
     title: "Query DOM",
     description:
-      "Query the active tab DOM by CSS selector, className, or xpath and return sanitized element details. For full page DOM, query html or body with limit 1 and maxOuterHTMLLength 0.",
+      "Query one DOM target or batch up to 12 independent targets in one model tool round. Returns sanitized element details and a bounded computed-style projection. Use computedStyleProperties for exact visual fields instead of repeating the same query. For full page DOM, query html or body with limit 1 and maxOuterHTMLLength 0.",
     parameters: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "CSS selector, className, or xpath to query.",
-        },
+        ...DOM_QUERY_ITEM_PROPERTIES,
         selector: {
           type: "string",
           description:
             "Deprecated alias for query. Kept for compatibility with older prompts.",
         },
-        queryType: {
-          type: "string",
-          enum: ["selector", "className", "xpath"],
+        queries: {
+          type: "array",
+          minItems: 1,
+          maxItems: 12,
           description:
-            "Use selector for CSS selectors, className for raw class names, and xpath for XPath expressions.",
-        },
-        limit: {
-          type: "number",
-          description: "Maximum number of matched elements to return.",
-        },
-        includeText: {
-          type: "boolean",
-          description: "Whether to include element text. Defaults to true.",
-        },
-        includeOuterHTML: {
-          type: "boolean",
-          description: "Whether to include outerHTML. Defaults to true.",
-        },
-        includeComputedStyle: {
-          type: "boolean",
-          description:
-            "Whether to include a computed style subset. Defaults to true.",
-        },
-        maxTextLength: {
-          type: "number",
-          description:
-            "Max text chars per element. Set 0 to disable truncation.",
-        },
-        maxOuterHTMLLength: {
-          type: "number",
-          description:
-            "Max outerHTML chars per element. Set 0 to disable truncation and retrieve full DOM for html/body.",
+            "Independent bounded DOM reads executed concurrently and returned in request order.",
+          items: {
+            type: "object",
+            properties: {
+              ...DOM_QUERY_ITEM_PROPERTIES,
+              maxTextLength: {
+                ...DOM_QUERY_ITEM_PROPERTIES.maxTextLength,
+                minimum: 1,
+              },
+              maxOuterHTMLLength: {
+                ...DOM_QUERY_ITEM_PROPERTIES.maxOuterHTMLLength,
+                minimum: 1,
+              },
+            },
+            required: ["query"],
+            additionalProperties: false,
+          },
         },
       },
-      anyOf: [{ required: ["query"] }, { required: ["selector"] }],
+      anyOf: [
+        { required: ["query"] },
+        { required: ["selector"] },
+        { required: ["queries"] },
+      ],
       additionalProperties: false,
     },
   },
@@ -325,7 +521,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
     title: "Take screenshot",
     description:
-      "Capture a fresh screenshot with the built-in Chrome CDP implementation. Supports full-page and element screenshots.",
+      "Capture a fresh screenshot with the built-in Chrome CDP implementation and return it as MCP image content. Supports full-page and element screenshots and never writes to Chrome Downloads.",
     parameters: {
       type: "object",
       properties: {
@@ -353,16 +549,6 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         quality: {
           type: "number",
           description: "JPEG quality from 0 to 100.",
-        },
-        filename: {
-          type: "string",
-          description:
-            "Optional Downloads-relative filename, e.g. ai-devtools/page.png.",
-        },
-        saveToDownloads: {
-          type: "boolean",
-          description:
-            "Save the screenshot through chrome.downloads in addition to returning it.",
         },
       },
       additionalProperties: false,
@@ -472,10 +658,15 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_CLICK,
     title: "Click",
     description:
-      "Resolve a visible, unobscured top-frame element by native browser CSS selector, then click its center with trusted CDP mouse input. Reuse the exact selector returned by a fresh browser_snapshot or browser_query_dom result. Playwright/jQuery text selectors such as :has-text(), :contains(), text=, locator chaining, and XPath are not supported. This page action requires confirmation.",
+      "Resolve a visible, unobscured top-frame element by targetRef from browser_snapshot or a native CSS selector, then click its center with trusted CDP mouse input. Prefer targetRef. Playwright/jQuery text selectors such as :has-text(), :contains(), text=, locator chaining, and XPath are not supported. This page action requires confirmation.",
     parameters: {
       type: "object",
       properties: {
+        ref: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description: "Opaque targetRef from the latest browser_snapshot.",
+        },
         selector: { type: "string", description: "Exact native CSS selector from fresh page evidence." },
         target: { type: "string", description: "Alias for selector." },
         element: { type: "string", description: "Alias for selector." },
@@ -505,6 +696,11 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     parameters: {
       type: "object",
       properties: {
+        ref: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description: "Opaque targetRef from the latest browser_snapshot.",
+        },
         selector: { type: "string", description: "CSS selector to hover." },
         target: { type: "string", description: "Alias for selector." },
         element: { type: "string", description: "Alias for selector." },
@@ -520,12 +716,26 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     parameters: {
       type: "object",
       properties: {
+        sourceRef: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description: "Opaque source targetRef from the latest browser_snapshot.",
+        },
         source: { type: "string", description: "Source CSS selector." },
         sourceSelector: { type: "string", description: "Alias for source." },
+        targetRef: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description: "Opaque destination targetRef from the latest browser_snapshot.",
+        },
         target: { type: "string", description: "Target CSS selector." },
         targetSelector: { type: "string", description: "Alias for target." },
       },
-      anyOf: [{ required: ["source"] }, { required: ["sourceSelector"] }],
+      anyOf: [
+        { required: ["sourceRef"] },
+        { required: ["source"] },
+        { required: ["sourceSelector"] },
+      ],
       additionalProperties: false,
     },
   },
@@ -533,7 +743,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_FILL_FORM,
     title: "Fill form",
     description:
-      "Preflight and fill up to 50 visible top-frame controls after one confirmation. Reuse exact native CSS selectors from a fresh browser_snapshot executionMap; Playwright/jQuery text selectors and XPath are not supported. Text and checkbox/radio changes use trusted CDP input. Native select has no deterministic cross-platform CDP value-selection primitive, so select fields use a narrowly scoped DOM selection with synthetic input/change events and report inputMode=dom. Execution stops on the first post-preflight failure and may be partial if the page changes mid-run.",
+      "Preflight and fill up to 50 visible top-frame controls after one confirmation. Prefer actionable targetRef values from browser_snapshot; exact native CSS selectors remain supported. Playwright/jQuery text selectors and XPath are not supported. Text and checkbox/radio changes use trusted CDP input. Native select has no deterministic cross-platform CDP value-selection primitive, so select fields use a narrowly scoped DOM selection with synthetic input/change events and report inputMode=dom. Execution stops on the first post-preflight failure and may be partial if the page changes mid-run.",
     parameters: {
       type: "object",
       properties: {
@@ -544,6 +754,10 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
           items: {
             type: "object",
             properties: {
+              ref: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
               selector: { type: "string", minLength: 1, maxLength: 2000 },
               target: { type: "string", minLength: 1, maxLength: 2000 },
               element: { type: "string", minLength: 1, maxLength: 2000 },
@@ -568,6 +782,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
             },
             required: ["value"],
             anyOf: [
+              { required: ["ref"] },
               { required: ["selector"] },
               { required: ["target"] },
               { required: ["element"] },
@@ -606,6 +821,10 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
                 type: "string",
                 enum: ["fill", "select", "click", "press_key", "wait"],
               },
+              ref: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
               selector: { type: "string" },
               value: {
                 oneOf: [
@@ -617,7 +836,6 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
               values: { type: "array", items: { type: "string" } },
               key: { type: "string" },
               time: { type: "number" },
-              timeoutMs: { type: "number" },
               dependsOn: { type: "array", items: { type: "string" } },
               expectedOutcome: { type: "string" },
               barrier: { type: "boolean" },
@@ -648,6 +866,11 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     parameters: {
       type: "object",
       properties: {
+        ref: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description: "Opaque targetRef from the latest browser_snapshot.",
+        },
         selector: { type: "string", description: "CSS selector to type into." },
         target: { type: "string", description: "Alias for selector." },
         element: { type: "string", description: "Alias for selector." },
@@ -676,6 +899,11 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     parameters: {
       type: "object",
       properties: {
+        ref: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description: "Optional opaque targetRef from the latest browser_snapshot.",
+        },
         selector: { type: "string", description: "Optional target selector." },
         target: { type: "string", description: "Alias for selector." },
         key: {
@@ -701,6 +929,11 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     parameters: {
       type: "object",
       properties: {
+        ref: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description: "Opaque targetRef from the latest browser_snapshot.",
+        },
         selector: {
           type: "string",
           minLength: 1,
@@ -730,6 +963,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       },
       required: ["values"],
       anyOf: [
+        { required: ["ref"] },
         { required: ["selector"] },
         { required: ["target"] },
         { required: ["element"] },
@@ -1650,6 +1884,11 @@ const MCP_TOOL_NAME_ALIASES: Record<string, McpToolName> = {
 };
 
 const MCP_EXPOSED_TOOL_ORDER: readonly McpToolName[] = [
+  MCP_TOOL_NAMES.BROWSER_STATUS,
+  MCP_TOOL_NAMES.BROWSER_OBSERVE,
+  MCP_TOOL_NAMES.BROWSER_ACT,
+  MCP_TOOL_NAMES.BROWSER_VERIFY,
+  MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
   MCP_TOOL_NAMES.BROWSER_SNAPSHOT,
   MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST,
   MCP_TOOL_NAMES.BROWSER_QUERY_DOM,

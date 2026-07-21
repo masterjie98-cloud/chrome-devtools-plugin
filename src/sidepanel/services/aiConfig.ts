@@ -58,7 +58,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   maxOutputTokens: undefined,
   supportsVision: false,
   includeImageHistory: false,
-  fastAgentMode: false,
+  fastAgentMode: true,
   autoReadPage: true,
   enableTools: true,
   allowPseudoToolCalls: false,

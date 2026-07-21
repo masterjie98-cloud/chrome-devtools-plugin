@@ -1906,7 +1906,7 @@ Implementation slices:
 - [x] Add MCP delegate/wait registrations and structured output schemas.
 - [x] Add daemon task deduplication, atomic claim, terminal result, abortable
       waiter, capacity bounds, and Profile/session isolation.
-- [x] Bump the shared extension-visible WebSocket protocol to V4.
+- [x] Keep the shared extension-visible WebSocket protocol aligned at V5.
 - [x] Add Chat source metadata, MCP message projection, inbox UI, and responsive
       states without a new UI dependency.
 - [x] Link delegated submissions to Agent progress and terminal results.
@@ -1957,7 +1957,7 @@ request, ran the embedded Agent read-only, persisted `completed`, and returned
 the stored result immediately to the Codex waiter. The fresh request preserved
 its exact numeric target ID and UUID navigation ID.
 
-#### 2026-07-16 - Stale target repair and delegated-task card polish
+### 2026-07-16 - Stale target repair and delegated-task card polish
 
 - Routing identities (`targetId`, `documentId`, and `navigationId`) are opaque
   protocol values. They now bypass human-text PII redaction so persistence does
@@ -2030,3 +2030,32 @@ Status: automated verification complete; reloaded-extension acceptance pending.
 - Current-tree validation passes 285/285 tests, the production build, and the
   packaged daemon plus two concurrent MCP-adapter lifecycle verifier. Reloading
   the unpacked extension remains required for the real Side Panel acceptance.
+
+### 2026-07-17 - Smart MCP kernel and local onboarding
+
+- Added a default 10-tool `smart` profile while retaining `inspect`, `read`, and
+  `full` expert profiles. The smart model-visible schema is 5,696 characters
+  versus 39,169 for the 69-tool full runtime surface, an 85.5% reduction.
+- Added live `browser_status`, `browser_observe`, bounded `browser_act`,
+  deterministic `browser_verify`, and compact `browser_debug_activity`.
+- Semantic snapshot nodes now expose target-bound actionable `targetRef` values.
+  Resolution survives an indefinitely pending approval, crosses daemon call
+  wrappers, and rechecks the selected target plus semantic fingerprint before
+  entering the existing trusted-input and approval path.
+- Removed pointer animation duration from the CDP execution critical path.
+- Reconciled redacted audit output with persisted timing/size metrics.
+- Added a sidepanel connection center, a connection-only save action, generated
+  Codex/Claude/Cursor configuration, and an optional macOS user LaunchAgent.
+- Automatic browser screenshot attachment remains intentionally absent. The
+  Agent must request screenshots through the normal approval-gated tool when
+  visual evidence is material.
+- Final automated evidence: the smart-kernel evaluation passes 10/10, the full
+  repository suite passes 306/306, the production build passes, and the packaged
+  daemon plus two concurrent MCP adapters pass lifecycle and private-permission
+  checks.
+- Final real-Chrome fixture evidence: the approved five-action form/drawer stage
+  completed without failure; one Fetch was grouped with status 200; DOM revision
+  advanced from 1 to 4; both drawer and Network-status checks passed. Ten live
+  semantic observations measured median 15.96 ms and P95 22.74 ms on that
+  fixture. These numbers are a local regression baseline, not a general
+  production-page benchmark.

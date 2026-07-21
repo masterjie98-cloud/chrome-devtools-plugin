@@ -1,4 +1,5 @@
 import type {
+  ComputedStyleProperty,
   DomElementInfo,
   DomQueryInput,
   DomQueryResult,
@@ -12,6 +13,7 @@ import type {
   PageSnapshotInput,
   PageSnapshot,
 } from "../shared/dom";
+import { DEFAULT_COMPUTED_STYLE_PROPERTIES } from "../shared/dom";
 import {
   paginateSemanticSnapshot,
   type SemanticCheckedState,
@@ -35,51 +37,6 @@ const SKIPPED_TAGS = new Set([
   "META",
   "LINK",
 ]);
-const COMPUTED_STYLE_KEYS = [
-  "display",
-  "position",
-  "top",
-  "right",
-  "bottom",
-  "left",
-  "visibility",
-  "opacity",
-  "z-index",
-  "width",
-  "height",
-  "min-width",
-  "min-height",
-  "max-width",
-  "max-height",
-  "margin",
-  "margin-top",
-  "margin-right",
-  "margin-bottom",
-  "margin-left",
-  "padding",
-  "padding-top",
-  "padding-right",
-  "padding-bottom",
-  "padding-left",
-  "border",
-  "border-radius",
-  "box-sizing",
-  "overflow",
-  "overflow-x",
-  "overflow-y",
-  "transform",
-  "flex",
-  "flex-direction",
-  "flex-wrap",
-  "align-items",
-  "justify-content",
-  "gap",
-  "grid-template-columns",
-  "grid-template-rows",
-  "grid-column",
-  "grid-row",
-] as const;
-
 const HIGHLIGHT_CLASS = "ai-devtools-assistant-highlight";
 const HIGHLIGHT_STYLE_ID = "ai-devtools-assistant-highlight-style";
 type ResolvedDomSetValueTarget = Exclude<DomSetValueTarget, "auto">;
@@ -87,6 +44,7 @@ interface DomElementInfoOptions {
   includeText?: boolean;
   includeOuterHTML?: boolean;
   includeComputedStyle?: boolean;
+  computedStyleProperties?: ComputedStyleProperty[];
   maxTextLength?: number;
   maxOuterHTMLLength?: number;
 }
@@ -331,6 +289,7 @@ export function queryDom(input: DomQueryInput): DomQueryResult {
             includeText: input.includeText,
             includeOuterHTML: input.includeOuterHTML,
             includeComputedStyle: input.includeComputedStyle,
+            computedStyleProperties: input.computedStyleProperties,
             maxTextLength: input.maxTextLength,
             maxOuterHTMLLength: input.maxOuterHTMLLength,
           }),
@@ -399,7 +358,9 @@ export function getElementInfo(
       ? sanitizeOuterHtml(element, options.maxOuterHTMLLength)
       : "",
     attributes: getSanitizedAttributes(element),
-    computedStyle: includeComputedStyle ? getComputedStyleSubset(element) : {},
+    computedStyle: includeComputedStyle
+      ? getComputedStyleSubset(element, options.computedStyleProperties)
+      : {},
     rect: toRectSnapshot(rect),
   };
 }
@@ -1021,11 +982,14 @@ function sanitizeOuterHtml(
   );
 }
 
-function getComputedStyleSubset(element: Element): Record<string, string> {
+function getComputedStyleSubset(
+  element: Element,
+  properties: readonly ComputedStyleProperty[] = DEFAULT_COMPUTED_STYLE_PROPERTIES,
+): Record<string, string> {
   const style = window.getComputedStyle(element);
   const subset: Record<string, string> = {};
 
-  for (const key of COMPUTED_STYLE_KEYS) {
+  for (const key of properties) {
     subset[key] = sanitizeText(style.getPropertyValue(key), 240);
   }
 

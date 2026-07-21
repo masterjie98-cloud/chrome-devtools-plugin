@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getApprovalEgressDestinations } from "../src/sidepanel/services/approvalPresentation";
+import {
+  getApprovalEgressDestinations,
+  getConversationApprovalEgressDestinations,
+} from "../src/sidepanel/services/approvalPresentation";
 
 test("embedded Agent approvals show only the configured AI Provider origin", () => {
   assert.deepEqual(
@@ -28,6 +31,30 @@ test("MCP approvals do not misattribute client-managed egress to the extension P
       toolName: "web_search",
       aiProviderUrl: "https://provider.example/v1",
     }),
+    ["MCP 客户端：后续模型或数据出站目标由该客户端配置"],
+  );
+  assert.deepEqual(
+    getConversationApprovalEgressDestinations(
+      "mcp",
+      "https://provider.example/v1",
+    ),
+    ["MCP 客户端：后续模型或数据出站目标由该客户端配置"],
+  );
+});
+
+test("conversation grants retain the requester-specific egress boundary", () => {
+  assert.deepEqual(
+    getConversationApprovalEgressDestinations(
+      "ui",
+      "https://provider.example/v1/chat/completions",
+    ),
+    ["AI Provider: https://provider.example"],
+  );
+  assert.deepEqual(
+    getConversationApprovalEgressDestinations(
+      "mcp",
+      "https://provider.example/v1/chat/completions",
+    ),
     ["MCP 客户端：后续模型或数据出站目标由该客户端配置"],
   );
 });
