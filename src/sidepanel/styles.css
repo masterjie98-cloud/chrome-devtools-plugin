@@ -997,6 +997,26 @@ h6.chat-markdown-heading {
   color: currentColor;
   opacity: 0.72;
   font-size: 11px;
+  transition: transform 0.16s ease;
+}
+
+.execution-approval-mode-chevron.is-expanded {
+  transform: rotate(180deg);
+}
+
+.disclosure-chevron {
+  transition: transform 0.16s ease;
+}
+
+.disclosure-chevron.is-expanded {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .execution-approval-mode-chevron,
+  .disclosure-chevron {
+    transition: none;
+  }
 }
 
 .execution-approval-menu-label {

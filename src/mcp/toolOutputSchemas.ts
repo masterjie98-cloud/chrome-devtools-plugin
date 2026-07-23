@@ -165,6 +165,23 @@ const semanticSnapshotSchema = outputObject({
     pagination: z.unknown(),
     stats: z.unknown(),
   }),
+  frameScope: z.enum(["auto", "all-accessible"]).optional(),
+  complete: z.boolean().optional(),
+  omittedFrameCount: z.number().int().nonnegative().max(10_000).optional(),
+  frames: z
+    .array(
+      outputObject({
+        frame: z.unknown(),
+        page: z.unknown(),
+        target: nullableUnknown,
+        snapshot: z.unknown(),
+        observation: z.unknown(),
+        actionable: z.literal(false),
+      }),
+    )
+    .max(11)
+    .optional(),
+  unavailableFrames: z.array(z.unknown()).max(12).optional(),
 });
 
 const domQueryResultSchema = outputObject({

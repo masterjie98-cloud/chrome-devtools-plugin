@@ -1,5 +1,31 @@
 # Chrome DevTools Plugin Threat Model
 
+## 2026-07-21 multi-frame observation and latency update
+
+`browser_observe` now defaults to a bounded `auto` frame scope. The background
+reads registered content frames from the already selected tab in parallel and
+returns a single provenance-bearing result. This is a read-coverage expansion,
+not a permission or execution expansion: every frame retains its own
+`frameId`, `documentId`, URL, and top-level navigation binding; stale or
+unavailable frames are reported as partial failures rather than relabeled as
+the selected frame.
+
+Only the selected frame receives actionable semantic `targetRef` values.
+Child-frame observations are explicitly marked non-actionable and their target
+references are removed. A model must select that frame and obtain a fresh,
+document-bound observation before attempting a mutation, after which the
+existing approval and one-use signed execution-grant checks still apply.
+Automatic scope reads at most four frames; explicit `all-accessible` reads at
+most eight by default and twelve at the hard limit. Node and source-character
+budgets are divided across the returned frames, preventing frame fan-out from
+creating an unbounded page-content egress path.
+
+The latency optimization changes scheduling, not trust decisions. Compact DOM
+construction avoids duplicate selector/viewport work and legacy summary
+materialization. State-hub synchronization and read-only audit persistence now
+run asynchronously after the tool result is returned. Approval, grant,
+mutation, and stale-target audit events remain on their existing durable path.
+
 ## 2026-07 execution-core trust-boundary update
 
 The default MCP adapter now exposes a compact `smart` profile. It is a

@@ -51,6 +51,7 @@ import type {
   HighlightElementResult,
   PageSnapshot,
   PageSnapshotInput,
+  MultiFramePageSnapshot,
   RemoveCssPatchInput,
   RemoveCssPatchResult,
   ScreenshotCaptureInput,
@@ -219,7 +220,7 @@ export interface ToolArgumentMap {
 }
 
 export interface ToolResultMap {
-  [TOOL_NAMES.DOM_GET_PAGE_INFO]: PageSnapshot;
+  [TOOL_NAMES.DOM_GET_PAGE_INFO]: PageSnapshot | MultiFramePageSnapshot;
   [TOOL_NAMES.DOM_QUERY]: DomQueryResult;
   [TOOL_NAMES.DOM_START_ELEMENT_PICK]: { started: boolean };
   [TOOL_NAMES.DOM_CANCEL_ELEMENT_PICK]: { cancelled: boolean };
@@ -1005,13 +1006,43 @@ function validatePageSnapshotInput(args: Record<string, unknown>): string | null
   ) {
     return "Snapshot sinceRevision must be a non-negative integer.";
   }
+  if (args.compact !== undefined && typeof args.compact !== "boolean") {
+    return "Snapshot compact must be a boolean.";
+  }
+  if (
+    args.frameScope !== undefined &&
+    args.frameScope !== "selected" &&
+    args.frameScope !== "auto" &&
+    args.frameScope !== "all-accessible"
+  ) {
+    return "Snapshot frameScope must be selected, auto, or all-accessible.";
+  }
+  if (
+    args.maxFrames !== undefined &&
+    (typeof args.maxFrames !== "number" ||
+      !Number.isInteger(args.maxFrames) ||
+      args.maxFrames < 1 ||
+      args.maxFrames > 12)
+  ) {
+    return "Snapshot maxFrames must be an integer between 1 and 12.";
+  }
+  if (
+    args.cursor !== undefined &&
+    args.frameScope !== undefined &&
+    args.frameScope !== "selected"
+  ) {
+    return "Snapshot cursor pagination is available only with frameScope=selected.";
+  }
   const unknownKeys = Object.keys(args).filter(
     (key) =>
       key !== "cursor" &&
       key !== "limit" &&
       key !== "mode" &&
       key !== "sourceLimit" &&
-      key !== "sinceRevision",
+      key !== "sinceRevision" &&
+      key !== "compact" &&
+      key !== "frameScope" &&
+      key !== "maxFrames",
   );
   return unknownKeys.length > 0
     ? `Snapshot arguments contain unsupported keys: ${unknownKeys.join(", ")}.`

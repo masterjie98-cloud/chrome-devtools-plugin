@@ -57,15 +57,35 @@ const SNAPSHOT_REFERENCE_SESSION_LIMIT = 32;
 // Approval may stay pending indefinitely. References are capacity-bounded and
 // always revalidated against a live target/fingerprint instead of expiring by time.
 const snapshotReferencesBySession = new Map<string, SnapshotReferenceSet>();
+const semanticSnapshotInputShape = {
+  cursor: z.string().regex(/^ss1_[a-f0-9]{8}_\d{1,6}$/).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+  mode: z.enum(["interactive", "outline", "full"]).optional(),
+  sourceLimit: z.number().int().min(100).max(10000).optional(),
+  sinceRevision: z.number().int().nonnegative().optional(),
+} as const;
 const semanticSnapshotInputSchema = z
-  .object({
-    cursor: z.string().regex(/^ss1_[a-f0-9]{8}_\d{1,6}$/).optional(),
-    limit: z.number().int().min(1).max(100).optional(),
-    mode: z.enum(["interactive", "outline", "full"]).optional(),
-    sourceLimit: z.number().int().min(100).max(10000).optional(),
-    sinceRevision: z.number().int().nonnegative().optional(),
-  })
+  .object(semanticSnapshotInputShape)
   .strict();
+const browserObserveInputSchema = z
+  .object({
+    ...semanticSnapshotInputShape,
+    frameScope: z
+      .enum(["selected", "auto", "all-accessible"])
+      .optional(),
+    maxFrames: z.number().int().min(1).max(12).optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.cursor === undefined ||
+      value.frameScope === undefined ||
+      value.frameScope === "selected",
+    {
+      message: "cursor pagination requires frameScope=selected",
+      path: ["frameScope"],
+    },
+  );
 const conversationPageInputSchema = z
   .object({
     cursor: z
@@ -411,10 +431,54 @@ const actionStageSchema = z
             type: z.literal("click"),
             ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
             selector: z.string().min(1).max(1000).optional(),
+            button: z.enum(["left", "right", "middle"]).optional(),
+            doubleClick: z.boolean().optional(),
           }).strict().refine(
             (value) => Boolean(value.ref || value.selector),
             { message: "click action requires ref or selector" },
           ),
+          actionStageMetadataSchema.extend({
+            id: z.string().min(1).max(80),
+            type: z.literal("hover"),
+            ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
+            selector: z.string().min(1).max(1000).optional(),
+          }).strict().refine(
+            (value) => Boolean(value.ref || value.selector),
+            { message: "hover action requires ref or selector" },
+          ),
+          actionStageMetadataSchema.extend({
+            id: z.string().min(1).max(80),
+            type: z.literal("drag"),
+            sourceRef: z.string().refine(isSnapshotTargetRef, "invalid source snapshot target ref").optional(),
+            sourceSelector: z.string().min(1).max(1000).optional(),
+            targetRef: z.string().refine(isSnapshotTargetRef, "invalid destination snapshot target ref").optional(),
+            targetSelector: z.string().min(1).max(1000).optional(),
+          }).strict()
+            .refine(
+              (value) => Boolean(value.sourceRef || value.sourceSelector),
+              { message: "drag action requires sourceRef or sourceSelector" },
+            )
+            .refine(
+              (value) => Boolean(value.targetRef || value.targetSelector),
+              { message: "drag action requires targetRef or targetSelector" },
+            ),
+          actionStageMetadataSchema.extend({
+            id: z.string().min(1).max(80),
+            type: z.literal("scroll"),
+            deltaX: z.number().optional(),
+            deltaY: z.number().optional(),
+            x: z.number().optional(),
+            y: z.number().optional(),
+          }).strict().refine(
+            (value) => value.deltaX !== undefined || value.deltaY !== undefined,
+            { message: "scroll action requires deltaX or deltaY" },
+          ),
+          actionStageMetadataSchema.extend({
+            id: z.string().min(1).max(80),
+            type: z.literal("resize"),
+            width: z.number().int().min(320).max(10000),
+            height: z.number().int().min(240).max(10000),
+          }).strict(),
           actionStageMetadataSchema.extend({
             id: z.string().min(1).max(80),
             type: z.literal("press_key"),
@@ -761,7 +825,7 @@ const removeCssPatchSchema = z.object({
 
 const MCP_TOOL_INPUT_SCHEMA_BASE: Record<McpToolName, ZodTypeAny> = {
   [MCP_TOOL_NAMES.BROWSER_STATUS]: noArgSchema,
-  [MCP_TOOL_NAMES.BROWSER_OBSERVE]: semanticSnapshotInputSchema,
+  [MCP_TOOL_NAMES.BROWSER_OBSERVE]: browserObserveInputSchema,
   [MCP_TOOL_NAMES.BROWSER_ACT]: actionStageSchema,
   [MCP_TOOL_NAMES.BROWSER_VERIFY]: browserVerifySchema,
   [MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY]: debugActivitySchema,
@@ -1038,7 +1102,18 @@ export async function executeMcpToolData(
     case MCP_TOOL_NAMES.BROWSER_STATUS:
       return readBrowserStatus(context.sessionId);
     case MCP_TOOL_NAMES.BROWSER_OBSERVE:
-      return readSemanticSnapshot(pluginBridge, parsedArgs, context.sessionId);
+      return readSemanticSnapshot(
+        pluginBridge,
+        {
+          ...parsedArgs,
+          frameScope:
+            parsedArgs.cursor !== undefined
+              ? "selected"
+              : (parsedArgs.frameScope ?? "auto"),
+        },
+        context.sessionId,
+        { compact: true, retryStaleOnce: true },
+      );
     case MCP_TOOL_NAMES.BROWSER_ACT:
       return executeActionStage(pluginBridge, parsedArgs);
     case MCP_TOOL_NAMES.BROWSER_VERIFY:
@@ -1976,6 +2051,40 @@ async function readSemanticSnapshot(
   pluginBridge: PluginWebSocketServer,
   args: Record<string, unknown>,
   sessionId?: string,
+  options: {
+    compact?: boolean;
+    retryStaleOnce?: boolean;
+  } = {},
+): Promise<unknown> {
+  try {
+    return await readSemanticSnapshotOnce(
+      pluginBridge,
+      args,
+      sessionId,
+      options.compact === true,
+    );
+  } catch (error) {
+    if (
+      options.retryStaleOnce !== true ||
+      !(error instanceof Error) ||
+      !error.message.startsWith("STALE_CONTEXT:")
+    ) {
+      throw error;
+    }
+    return readSemanticSnapshotOnce(
+      pluginBridge,
+      args,
+      sessionId,
+      options.compact === true,
+    );
+  }
+}
+
+async function readSemanticSnapshotOnce(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+  sessionId: string | undefined,
+  compact: boolean,
 ): Promise<unknown> {
   const stateBeforeRead = getBrowserStateSnapshot(sessionId);
   const value = await proxyBrowserTool(pluginBridge, {
@@ -1995,15 +2104,31 @@ async function readSemanticSnapshot(
       ...(typeof args.sinceRevision === "number"
         ? { sinceRevision: args.sinceRevision }
         : {}),
+      ...(compact ? { compact: true } : {}),
+      ...(args.frameScope === "selected" ||
+      args.frameScope === "auto" ||
+      args.frameScope === "all-accessible"
+        ? { frameScope: args.frameScope }
+        : {}),
+      ...(typeof args.maxFrames === "number"
+        ? { maxFrames: args.maxFrames }
+        : {}),
     },
   });
-  if (!isSemanticPageSnapshot(value)) {
+  const multiFrameValue = isMultiFramePageSnapshot(value) ? value : undefined;
+  const primaryFrame = multiFrameValue
+    ? (multiFrameValue.frames.find(
+        (entry) => entry.frame.frameId === multiFrameValue.selectedFrameId,
+      ) ?? multiFrameValue.frames[0])
+    : undefined;
+  const pageValue = primaryFrame?.pageSnapshot ?? value;
+  if (!isSemanticPageSnapshot(pageValue)) {
     throw new Error(
       "SEMANTIC_SNAPSHOT_UNAVAILABLE: reload the current extension build and retry browser_snapshot.",
     );
   }
   const stateAfterRead = getBrowserStateSnapshot(sessionId);
-  const capturedTarget = value.provenance?.target;
+  const capturedTarget = pageValue.provenance?.target;
   if (
     stateBeforeRead.activeTab &&
     !sameBrowserTarget(stateBeforeRead.activeTab, stateAfterRead.activeTab)
@@ -2030,13 +2155,16 @@ async function readSemanticSnapshot(
       "STALE_CONTEXT: semantic snapshot provenance does not match the browser session state; retry browser_snapshot.",
     );
   }
+  const snapshot = compact
+    ? compactSemanticSnapshot(pageValue.semanticSnapshot)
+    : pageValue.semanticSnapshot;
   const result = {
     version: "browser-semantic-snapshot-v1",
     page: {
-      url: value.url,
-      title: value.title,
-      origin: value.origin,
-      capturedAt: value.capturedAt,
+      url: pageValue.url,
+      title: pageValue.title,
+      origin: pageValue.origin,
+      capturedAt: pageValue.capturedAt,
     },
     target:
       capturedTarget ??
@@ -2045,8 +2173,8 @@ async function readSemanticSnapshot(
       null,
     freshness: {
       source: "live-browser",
-      capturedAt: value.capturedAt,
-      observedAt: value.provenance?.observedAt ?? new Date().toISOString(),
+      capturedAt: pageValue.capturedAt,
+      observedAt: pageValue.provenance?.observedAt ?? new Date().toISOString(),
       revision:
         stateBeforeRead.activeTab
           ? stateBeforeRead.revision
@@ -2054,25 +2182,97 @@ async function readSemanticSnapshot(
       navigationRevision: capturedTarget?.revision,
       stale: false,
     },
-    snapshot: value.semanticSnapshot,
+    snapshot,
     observation: {
-      mode: value.mode ?? "interactive",
-      sourceVisited: value.sourceVisited ?? value.nodeCount,
-      sourceLimit: value.sourceLimit ?? 2000,
-      domRevision: value.domRevision ?? 0,
-      delta: value.delta ?? null,
-      truncated: value.truncated,
+      mode: pageValue.mode ?? "interactive",
+      sourceVisited: pageValue.sourceVisited ?? pageValue.nodeCount,
+      sourceLimit: pageValue.sourceLimit ?? 2000,
+      domRevision: pageValue.domRevision ?? 0,
+      delta: pageValue.delta ?? null,
+      truncated: pageValue.truncated,
+      timing: pageValue.timing ?? null,
     },
+    ...(multiFrameValue
+      ? {
+          frameScope: multiFrameValue.frameScope,
+          complete: multiFrameValue.complete,
+          omittedFrameCount: multiFrameValue.omittedFrameCount,
+          frames: multiFrameValue.frames
+            .filter((entry) => entry !== primaryFrame)
+            .filter((entry) => isSemanticPageSnapshot(entry.pageSnapshot))
+            .map((entry) => ({
+              frame: entry.frame,
+              page: {
+                url: entry.pageSnapshot.url,
+                title: entry.pageSnapshot.title,
+                origin: entry.pageSnapshot.origin,
+                capturedAt: entry.pageSnapshot.capturedAt,
+              },
+              target: entry.pageSnapshot.provenance?.target ?? null,
+              snapshot: compact
+                ? compactSemanticSnapshot(
+                    entry.pageSnapshot.semanticSnapshot!,
+                    false,
+                  )
+                : entry.pageSnapshot.semanticSnapshot,
+              observation: {
+                mode: entry.pageSnapshot.mode ?? "interactive",
+                sourceVisited:
+                  entry.pageSnapshot.sourceVisited ??
+                  entry.pageSnapshot.nodeCount,
+                sourceLimit: entry.pageSnapshot.sourceLimit ?? 2000,
+                domRevision: entry.pageSnapshot.domRevision ?? 0,
+                truncated: entry.pageSnapshot.truncated,
+                timing: entry.pageSnapshot.timing ?? null,
+              },
+              actionable: false,
+            })),
+          unavailableFrames: multiFrameValue.unavailableFrames,
+        }
+      : {}),
   };
   registerSnapshotReferences(
     pluginBridge,
     stateAfterRead.sessionId,
-    value,
+    pageValue,
     capturedTarget ??
       stateBeforeRead.activeTab ??
       stateAfterRead.activeTab,
   );
   return result;
+}
+
+function compactSemanticSnapshot(
+  snapshot: import("../shared/semanticSnapshot").SemanticSnapshotCollection,
+  includeTargetRef = true,
+) {
+  const nodes = snapshot.nodes.map(
+    ({
+      selector: _selector,
+      tagName: _tagName,
+      bounds: _bounds,
+      ref: _ref,
+      targetRef: _targetRef,
+      ...node
+    }) => ({
+      ...node,
+      ...(includeTargetRef ? { targetRef: _targetRef } : {}),
+    }),
+  );
+  const base = {
+    ...snapshot,
+    nodes,
+    stats: {
+      sourceTruncated: snapshot.stats.sourceTruncated,
+    },
+  };
+  return {
+    ...base,
+    stats: {
+      ...base.stats,
+      outputChars: JSON.stringify(base).length,
+    },
+  };
 }
 
 function registerSnapshotReferences(
@@ -2210,13 +2410,19 @@ function collectSnapshotRefs(
     toolName === MCP_TOOL_NAMES.BROWSER_ACT
   ) {
     return Array.isArray(args.actions)
-      ? args.actions.flatMap((action) =>
-          action &&
-          typeof action === "object" &&
-          typeof (action as { ref?: unknown }).ref === "string"
-            ? [(action as { ref: string }).ref]
-            : [],
-        )
+      ? args.actions.flatMap((action) => {
+          if (!action || typeof action !== "object") {
+            return [];
+          }
+          const value = action as {
+            ref?: unknown;
+            sourceRef?: unknown;
+            targetRef?: unknown;
+          };
+          return [value.ref, value.sourceRef, value.targetRef].filter(
+            (reference): reference is string => typeof reference === "string",
+          );
+        })
       : [];
   }
   if (toolName === MCP_TOOL_NAMES.BROWSER_VERIFY) {
@@ -2276,9 +2482,24 @@ function replaceSnapshotRefs(
     toolName === MCP_TOOL_NAMES.BROWSER_EXECUTE_ACTION_STAGE ||
     toolName === MCP_TOOL_NAMES.BROWSER_ACT
   ) {
+    const replaceStageAction = (value: Record<string, unknown>) => {
+      if (value.type !== "drag") {
+        return replaceTarget(value);
+      }
+      const { sourceRef, targetRef, ...rest } = value;
+      return {
+        ...rest,
+        ...(typeof sourceRef === "string"
+          ? { sourceSelector: resolve(sourceRef) }
+          : {}),
+        ...(typeof targetRef === "string"
+          ? { targetSelector: resolve(targetRef) }
+          : {}),
+      };
+    };
     return {
       ...args,
-      actions: (args.actions as Record<string, unknown>[]).map(replaceTarget),
+      actions: (args.actions as Record<string, unknown>[]).map(replaceStageAction),
     };
   }
   if (toolName === MCP_TOOL_NAMES.BROWSER_VERIFY) {
@@ -2298,14 +2519,18 @@ async function executeActionStage(
 ): Promise<Record<string, unknown>> {
   const stage = args as unknown as ParsedActionStage;
   for (const action of stage.actions) {
-    if (
-      "selector" in action &&
-      action.selector &&
-      !isNativeStageSelector(action.selector)
-    ) {
-      throw new Error(
-        `INVALID_NATIVE_CSS_SELECTOR: action ${action.id} must use an exact native CSS selector from fresh page evidence.`,
-      );
+    const selectors =
+      action.type === "drag"
+        ? [action.sourceSelector, action.targetSelector]
+        : "selector" in action
+          ? [action.selector]
+          : [];
+    for (const selector of selectors) {
+      if (selector && !isNativeStageSelector(selector)) {
+        throw new Error(
+          `INVALID_NATIVE_CSS_SELECTOR: action ${action.id} must use exact native CSS selectors from fresh page evidence.`,
+        );
+      }
     }
   }
 
@@ -2411,7 +2636,43 @@ async function executeActionStage(
         data = await proxyBrowserTool(pluginBridge, {
           id: createMessageId(),
           toolName: TOOL_NAMES.BROWSER_CLICK,
+          args: {
+            selector: action.selector,
+            button: action.button,
+            doubleClick: action.doubleClick,
+          },
+        } as unknown as AnyToolCall);
+      } else if (action.type === "hover") {
+        data = await proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.BROWSER_HOVER,
           args: { selector: action.selector },
+        } as unknown as AnyToolCall);
+      } else if (action.type === "drag") {
+        data = await proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.BROWSER_DRAG,
+          args: {
+            sourceSelector: action.sourceSelector,
+            targetSelector: action.targetSelector,
+          },
+        } as unknown as AnyToolCall);
+      } else if (action.type === "scroll") {
+        data = await proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.BROWSER_MOUSE_WHEEL,
+          args: {
+            deltaX: action.deltaX,
+            deltaY: action.deltaY,
+            x: action.x,
+            y: action.y,
+          },
+        } as unknown as AnyToolCall);
+      } else if (action.type === "resize") {
+        data = await proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.BROWSER_RESIZE,
+          args: { width: action.width, height: action.height },
         } as unknown as AnyToolCall);
       } else if (action.type === "press_key") {
         data = await proxyBrowserTool(pluginBridge, {
@@ -2512,6 +2773,22 @@ function isSemanticPageSnapshot(
     Boolean(semantic) &&
     typeof semantic === "object" &&
     (semantic as { version?: unknown }).version === "semantic-snapshot-v1"
+  );
+}
+
+function isMultiFramePageSnapshot(
+  value: unknown,
+): value is import("../shared/dom").MultiFramePageSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<
+    import("../shared/dom").MultiFramePageSnapshot
+  >;
+  return (
+    candidate.version === "multi-frame-page-snapshot-v1" &&
+    typeof candidate.tabId === "number" &&
+    typeof candidate.selectedFrameId === "number" &&
+    Array.isArray(candidate.frames) &&
+    Array.isArray(candidate.unavailableFrames)
   );
 }
 

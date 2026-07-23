@@ -2866,7 +2866,10 @@ async function recordToolAuditBestEffort(
   >,
 ): Promise<void> {
   try {
-    await recordAuditEvent(stateStore, {
+    if (!stateStore) {
+      return;
+    }
+    await stateStore.appendAudit({
       id: createMessageId(),
       eventType: outcome === "completed" ? "tool.completed" : "tool.failed",
       timestamp: new Date().toISOString(),

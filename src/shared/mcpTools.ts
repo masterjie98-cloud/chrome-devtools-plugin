@@ -171,7 +171,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_OBSERVE,
     title: "Observe current page",
     description:
-      "Preferred live page observation entrypoint. Returns a fresh bounded semantic snapshot, actionable targetRef values, target freshness, DOM revision, and mutation delta. It never captures a screenshot automatically.",
+      "Preferred live page observation entrypoint. Returns a fresh compact semantic snapshot, actionable targetRef values for the selected frame, target freshness, DOM revision, and mutation delta. By default it also reads a bounded set of accessible child frames in parallel; child-frame observations are read-only and require selecting that frame before acting. It retries one transient target change internally and never captures a screenshot automatically. Use browser_snapshot when expert selector, tag, and geometry fields are required.",
     parameters: {
       type: "object",
       properties: {
@@ -183,6 +183,18 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         },
         sourceLimit: { type: "number", minimum: 100, maximum: 10000 },
         sinceRevision: { type: "number", minimum: 0 },
+        frameScope: {
+          type: "string",
+          enum: ["selected", "auto", "all-accessible"],
+          description:
+            "selected reads only the current frame; auto (default) includes up to 4 accessible frames; all-accessible includes up to maxFrames. Cursor pagination requires selected.",
+        },
+        maxFrames: {
+          type: "number",
+          minimum: 1,
+          maximum: 12,
+          description: "Maximum accessible frames included in one observation.",
+        },
       },
       additionalProperties: false,
     },
@@ -191,7 +203,7 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_ACT,
     title: "Execute page action stage",
     description:
-      "Preferred bounded action entrypoint. Executes up to 20 fill, select, click, key, or wait operations locally after authorization, accepts targetRef from browser_observe/browser_snapshot, batches independent form controls, and stops on failure or an explicit barrier.",
+      "Preferred bounded action entrypoint. Executes up to 20 fill, select, click/double-click, hover, drag, scroll, resize, key, or wait operations locally after authorization, accepts targetRef from browser_observe/browser_snapshot, batches independent form controls, and stops on failure or an explicit barrier.",
     parameters: {
       type: "object",
       properties: {
@@ -205,13 +217,33 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
               id: { type: "string" },
               type: {
                 type: "string",
-                enum: ["fill", "select", "click", "press_key", "wait"],
+                enum: [
+                  "fill",
+                  "select",
+                  "click",
+                  "hover",
+                  "drag",
+                  "scroll",
+                  "resize",
+                  "press_key",
+                  "wait",
+                ],
               },
               ref: {
                 type: "string",
                 pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
               },
               selector: { type: "string" },
+              sourceRef: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
+              sourceSelector: { type: "string" },
+              targetRef: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
+              targetSelector: { type: "string" },
               value: {
                 oneOf: [
                   { type: "string" },
@@ -220,9 +252,20 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
                 ],
               },
               values: { type: "array", items: { type: "string" } },
+              button: {
+                type: "string",
+                enum: ["left", "right", "middle"],
+              },
+              doubleClick: { type: "boolean" },
               key: { type: "string" },
               time: { type: "number" },
               timeoutMs: { type: "number" },
+              deltaX: { type: "number" },
+              deltaY: { type: "number" },
+              x: { type: "number" },
+              y: { type: "number" },
+              width: { type: "number", minimum: 320, maximum: 10000 },
+              height: { type: "number", minimum: 240, maximum: 10000 },
               dependsOn: { type: "array", items: { type: "string" } },
               expectedOutcome: { type: "string" },
               barrier: { type: "boolean" },

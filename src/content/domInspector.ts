@@ -63,10 +63,17 @@ let domMutationObserver: MutationObserver | null = null;
 const domMutationJournal: DomMutationJournalEntry[] = [];
 
 export function getPageSnapshot(input: PageSnapshotInput = {}): PageSnapshot {
+  const totalStartedAt = performance.now();
   ensureDomMutationObserver();
   const mode = input.mode ?? "interactive";
   const sourceLimit = normalizeSnapshotSourceLimit(input.sourceLimit);
-  const observation = buildBoundedPageObservation(mode, sourceLimit);
+  const scanStartedAt = performance.now();
+  const observation = buildBoundedPageObservation(
+    mode,
+    sourceLimit,
+    input.compact !== true,
+  );
+  const scanMs = performance.now() - scanStartedAt;
   const visibleText =
     mode === "full"
       ? sanitizeText(document.body?.innerText ?? "", SANITIZE_LIMITS.visibleText)
@@ -98,12 +105,17 @@ export function getPageSnapshot(input: PageSnapshotInput = {}): PageSnapshot {
       `${location.href}\n${document.title}`,
       observation.truncated,
     ),
+    timing: {
+      totalMs: roundTiming(performance.now() - totalStartedAt),
+      scanMs: roundTiming(scanMs),
+    },
   };
 }
 
 function buildBoundedPageObservation(
   mode: "interactive" | "outline" | "full",
   sourceLimit: number,
+  includeDomSummary: boolean,
 ): {
   nodes: DomSummaryNode[];
   candidates: SemanticSnapshotCandidate[];
@@ -139,15 +151,22 @@ function buildBoundedPageObservation(
       mode === "full" ||
       (Boolean(role) &&
         (mode === "outline" || INTERACTIVE_SEMANTIC_ROLES.has(role ?? "")));
-    if (!shouldRetain || !isElementVisible(element)) {
+    const visibleRect = shouldRetain ? getVisibleElementRect(element) : undefined;
+    if (!shouldRetain || !visibleRect) {
       continue;
     }
     retained += 1;
-    if (nodes.length < SANITIZE_LIMITS.domSummaryNodes) {
+    const canCollectCandidate =
+      Boolean(role) &&
+      SEMANTIC_ROLES.has(role ?? "") &&
+      candidates.length < MAX_SEMANTIC_CANDIDATES;
+    const selector =
+      includeDomSummary || canCollectCandidate ? getCssSelector(element) : "";
+    if (includeDomSummary && nodes.length < SANITIZE_LIMITS.domSummaryNodes) {
       const text = directText(element);
       nodes.push({
         tagName: element.tagName.toLowerCase(),
-        selector: getCssSelector(element),
+        selector,
         id: element.id ? sanitizeText(element.id, 100) : undefined,
         className:
           element instanceof HTMLElement
@@ -163,12 +182,10 @@ function buildBoundedPageObservation(
         childElementCount: element.childElementCount,
       });
     }
-    if (
-      role &&
-      SEMANTIC_ROLES.has(role) &&
-      candidates.length < MAX_SEMANTIC_CANDIDATES
-    ) {
-      candidates.push(toSemanticSnapshotCandidate(element, role));
+    if (role && canCollectCandidate) {
+      candidates.push(
+        toSemanticSnapshotCandidate(element, role, selector, visibleRect),
+      );
     }
   }
   return {
@@ -178,9 +195,13 @@ function buildBoundedPageObservation(
     retained,
     truncated:
       Boolean(current) ||
-      nodes.length >= SANITIZE_LIMITS.domSummaryNodes ||
+      (includeDomSummary && nodes.length >= SANITIZE_LIMITS.domSummaryNodes) ||
       candidates.length >= MAX_SEMANTIC_CANDIDATES,
   };
+}
+
+function roundTiming(value: number): number {
+  return Math.max(0, Math.round(value * 100) / 100);
 }
 
 function normalizeSnapshotSourceLimit(value: number | undefined): number {
@@ -689,8 +710,9 @@ const INTERACTIVE_SEMANTIC_ROLES = new Set([
 function toSemanticSnapshotCandidate(
   element: Element,
   role: string,
+  selector: string,
+  rect: DOMRect,
 ): SemanticSnapshotCandidate {
-  const rect = element.getBoundingClientRect();
   const interactive = INTERACTIVE_SEMANTIC_ROLES.has(role);
   const headingLevel = /^h([1-6])$/i.exec(element.tagName)?.[1];
   const disabled = interactive && isElementDisabled(element);
@@ -700,7 +722,7 @@ function toSemanticSnapshotCandidate(
   return {
     role: sanitizeText(role, 80),
     name: getAccessibleName(element),
-    selector: sanitizeText(getCssSelector(element), 400),
+    selector: sanitizeText(selector, 400),
     tagName: element.tagName.toLowerCase(),
     description: getAccessibleDescription(element),
     href:
@@ -907,17 +929,17 @@ function readPositiveInteger(value: string | null): number | undefined {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-function isElementVisible(element: Element): boolean {
+function getVisibleElementRect(element: Element): DOMRect | undefined {
   const rect = element.getBoundingClientRect();
   const style = window.getComputedStyle(element);
 
-  return (
-    rect.width > 0 &&
+  return rect.width > 0 &&
     rect.height > 0 &&
     style.visibility !== "hidden" &&
     style.display !== "none" &&
     Number(style.opacity || "1") > 0
-  );
+      ? rect
+      : undefined;
 }
 
 function directText(element: Element): string {

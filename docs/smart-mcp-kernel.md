@@ -10,11 +10,20 @@ The preferred task protocol is:
 
 1. `browser_status` — confirm the local daemon, Chrome Profile, target, and page
    sync state.
-2. `browser_observe` — take one fresh bounded semantic observation. This does not
-   capture a screenshot automatically.
+2. `browser_observe` — take one fresh compact semantic observation. A transient
+   target change is retried once internally. The smart result keeps semantic
+   state and `targetRef`, while expert-only selector, tag and bounds fields stay
+   on `browser_snapshot`. By default it also reads up to four registered,
+   accessible frames in parallel. Only the selected frame is actionable;
+   child-frame observations omit `targetRef` and require an explicit frame
+   selection plus fresh observation before any write. Use `frameScope=selected`
+   for pagination or a strictly single-frame read, and `all-accessible` with a
+   bounded `maxFrames` only when broader page understanding is necessary. This
+   does not capture a screenshot automatically.
 3. `browser_act` — execute one bounded current-page action stage. Independent
-   form controls are batched; ordered actions remain explicit dependencies or
-   barriers.
+   form controls are batched; click/double-click, hover, drag, scroll, viewport
+   resize, keys and waits share the same stage; ordered actions remain explicit
+   dependencies or barriers.
 4. `browser_verify` — evaluate URL, title, visible text, and semantic target
    expectations from one fresh page read.
 5. `browser_debug_activity` — when approved, read a compact Network digest and
@@ -52,6 +61,16 @@ it, the daemon:
    execution-grant path.
 
 References never grant permission and never authorize a different page.
+
+## Observation latency
+
+The smart observation path sets `compact=true` at the extension boundary. The
+content script computes the viewport and stable selector once per semantic
+node, omits the legacy DOM-summary projection, and returns content-side scan
+timing. Page-context synchronization and read-only audit persistence run after
+the MCP result has been delivered, so neither blocks the caller. Frame reads
+share one global node/source budget and run concurrently without changing the
+selected frame.
 
 ## Tool profiles
 

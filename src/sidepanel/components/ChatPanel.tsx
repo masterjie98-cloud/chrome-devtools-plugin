@@ -423,7 +423,10 @@ export function ChatPanel({
           onClick={() => toggleToolMessage(message.id)}
           aria-expanded={expanded}
         >
-          {expanded ? <DownOutlined /> : <RightOutlined />}
+          <RightOutlined
+            className={`disclosure-chevron${expanded ? " is-expanded" : ""}`}
+            aria-hidden="true"
+          />
           <span>{expanded ? "收起工具结果" : getToolMessageSummary(message)}</span>
         </button>
         {expanded ? (
@@ -1274,7 +1277,12 @@ function ToolApprovalCard({
             <Button
               type="text"
               size="small"
-              icon={argumentsExpanded ? <DownOutlined /> : <RightOutlined />}
+              icon={
+                <RightOutlined
+                  className={`disclosure-chevron${argumentsExpanded ? " is-expanded" : ""}`}
+                  aria-hidden="true"
+                />
+              }
               onClick={() => setArgumentsExpanded((current) => !current)}
               aria-expanded={argumentsExpanded}
               aria-controls={`tool-approval-args-${approval.id}`}
@@ -1323,6 +1331,7 @@ function ExecutionApprovalModeBar({
   origin?: string;
   onChange: (mode: ExecutionApprovalMode) => void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
   const options: Array<{
     key: ExecutionApprovalMode;
     title: string;
@@ -1352,6 +1361,8 @@ function ExecutionApprovalModeBar({
 
   return (
     <Dropdown
+      open={menuOpen}
+      onOpenChange={setMenuOpen}
       trigger={["click"]}
       placement="topRight"
       menu={{
@@ -1367,7 +1378,10 @@ function ExecutionApprovalModeBar({
             </span>
           ),
         })),
-        onClick: ({ key }) => onChange(key as ExecutionApprovalMode),
+        onClick: ({ key }) => {
+          onChange(key as ExecutionApprovalMode);
+          setMenuOpen(false);
+        },
       }}
     >
       <button
@@ -1375,6 +1389,7 @@ function ExecutionApprovalModeBar({
         className={`execution-approval-mode is-${mode}`}
         aria-label={`切换执行审批模式，当前为${active.title}`}
         aria-haspopup="menu"
+        aria-expanded={menuOpen}
       >
         <span className="execution-approval-mode-copy" aria-live="polite">
           {active.icon}
@@ -1387,7 +1402,10 @@ function ExecutionApprovalModeBar({
             </span>
           </span>
         </span>
-        <span className="execution-approval-mode-chevron" aria-hidden="true">
+        <span
+          className={`execution-approval-mode-chevron${menuOpen ? " is-expanded" : ""}`}
+          aria-hidden="true"
+        >
           <DownOutlined />
         </span>
       </button>

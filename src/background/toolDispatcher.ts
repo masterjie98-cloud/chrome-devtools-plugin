@@ -7,10 +7,12 @@ import {
   goForwardActiveTab,
   getSelectedContentFrame,
   getSelectedContentFrameSnapshot,
+  getContentFrameSnapshot,
   injectContentScript,
   isTabUrlScriptable,
   listTargetTabs,
   listTargetFrames,
+  listRegisteredContentFrames,
   listCookies,
   navigateActiveTab,
   queryActiveTab,
@@ -98,6 +100,10 @@ import type {
   BrowserPressKeyInput,
   BrowserSelectOptionInput,
   BrowserTypeInput,
+  BrowserTargetFrame,
+  FramePageSnapshot,
+  MultiFramePageSnapshot,
+  PageSnapshotInput,
   PageSnapshotTarget,
   ScreenshotCaptureInput,
 } from "../shared/dom";
@@ -147,6 +153,15 @@ export async function executeToolCall(
 
   switch (normalizedCall.toolName) {
     case TOOL_NAMES.DOM_GET_PAGE_INFO: {
+      if (
+        normalizedCall.args.frameScope === "auto" ||
+        normalizedCall.args.frameScope === "all-accessible"
+      ) {
+        return {
+          toolName: normalizedCall.toolName,
+          data: await readMultiFramePageSnapshot(normalizedCall.args),
+        };
+      }
       const pageRead = await forwardContentRequestWithTarget(
         MESSAGE_TYPES.CONTENT_GET_PAGE_INFO,
         normalizedCall.args,
@@ -588,6 +603,164 @@ export async function executeToolCall(
     default:
       throw new Error("Tool is not supported.");
   }
+}
+
+async function readMultiFramePageSnapshot(
+  input: PageSnapshotInput,
+): Promise<MultiFramePageSnapshot> {
+  const tab = await queryActiveTab();
+  if (!tab?.id) {
+    throw new Error("No active tab is available.");
+  }
+  if (!isTabUrlScriptable(tab.url)) {
+    throw new Error("The active tab does not allow extension content scripts.");
+  }
+  const targetTab = { ...tab, id: tab.id };
+
+  const frameScope =
+    input.frameScope === "all-accessible" ? "all-accessible" : "auto";
+  const registeredFrames = listRegisteredContentFrames(tab.id);
+  if (registeredFrames.length === 0) {
+    throw new Error(
+      "FRAME_UNAVAILABLE: no accessible content frame has registered for the selected tab.",
+    );
+  }
+
+  const requestedLimit = input.limit ?? 50;
+  const requestedSourceLimit = input.sourceLimit ?? 2_000;
+  const defaultMaxFrames = frameScope === "auto" ? 4 : 8;
+  const frameCount = Math.min(
+    registeredFrames.length,
+    input.maxFrames ?? defaultMaxFrames,
+    requestedLimit,
+    Math.max(1, Math.floor(requestedSourceLimit / 100)),
+  );
+  const frames = registeredFrames.slice(0, frameCount);
+  const outputLimits = allocateFrameBudget(requestedLimit, frames.length, 1);
+  const sourceLimits = allocateFrameBudget(
+    requestedSourceLimit,
+    frames.length,
+    100,
+  );
+  const selectedFrameId = getSelectedContentFrame(tab.id).frameId;
+
+  const settled = await Promise.allSettled(
+    frames.map((frame, index) =>
+      readPageSnapshotForFrame(targetTab, frame, {
+        ...input,
+        cursor: undefined,
+        frameScope: "selected",
+        maxFrames: undefined,
+        limit: outputLimits[index],
+        sourceLimit: sourceLimits[index],
+        sinceRevision:
+          frame.frameId === selectedFrameId ? input.sinceRevision : undefined,
+      }),
+    ),
+  );
+
+  const available: FramePageSnapshot[] = [];
+  const unavailable: MultiFramePageSnapshot["unavailableFrames"] = [];
+  for (let index = 0; index < settled.length; index += 1) {
+    const result = settled[index]!;
+    const frame = frames[index]!;
+    if (result.status === "fulfilled") {
+      available.push(result.value);
+      continue;
+    }
+    const message =
+      result.reason instanceof Error
+        ? result.reason.message
+        : "Frame snapshot failed.";
+    unavailable.push({
+      frame,
+      errorCode: message.startsWith("STALE_FRAME:")
+        ? "STALE_FRAME"
+        : "FRAME_UNAVAILABLE",
+      error: message,
+    });
+  }
+
+  const omittedFrameCount = registeredFrames.length - frames.length;
+  return {
+    version: "multi-frame-page-snapshot-v1",
+    tabId: tab.id,
+    selectedFrameId,
+    frameScope,
+    capturedAt: new Date().toISOString(),
+    complete: unavailable.length === 0 && omittedFrameCount === 0,
+    omittedFrameCount,
+    frames: available,
+    unavailableFrames: unavailable,
+  };
+}
+
+async function readPageSnapshotForFrame(
+  tab: chrome.tabs.Tab & { id: number },
+  frame: BrowserTargetFrame,
+  input: PageSnapshotInput,
+): Promise<FramePageSnapshot> {
+  const navigationBefore = getTargetNavigationState(tab.id, false);
+  const request = {
+    id: createMessageId(),
+    source: "background",
+    type: MESSAGE_TYPES.CONTENT_GET_PAGE_INFO,
+    payload: input,
+  } as RequestOf<typeof MESSAGE_TYPES.CONTENT_GET_PAGE_INFO>;
+  const address = { frameId: frame.frameId, documentId: frame.documentId };
+  let response = await sendTabRequest(tab.id, request, address);
+  if (!response.ok && response.error.code === "TAB_MESSAGE_ERROR") {
+    await injectContentScript(tab.id, address);
+    response = await sendTabRequest(tab.id, request, address);
+  }
+  if (!response.ok) {
+    throw new Error(`FRAME_UNAVAILABLE: ${response.error.message}`);
+  }
+
+  const currentFrame = getContentFrameSnapshot(tab.id, address);
+  const navigationAfter = getTargetNavigationState(tab.id, false);
+  if (
+    !currentFrame ||
+    currentFrame.documentId !== frame.documentId ||
+    navigationAfter.navigationId !== navigationBefore.navigationId ||
+    navigationAfter.revision !== navigationBefore.revision
+  ) {
+    throw new Error(
+      "STALE_FRAME: the frame document or top-level navigation changed during capture.",
+    );
+  }
+
+  const target: PageSnapshotTarget = {
+    url: currentFrame.url,
+    title: currentFrame.title,
+    targetId: String(tab.id),
+    tabId: tab.id,
+    windowId: tab.windowId,
+    frameId: currentFrame.frameId,
+    documentId: currentFrame.documentId,
+    navigationId: navigationAfter.navigationId,
+    revision: navigationAfter.revision,
+  };
+  return {
+    frame: currentFrame,
+    pageSnapshot: attachPageSnapshotProvenance(response.payload, target),
+  };
+}
+
+function allocateFrameBudget(
+  total: number,
+  count: number,
+  minimum: number,
+): number[] {
+  if (count <= 0) return [];
+  const normalizedTotal = Math.max(total, count * minimum);
+  const base = Math.floor(normalizedTotal / count);
+  let remainder = normalizedTotal - base * count;
+  return Array.from({ length: count }, () => {
+    const value = base + (remainder > 0 ? 1 : 0);
+    remainder = Math.max(0, remainder - 1);
+    return Math.max(minimum, value);
+  });
 }
 
 async function clickElementWithTrustedInput(

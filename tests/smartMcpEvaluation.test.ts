@@ -64,16 +64,135 @@ test("[eval 03] browser_status reports connection state without page payloads", 
 });
 
 test("[eval 04] browser_observe returns live actionable target refs", async () => {
+  const calls: AnyToolCall[] = [];
   const result = await executeMcpToolData(
     MCP_TOOL_NAMES.BROWSER_OBSERVE,
     { mode: "interactive", limit: 10 },
-    createBridge(),
+    createBridge(calls),
     { sessionId: "eval-observe" },
   );
   assert.equal(read(result, "version"), "browser-semantic-snapshot-v1");
-  const snapshot = (result as { snapshot: { nodes: Array<{ targetRef: string }> } })
-    .snapshot;
+  const snapshot = (
+    result as {
+      snapshot: {
+        nodes: Array<{
+          bounds?: unknown;
+          ref?: string;
+          selector?: string;
+          tagName?: string;
+          targetRef: string;
+        }>;
+      };
+    }
+  ).snapshot;
   assert.match(snapshot.nodes[0]?.targetRef ?? "", /^sr1_[a-f0-9]{8}_s1$/);
+  assert.equal(snapshot.nodes[0]?.selector, undefined);
+  assert.equal(snapshot.nodes[0]?.tagName, undefined);
+  assert.equal(snapshot.nodes[0]?.bounds, undefined);
+  assert.equal(snapshot.nodes[0]?.ref, undefined);
+  assert.deepEqual(calls[0]?.args, {
+    limit: 10,
+    mode: "interactive",
+    compact: true,
+    frameScope: "auto",
+  });
+});
+
+test("[eval 04c] browser_observe returns bounded child-frame observations without actionable refs", async () => {
+  const childTarget = {
+    ...target,
+    url: "https://child.fixture.test/frame",
+    title: "Child fixture",
+    frameId: 7,
+    documentId: "child-document",
+  };
+  const bridge = {
+    connectedPluginClients: () => 1,
+    callBrowserTool: async () => ({
+      version: "multi-frame-page-snapshot-v1",
+      tabId: target.tabId,
+      selectedFrameId: target.frameId,
+      frameScope: "auto",
+      capturedAt: "2026-07-17T00:00:00.020Z",
+      complete: true,
+      omittedFrameCount: 0,
+      frames: [
+        {
+          frame: frameMetadata(target, true),
+          pageSnapshot: pageSnapshot(),
+        },
+        {
+          frame: frameMetadata(childTarget, false),
+          pageSnapshot: pageSnapshot(childTarget),
+        },
+      ],
+      unavailableFrames: [],
+    }),
+  } as unknown as PluginWebSocketServer;
+
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_OBSERVE,
+    { mode: "interactive", limit: 10, frameScope: "auto" },
+    bridge,
+    { sessionId: "eval-observe-frames" },
+  );
+  const frames = (result as {
+    frames: Array<{
+      actionable: boolean;
+      target: { frameId: number };
+      snapshot: { nodes: Array<{ targetRef?: string }> };
+    }>;
+  }).frames;
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0]?.target.frameId, 7);
+  assert.equal(frames[0]?.actionable, false);
+  assert.equal(frames[0]?.snapshot.nodes[0]?.targetRef, undefined);
+  assert.equal(read(result, "complete"), true);
+});
+
+test("[eval 04b] browser_observe retries one transient target change internally", async () => {
+  const sessionId = "eval-observe-retry";
+  const nextTarget = {
+    ...target,
+    url: "https://fixture.test/form?step=2",
+    navigationId: "fixture-navigation-2",
+    revision: 5,
+  };
+  let reads = 0;
+  browserStateHub.setCurrentTab(target, sessionId);
+  const bridge = {
+    connectedPluginClients: () => 1,
+    callBrowserTool: async (call: AnyToolCall) => {
+      assert.equal(call.toolName, TOOL_NAMES.DOM_GET_PAGE_INFO);
+      reads += 1;
+      if (reads === 1) {
+        browserStateHub.setCurrentTab(nextTarget, sessionId);
+      }
+      const snapshot = pageSnapshot();
+      return {
+        ...snapshot,
+        url: nextTarget.url,
+        provenance: {
+          ...snapshot.provenance,
+          target: nextTarget,
+        },
+      };
+    },
+  } as unknown as PluginWebSocketServer;
+
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_OBSERVE,
+    { mode: "interactive", limit: 10 },
+    bridge,
+    { sessionId },
+  );
+
+  assert.equal(reads, 2);
+  assert.equal(read(result, "version"), "browser-semantic-snapshot-v1");
+  assert.equal(
+    (result as { page: { url: string } }).page.url,
+    nextTarget.url,
+  );
 });
 
 test("[eval 05] browser_act resolves an observed targetRef before execution", async () => {
@@ -111,6 +230,49 @@ test("[eval 05] browser_act resolves an observed targetRef before execution", as
     (click?.args as { selector?: string } | undefined)?.selector,
     "#save",
   );
+});
+
+test("[eval 05b] browser_act resolves both drag target refs before execution", async () => {
+  const sessionId = "eval-act-drag-refs";
+  const calls: AnyToolCall[] = [];
+  browserStateHub.setCurrentTab(target, sessionId);
+  const observed = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_OBSERVE,
+    { mode: "interactive", limit: 10 },
+    createBridge(calls),
+    { sessionId },
+  );
+  const nodes = (
+    observed as {
+      snapshot: { nodes: Array<{ name: string; targetRef: string }> };
+    }
+  ).snapshot.nodes;
+  const sourceRef = nodes.find((node) => node.name === "Name")?.targetRef;
+  const targetRef = nodes.find((node) => node.name === "Save")?.targetRef;
+  assert.ok(sourceRef);
+  assert.ok(targetRef);
+
+  await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_ACT,
+    {
+      actions: [
+        {
+          id: "drag",
+          type: "drag",
+          sourceRef,
+          targetRef,
+        },
+      ],
+    },
+    createBridge(calls),
+    { sessionId },
+  );
+
+  const drag = calls.find((call) => call.toolName === TOOL_NAMES.BROWSER_DRAG);
+  assert.deepEqual(drag?.args, {
+    sourceSelector: "#name",
+    targetSelector: "#save",
+  });
 });
 
 test("[eval 06] browser_verify evaluates multiple outcomes from one live read", async () => {
@@ -181,6 +343,13 @@ test("[eval 08] actionable refs and verify inputs fail closed on malformed value
   assert.equal(
     MCP_TOOL_INPUT_SCHEMAS[MCP_TOOL_NAMES.BROWSER_VERIFY].safeParse({
       checks: [{ id: "missing", type: "target_present" }],
+    }).success,
+    false,
+  );
+  assert.equal(
+    MCP_TOOL_INPUT_SCHEMAS[MCP_TOOL_NAMES.BROWSER_OBSERVE].safeParse({
+      cursor: "ss1_deadbeef_1",
+      frameScope: "auto",
     }).success,
     false,
   );
@@ -264,6 +433,14 @@ function createBridge(
           y: 80,
         };
       }
+      if (call.toolName === TOOL_NAMES.BROWSER_DRAG) {
+        return {
+          sourceSelector: "#name",
+          targetSelector: "#save",
+          matched: true,
+          action: "drag",
+        };
+      }
       if (call.toolName === TOOL_NAMES.DEBUGGER_NETWORK_LIST) {
         return {
           attached: true,
@@ -306,11 +483,11 @@ function createBridge(
   } as unknown as PluginWebSocketServer;
 }
 
-function pageSnapshot() {
+function pageSnapshot(snapshotTarget = target) {
   return {
-    url: target.url,
-    title: target.title,
-    origin: "https://fixture.test",
+    url: snapshotTarget.url,
+    title: snapshotTarget.title,
+    origin: new URL(snapshotTarget.url).origin,
     capturedAt: "2026-07-17T00:00:00.000Z",
     visibleText: "Name Save",
     domSummary: [],
@@ -338,14 +515,30 @@ function pageSnapshot() {
         },
       ],
       { limit: 100 },
-      `${target.url}\n${target.title}`,
+      `${snapshotTarget.url}\n${snapshotTarget.title}`,
       false,
     ),
     provenance: {
       source: "chrome-content-script" as const,
       observedAt: "2026-07-17T00:00:00.010Z",
-      target,
+      target: snapshotTarget,
     },
+  };
+}
+
+function frameMetadata(
+  snapshotTarget: typeof target,
+  selected: boolean,
+) {
+  return {
+    tabId: snapshotTarget.tabId,
+    frameId: snapshotTarget.frameId,
+    documentId: snapshotTarget.documentId,
+    url: snapshotTarget.url,
+    title: snapshotTarget.title,
+    isTop: snapshotTarget.frameId === 0,
+    selected,
+    lastSeenAt: "2026-07-17T00:00:00.000Z",
   };
 }
 

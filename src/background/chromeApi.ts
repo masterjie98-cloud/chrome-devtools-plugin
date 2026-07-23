@@ -267,14 +267,43 @@ export function getSelectedContentFrameSnapshot(
   tabId: number,
 ): BrowserTargetFrame | undefined {
   const selected = getSelectedContentFrame(tabId);
-  const frame = contentFramesByTab.get(tabId)?.get(selected.frameId);
+  return getContentFrameSnapshot(tabId, selected);
+}
+
+export function getContentFrameSnapshot(
+  tabId: number,
+  address: ContentFrameAddress,
+): BrowserTargetFrame | undefined {
+  const frame = contentFramesByTab.get(tabId)?.get(address.frameId);
   if (!frame) {
     return undefined;
   }
-  if (selected.documentId && frame.documentId !== selected.documentId) {
+  if (address.documentId && frame.documentId !== address.documentId) {
     return undefined;
   }
-  return { ...frame, selected: true };
+  const selected = getSelectedContentFrame(tabId);
+  return {
+    ...frame,
+    selected:
+      selected.frameId === frame.frameId &&
+      (!selected.documentId || selected.documentId === frame.documentId),
+  };
+}
+
+export function listRegisteredContentFrames(tabId: number): BrowserTargetFrame[] {
+  const selected = getSelectedContentFrame(tabId);
+  return [...(contentFramesByTab.get(tabId)?.values() ?? [])]
+    .map((frame) => ({
+      ...frame,
+      selected:
+        frame.frameId === selected.frameId &&
+        (!selected.documentId || frame.documentId === selected.documentId),
+    }))
+    .sort((left, right) => {
+      if (left.selected !== right.selected) return left.selected ? -1 : 1;
+      if (left.isTop !== right.isTop) return left.isTop ? -1 : 1;
+      return left.frameId - right.frameId;
+    });
 }
 
 export async function listTargetFrames(): Promise<BrowserTargetFrameListResult> {
@@ -283,14 +312,9 @@ export async function listTargetFrames(): Promise<BrowserTargetFrameListResult> 
     throw new Error("No active tab is available.");
   }
   const selected = getSelectedContentFrame(tab.id);
-  const frames = [...(contentFramesByTab.get(tab.id)?.values() ?? [])]
-    .map((frame) => ({
-      ...frame,
-      selected:
-        frame.frameId === selected.frameId &&
-        (!selected.documentId || frame.documentId === selected.documentId),
-    }))
-    .sort((a, b) => a.frameId - b.frameId);
+  const frames = listRegisteredContentFrames(tab.id).sort(
+    (a, b) => a.frameId - b.frameId,
+  );
   return {
     tabId: tab.id,
     selectedFrameId: selected.frameId,

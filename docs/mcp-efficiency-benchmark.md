@@ -183,3 +183,49 @@ status、resource type 或聚合录制接口，因此 Network 项无法做同能
 - 人工审批速度取决于用户是否正在看审批卡。本轮结果真实体现当前产品交互，但
   不代表浏览器执行引擎本身需要几十秒。
 - 本轮没有测试截图理解、复杂 SPA、长任务恢复、断线续接和跨任务协作的收益。
+
+## 2026-07-21 同页复测与改进
+
+在 `http://localhost:5667/overview` 上重新比较了 Codex Chrome 的
+`domSnapshot()` 与 AI DevTools 的智能观察入口。以下仍是本机单次小样本，不是
+跨环境性能结论。
+
+| 路径 | 热态样本 | 中位数 | 结果字符数 | 覆盖 |
+| --- | --- | ---: | ---: | --- |
+| Codex Chrome DOM snapshot | 31/23/25/18/19 ms | 23 ms | 3,034 | 交互控件与页面大纲 |
+| AI DevTools `browser_observe(interactive)` | 92/42/47/36 ms（排除一次 508 ms 重连样本） | 44.5 ms | 1,603 | 交互控件、状态、`targetRef`、目标新鲜度 |
+| AI DevTools `browser_observe(outline)` | 37/38/38/43/53/57/59/65/80/119 ms | 53 ms | 3,459 | 交互控件、页面大纲、`targetRef`、目标新鲜度 |
+
+本轮落地了三项针对实测差距的改进：
+
+- 智能观察不再重复返回 selector、tag、bounds 和页内短 `ref`；这些字段仍由专家
+  `browser_snapshot` 提供。`interactive` 结果在本页降到 1,603 字符。
+- `browser_observe` 遇到一次目标切换竞态时在内部安全重读一次；连续变化仍返回
+  `STALE_CONTEXT`，不会把旧页面结果伪装成新页面结果。
+- 默认 `browser_act` 复用现有受控执行器，新增双击、hover、拖拽、滚轮和窗口尺寸
+  操作；模型不需要为了这些能力切换到 74-tool 专家表面或退回脆弱坐标调用。
+
+以上数据暴露了两项差距：Codex Chrome 的 DOM snapshot 可在一次结果中展开可访问
+iframe，而当时 AI DevTools 仍需 `browser_list_frames`、
+`browser_set_target_frame` 后读取；Codex Chrome 热态 DOM 读取在本页也更快。
+
+随后实现的修复如下，数字必须在新 daemon 和新扩展同时加载后重新测量，不能沿用
+上表旧值：
+
+- `browser_observe` 默认 `frameScope=auto`，一次并行读取最多 4 个已注册可访问
+  frame；`all-accessible` 默认 8、硬上限 12。节点数和 source 字符预算在 frame
+  之间分配，失败 frame 作为部分结果明确返回。
+- 只有当前选中 frame 返回可执行 `targetRef`；子 frame 标记
+  `actionable=false` 并移除引用。要写入子 frame，仍须显式选择并重新观察，不能
+  用一次读取绕过 document/navigation 绑定。
+- content 侧 `compact` 路径不再构造旧 DOM summary，同一节点只计算一次可见矩形
+  和 selector；页面状态同步和只读审计持久化移出 MCP 响应关键路径。
+- 自动化验证覆盖默认参数、跨 frame 输出、子 frame 不可执行、游标与多 frame
+  冲突拒绝，以及 frame 排序不会改变当前选择。真实热态中位数和 P95 待下方
+  运行条件满足后写回本报告。
+
+待执行的真实复测命令与条件：加载最新 `dist`、重启 LaunchAgent，同时启动
+`tests/fixtures/frame-host` 的 8765 服务和 `frame-child` 的 8766 服务；随后对
+`browser_observe(interactive)` 连续采集至少 10 个热态样本，并确认同一次结果
+出现顶层和 child frame。当前受控执行环境禁止监听本机端口，因此本段不伪造
+运行结果。

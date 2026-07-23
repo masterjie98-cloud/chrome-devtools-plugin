@@ -8,6 +8,12 @@ export interface PageSnapshotInput extends SemanticSnapshotInput {
   mode?: "interactive" | "outline" | "full";
   sourceLimit?: number;
   sinceRevision?: number;
+  /** Skip legacy DOM summary materialization when only semantic nodes are needed. */
+  compact?: boolean;
+  /** Read only the selected frame, or fan out across accessible frames in the tab. */
+  frameScope?: "selected" | "auto" | "all-accessible";
+  /** Bounded number of frames included by a multi-frame observation. */
+  maxFrames?: number;
 }
 
 export interface DomMutationDelta {
@@ -153,6 +159,33 @@ export interface PageSnapshot {
   delta?: DomMutationDelta;
   semanticSnapshot?: SemanticSnapshotCollection;
   provenance?: PageSnapshotProvenance;
+  timing?: {
+    totalMs: number;
+    scanMs: number;
+  };
+}
+
+export interface FramePageSnapshot {
+  frame: BrowserTargetFrame;
+  pageSnapshot: PageSnapshot;
+}
+
+export interface UnavailableFrameSnapshot {
+  frame: BrowserTargetFrame;
+  errorCode: "FRAME_UNAVAILABLE" | "STALE_FRAME";
+  error: string;
+}
+
+export interface MultiFramePageSnapshot {
+  version: "multi-frame-page-snapshot-v1";
+  tabId: number;
+  selectedFrameId: number;
+  frameScope: "auto" | "all-accessible";
+  capturedAt: string;
+  complete: boolean;
+  omittedFrameCount: number;
+  frames: FramePageSnapshot[];
+  unavailableFrames: UnavailableFrameSnapshot[];
 }
 
 export interface DomElementInfo {

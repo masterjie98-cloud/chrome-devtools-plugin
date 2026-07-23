@@ -691,6 +691,12 @@ export function sanitizePageSnapshotForMcp(
     sourceLimit: pageSnapshot.sourceLimit,
     domRevision: pageSnapshot.domRevision,
     delta: pageSnapshot.delta,
+    timing: pageSnapshot.timing
+      ? {
+          totalMs: safeNonNegativeNumber(pageSnapshot.timing.totalMs),
+          scanMs: safeNonNegativeNumber(pageSnapshot.timing.scanMs),
+        }
+      : undefined,
     semanticSnapshot: pageSnapshot.semanticSnapshot
       ? sanitizeSemanticSnapshot(pageSnapshot.semanticSnapshot)
       : undefined,
@@ -702,6 +708,10 @@ export function sanitizePageSnapshotForMcp(
         }
       : undefined,
   };
+}
+
+function safeNonNegativeNumber(value: number): number {
+  return Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 function sanitizePageSnapshotTarget(

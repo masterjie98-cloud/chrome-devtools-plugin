@@ -4,7 +4,11 @@ import {
   queryActiveTab,
 } from "./chromeApi";
 import { getTargetNavigationState } from "./targetNavigation";
-import type { PageSnapshot, ScreenshotCaptureResult } from "../shared/dom";
+import type {
+  MultiFramePageSnapshot,
+  PageSnapshot,
+  ScreenshotCaptureResult,
+} from "../shared/dom";
 import { createMessageId } from "../shared/messaging";
 import { getInstallationId } from "../shared/extensionIdentity";
 import {
@@ -262,11 +266,14 @@ class BackgroundStateHubBridge {
         }),
         controller.signal,
       );
-      await this.syncToolResult(message.payload.call, result.data);
       this.sendBrowserToolResult(message.requestId, {
         ok: true,
         toolName: result.toolName,
         data: normalizeBrowserToolResultData(result.data),
+      });
+      void this.syncToolResult(message.payload.call, result.data).catch(() => {
+        // State synchronization is best-effort and must not delay or replace a
+        // successfully completed browser result.
       });
     } catch (error) {
       const cancelled = controller.signal.aborted;
@@ -290,10 +297,20 @@ class BackgroundStateHubBridge {
         this.sendActiveTab(activeTarget);
       }
     }
-    if (call.toolName === TOOL_NAMES.DOM_GET_PAGE_INFO && isPageSnapshot(data)) {
+    const pageSnapshot = isPageSnapshot(data)
+      ? data
+      : isMultiFramePageSnapshot(data)
+        ? data.frames.find(
+            (entry) => entry.frame.frameId === data.selectedFrameId,
+          )?.pageSnapshot ?? data.frames[0]?.pageSnapshot
+        : undefined;
+    if (call.toolName === TOOL_NAMES.DOM_GET_PAGE_INFO && pageSnapshot) {
       this.sendPageContext(
-        data.provenance?.target ?? { url: data.url, title: data.title },
-        data,
+        pageSnapshot.provenance?.target ?? {
+          url: pageSnapshot.url,
+          title: pageSnapshot.title,
+        },
+        pageSnapshot,
       );
       return;
     }
@@ -570,6 +587,19 @@ function isPageSnapshot(value: unknown): value is PageSnapshot {
     "title" in value &&
     typeof (value as PageSnapshot).title === "string" &&
     Array.isArray((value as PageSnapshot).domSummary)
+  );
+}
+
+function isMultiFramePageSnapshot(
+  value: unknown,
+): value is MultiFramePageSnapshot {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "version" in value &&
+    value.version === "multi-frame-page-snapshot-v1" &&
+    "frames" in value &&
+    Array.isArray(value.frames)
   );
 }
 
