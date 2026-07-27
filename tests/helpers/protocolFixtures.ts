@@ -4,6 +4,10 @@ import {
   type WsClientRole,
 } from "../../src/shared/wsProtocol";
 import { wsClientNameForRole } from "../../src/shared/wsClientIdentity";
+import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+} from "../../src/shared/runtimeIdentity";
 
 export const TEST_BRIDGE_TOKEN =
   "test-only-bridge-token-000000000000000000000000";
@@ -41,6 +45,8 @@ export function clientHelloMessage(
     WS_COMMANDS.CLIENT_HELLO,
     {
       protocolVersion: WS_PROTOCOL_VERSION,
+      buildId: RUNTIME_BUILD_ID,
+      schemaHash: RUNTIME_SCHEMA_HASH,
       clientRole,
       clientName: options.clientName ?? wsClientNameForRole(clientRole),
       ...(clientRole === "mcp" ? {} : { installationId: sessionId }),

@@ -156,6 +156,63 @@ sessionId、browserConnected、uiConnected 和当前页面标题。
   操作自动继续）、`完全访问权限`（仅当前聊天与当前域名内自动继续全部插件能力）。
   MCP 接入服从当前档位，并且每次执行仍使用独立的一次性授权。
 
+### 6.1 推荐的一次调用工作流
+
+新任务优先使用 `browser_workflow`，把观察、最多 20 个有界动作、确定性验证以及
+DOM/URL/Network/Console 证据放进一次模型工具调用。普通表单动作仍服从当前任务
+授权；提交、发送、删除、敏感字段或模型显式声明的 `decisionBarrier` 仍单独确认。
+
+```json
+{
+  "observation": {
+    "mode": "interactive",
+    "frameScope": "auto",
+    "fields": ["role", "name", "value", "selectedValues", "checked"]
+  },
+  "actions": [
+    {
+      "id": "name",
+      "type": "fill",
+      "selector": "#name",
+      "value": "Ada"
+    }
+  ],
+  "checks": [
+    {
+      "id": "name-value",
+      "type": "target_state",
+      "selector": "#name",
+      "value": "Ada"
+    }
+  ],
+  "evidence": {
+    "dom": true,
+    "url": true,
+    "network": true,
+    "console": true
+  }
+}
+```
+
+观察跨域 iframe 时，`browser_observe` 会为可访问子 frame 返回
+`frameRef + documentId + targetRef`。后续动作直接传回这三个值即可路由到该
+document，不必先 `browser_set_target_frame`；任一引用过期都会在写入前失败。
+
+元素截图同样可使用上述引用，并支持：
+
+```json
+{
+  "ref": "sr1_...",
+  "frameRef": "fr1_...",
+  "documentId": "...",
+  "diffAgainst": "previous",
+  "returnImage": "changed"
+}
+```
+
+第二张未变化时只返回 diff 指标，不再传重复图片字节。所有截图仍是显式
+approval-gated 读取，不会因发送聊天消息而自动附加。
+
 ## 7. Codex 与插件 AI 如何协作
 
 先区分两条链路：
@@ -358,10 +415,20 @@ codex mcp add \
 ```bash
 npm install
 npm run build
+npm run daemon:install-service
 ```
 
-随后重启 daemon、重新加载 Chrome 扩展，并新建 Codex 任务。若只更新了代码、
-项目和 Node.js 的绝对路径都没变，不需要重复 `codex mcp add`。
+随后重新加载 Chrome 扩展，并新建 Codex 任务。新协议通过 `buildId` 和
+`schemaHash` 同时校验 adapter、daemon 与扩展；任一端仍是旧构建时会拒绝连接并
+提示应重启的组件，而不是等到业务工具调用时报未知参数。若只更新了代码、项目和
+Node.js 的绝对路径都没变，不需要重复 `codex mcp add`。
+
+对本机 8765/8766 fixture 做完整工作流回归：
+
+```bash
+npm run verify:workflow-evidence -- \
+  --tab-url-prefix http://127.0.0.1:8765/
+```
 
 ### 常见问题
 
@@ -375,6 +442,8 @@ npm run build
   仍监听 `127.0.0.1:17321`，再新建 Codex 任务。
 - **`PROTOCOL_VERSION_UNSUPPORTED`：**代码、`dist/`、正在运行的 daemon、Chrome
   扩展和 Codex adapter 不是同一次构建；重新执行 `npm run build` 并全部重启。
+- **`BUILD_ID_MISMATCH` / `SCHEMA_HASH_MISMATCH`：**至少一端仍是旧构建；按报错
+  指引重启 Codex 任务、daemon 或重新加载扩展。
 - **`STALE_CONTEXT`：**页面在读取或审批后发生了导航或 DOM 修订；重新读取页面，
   不要重放旧审批对应的写操作。
 - **Debugger 冲突：**另一个扩展或 DevTools/CDP 客户端占用了 Chrome debugger；

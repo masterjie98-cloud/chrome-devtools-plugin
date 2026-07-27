@@ -966,6 +966,10 @@ export function validateToolCall(call: unknown): string | null {
 }
 
 function validatePageSnapshotInput(args: Record<string, unknown>): string | null {
+  const frameAddressError = validateDirectFrameAddress(args);
+  if (frameAddressError) {
+    return frameAddressError;
+  }
   if (
     args.cursor !== undefined &&
     (typeof args.cursor !== "string" || args.cursor.length < 1 || args.cursor.length > 100)
@@ -1042,7 +1046,9 @@ function validatePageSnapshotInput(args: Record<string, unknown>): string | null
       key !== "sinceRevision" &&
       key !== "compact" &&
       key !== "frameScope" &&
-      key !== "maxFrames",
+      key !== "maxFrames" &&
+      key !== "frameId" &&
+      key !== "documentId",
   );
   return unknownKeys.length > 0
     ? `Snapshot arguments contain unsupported keys: ${unknownKeys.join(", ")}.`
@@ -1133,6 +1139,10 @@ function validateDebuggerProxyRule(
 }
 
 function validateScreenshotCapture(args: Record<string, unknown>): string | null {
+  const frameAddressError = validateDirectFrameAddress(args);
+  if (frameAddressError) {
+    return frameAddressError;
+  }
   if (
     args.type !== undefined &&
     args.type !== "png" &&
@@ -1176,12 +1186,38 @@ function validateScreenshotCapture(args: Record<string, unknown>): string | null
   ) {
     return "saveToDownloads must be a boolean.";
   }
+  if (
+    args.diffAgainst !== undefined &&
+    args.diffAgainst !== "previous"
+  ) {
+    return "diffAgainst must be previous.";
+  }
+  if (
+    args.returnImage !== undefined &&
+    args.returnImage !== "always" &&
+    args.returnImage !== "changed" &&
+    args.returnImage !== "never"
+  ) {
+    return "returnImage must be always, changed, or never.";
+  }
+  if (
+    args.diffThreshold !== undefined &&
+    (!Number.isInteger(args.diffThreshold) ||
+      Number(args.diffThreshold) < 0 ||
+      Number(args.diffThreshold) > 255)
+  ) {
+    return "diffThreshold must be an integer between 0 and 255.";
+  }
   return null;
 }
 
 function validateBrowserElementTarget(
   args: Record<string, unknown>,
 ): string | null {
+  const frameAddressError = validateDirectFrameAddress(args);
+  if (frameAddressError) {
+    return frameAddressError;
+  }
   const target = args.target ?? args.selector ?? args.element;
   if (typeof target !== "string" || !target.trim()) {
     return "selector or target is required.";
@@ -1190,6 +1226,10 @@ function validateBrowserElementTarget(
 }
 
 function validateBrowserDrag(args: Record<string, unknown>): string | null {
+  const frameAddressError = validateDirectFrameAddress(args);
+  if (frameAddressError) {
+    return frameAddressError;
+  }
   const source = args.source ?? args.sourceSelector;
   const target = args.target ?? args.targetSelector;
   if (typeof source !== "string" || !source.trim()) {
@@ -1212,8 +1252,20 @@ function validateBrowserFillForm(args: Record<string, unknown>): string | null {
   if (args.fields.length > 50) {
     return "fields is limited to 50 controls per operation.";
   }
-  if (Object.keys(args).some((key) => key !== "fields")) {
+  if (
+    Object.keys(args).some(
+      (key) =>
+        key !== "fields" &&
+        key !== "frameId" &&
+        key !== "documentId" &&
+        key !== "decisionBarrier",
+    )
+  ) {
     return "fill form arguments contain unsupported keys.";
+  }
+  const frameAddressError = validateDirectFrameAddress(args);
+  if (frameAddressError) {
+    return frameAddressError;
   }
 
   for (const field of args.fields) {
@@ -1474,9 +1526,20 @@ function validateCookieDelete(args: Record<string, unknown>): string | null {
 function validateBrowserSelectOption(
   args: Record<string, unknown>,
 ): string | null {
-  const allowedKeys = new Set(["selector", "target", "element", "values"]);
+  const allowedKeys = new Set([
+    "selector",
+    "target",
+    "element",
+    "values",
+    "frameId",
+    "documentId",
+  ]);
   if (Object.keys(args).some((key) => !allowedKeys.has(key))) {
     return "select option arguments contain unsupported keys.";
+  }
+  const frameAddressError = validateDirectFrameAddress(args);
+  if (frameAddressError) {
+    return frameAddressError;
   }
   const targetError = validateBoundedFormControlTarget(args, false);
   if (targetError) {
@@ -1497,6 +1560,31 @@ function validateBrowserSelectOption(
   }
   if (new Set(args.values).size !== args.values.length) {
     return "values must be unique.";
+  }
+  return null;
+}
+
+function validateDirectFrameAddress(
+  args: Record<string, unknown>,
+): string | null {
+  if (args.frameId === undefined && args.documentId === undefined) {
+    return null;
+  }
+  if (
+    typeof args.frameId !== "number" ||
+    !Number.isInteger(args.frameId) ||
+    args.frameId < 0
+  ) {
+    return "frameId must be a non-negative integer.";
+  }
+  if (
+    args.documentId !== undefined &&
+    (typeof args.documentId !== "string" || !args.documentId.trim())
+  ) {
+    return "documentId must be a non-empty string.";
+  }
+  if (args.frameId !== 0 && args.documentId === undefined) {
+    return "documentId is required for direct child-frame execution.";
   }
   return null;
 }
@@ -1554,6 +1642,10 @@ function validateNativeCssSelector(
 }
 
 function validateBrowserWaitFor(args: Record<string, unknown>): string | null {
+  const frameAddressError = validateDirectFrameAddress(args);
+  if (frameAddressError) {
+    return frameAddressError;
+  }
   if (args.time !== undefined && typeof args.time !== "number") {
     return "time must be a number of seconds.";
   }

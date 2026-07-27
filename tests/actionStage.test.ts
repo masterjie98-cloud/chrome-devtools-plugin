@@ -43,9 +43,9 @@ test("action stage batches independent fields but preserves dependency barriers"
     bridge,
   );
 
-  assert.equal(browserCalls.length, 2);
+  assert.equal(browserCalls.length, 3);
   assert.deepEqual(
-    browserCalls.map((call) => call.args),
+    browserCalls.slice(0, 2).map((call) => call.args),
     [
       {
         fields: [
@@ -58,6 +58,7 @@ test("action stage batches independent fields but preserves dependency barriers"
       },
     ],
   );
+  assert.equal(browserCalls[2]?.toolName, TOOL_NAMES.DOM_GET_PAGE_INFO);
   assert.equal((result as { completed: number }).completed, 3);
 });
 
@@ -109,6 +110,7 @@ test("smart action stage exposes existing pointer, drag, scroll, and viewport pr
       TOOL_NAMES.BROWSER_DRAG,
       TOOL_NAMES.BROWSER_MOUSE_WHEEL,
       TOOL_NAMES.BROWSER_RESIZE,
+      TOOL_NAMES.DOM_GET_PAGE_INFO,
     ],
   );
   assert.deepEqual(browserCalls[1]?.args, {

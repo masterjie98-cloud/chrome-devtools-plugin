@@ -58,6 +58,8 @@ const semanticSnapshotNodeSchema = z.object({
   tagName: z.string().max(60),
   description: z.string().max(300).optional(),
   href: z.string().max(1200).optional(),
+  value: z.string().max(4000).optional(),
+  selectedValues: z.array(z.string().max(4000)).max(50).optional(),
   disabled: z.boolean().optional(),
   checked: z.union([z.boolean(), z.literal("mixed")]).optional(),
   pressed: z.union([z.boolean(), z.literal("mixed")]).optional(),
@@ -334,6 +336,11 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
     payload: z
       .object({
         protocolVersion: z.number().int().positive(),
+        // Optional only so older clients reach the explicit compatibility
+        // rejection path instead of a generic schema error. Authentication
+        // cannot proceed unless both exactly match the daemon identity.
+        buildId: z.string().min(1).max(120).optional(),
+        schemaHash: z.string().regex(/^[a-f0-9]{8}$/).optional(),
         clientRole: z.enum(["plugin", "observer", "browser", "ui", "mcp"]),
         clientName: z.string().min(1).max(100).optional(),
         installationId: z.string().min(1).max(200).optional(),

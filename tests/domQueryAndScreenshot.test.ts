@@ -7,7 +7,10 @@ import {
   listRuntimeMcpTools,
 } from "../src/mcp/toolRuntime";
 import { MCP_TOOL_OUTPUT_SCHEMAS } from "../src/mcp/toolOutputSchemas";
-import { shouldSaveScreenshotToDownloads } from "../src/background/toolDispatcher";
+import {
+  screenshotDataUrlToBlob,
+  shouldSaveScreenshotToDownloads,
+} from "../src/background/toolDispatcher";
 import { MCP_TOOL_NAMES } from "../src/shared/mcpTools";
 import { getToolPolicy } from "../src/shared/toolPolicy";
 import { TOOL_NAMES, type AnyToolCall } from "../src/shared/tools";
@@ -15,6 +18,17 @@ import { TOOL_NAMES, type AnyToolCall } from "../src/shared/tools";
 test("MCP screenshots never expose implicit Chrome Downloads arguments", () => {
   const schema = MCP_TOOL_INPUT_SCHEMAS[MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT];
   assert.equal(schema.safeParse({ fullPage: true }).success, true);
+  assert.equal(
+    schema.safeParse({
+      ref: "sr1_deadbeef_s1",
+      frameRef: "fr1_deadbeef",
+      documentId: "document-1",
+      diffAgainst: "previous",
+      returnImage: "changed",
+      diffThreshold: 24,
+    }).success,
+    true,
+  );
   assert.equal(schema.safeParse({ filename: "capture.png" }).success, false);
   assert.equal(schema.safeParse({ saveToDownloads: true }).success, false);
 
@@ -24,6 +38,10 @@ test("MCP screenshots never expose implicit Chrome Downloads arguments", () => {
   const properties = definition?.inputSchema.properties ?? {};
   assert.equal("filename" in properties, false);
   assert.equal("saveToDownloads" in properties, false);
+  assert.equal("ref" in properties, true);
+  assert.equal("frameRef" in properties, true);
+  assert.equal("documentId" in properties, true);
+  assert.equal("diffAgainst" in properties, true);
 });
 
 test("internal screenshot naming does not imply a local download", () => {
@@ -34,6 +52,19 @@ test("internal screenshot naming does not imply a local download", () => {
   );
   assert.equal(shouldSaveScreenshotToDownloads({ saveToDownloads: false }), false);
   assert.equal(shouldSaveScreenshotToDownloads({ saveToDownloads: true }), true);
+});
+
+test("screenshot diff decodes data URLs without extension fetch", async () => {
+  const blob = screenshotDataUrlToBlob(
+    "data:image/png;base64,aGVsbG8=",
+  );
+  assert.equal(blob.type, "image/png");
+  assert.equal(blob.size, 5);
+  assert.equal(Buffer.from(await blob.arrayBuffer()).toString("utf8"), "hello");
+  assert.throws(
+    () => screenshotDataUrlToBlob("data:text/plain;base64,aGVsbG8="),
+    /SCREENSHOT_DIFF_INVALID_IMAGE/,
+  );
 });
 
 test("browser_query_dom accepts bounded batches and exact visual style projections", async () => {

@@ -28,6 +28,7 @@ import {
   truncateText,
 } from "../shared/sanitize";
 import { isAgentPointerHost } from "./agentPointer";
+import { classifyActionTarget } from "../shared/actionRisk";
 
 const SKIPPED_TAGS = new Set([
   "SCRIPT",
@@ -714,6 +715,8 @@ function toSemanticSnapshotCandidate(
   rect: DOMRect,
 ): SemanticSnapshotCandidate {
   const interactive = INTERACTIVE_SEMANTIC_ROLES.has(role);
+  const name = getAccessibleName(element);
+  const controlValues = readSafeControlValues(element, name);
   const headingLevel = /^h([1-6])$/i.exec(element.tagName)?.[1];
   const disabled = interactive && isElementDisabled(element);
   const required = interactive && isElementRequired(element);
@@ -721,7 +724,7 @@ function toSemanticSnapshotCandidate(
   const focused = interactive && document.activeElement === element;
   return {
     role: sanitizeText(role, 80),
-    name: getAccessibleName(element),
+    name,
     selector: sanitizeText(selector, 400),
     tagName: element.tagName.toLowerCase(),
     description: getAccessibleDescription(element),
@@ -729,6 +732,7 @@ function toSemanticSnapshotCandidate(
       element instanceof HTMLAnchorElement && element.href
         ? sanitizeUrl(element.href)
         : undefined,
+    ...controlValues,
     disabled: disabled ? true : undefined,
     checked: readCheckedState(element),
     pressed: readAriaTriState(element, "aria-pressed"),
@@ -752,6 +756,62 @@ function toSemanticSnapshotCandidate(
       height: Math.round(rect.height),
     },
   };
+}
+
+function readSafeControlValues(
+  element: Element,
+  accessibleName: string,
+): Pick<SemanticSnapshotCandidate, "value" | "selectedValues"> {
+  const descriptor = {
+    tagName: element.tagName.toLowerCase(),
+    role: getSemanticRole(element),
+    inputType:
+      element instanceof HTMLInputElement ? element.type : undefined,
+    accessibleName,
+    id: element.id || undefined,
+    name:
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLTextAreaElement ||
+      element instanceof HTMLSelectElement
+        ? element.name || undefined
+        : undefined,
+    autocomplete:
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLTextAreaElement
+        ? element.autocomplete || undefined
+        : undefined,
+    placeholder:
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLTextAreaElement
+        ? element.placeholder || undefined
+        : undefined,
+    testId: element.getAttribute("data-testid") ?? undefined,
+  };
+  if (classifyActionTarget(descriptor).dataSensitivity === "sensitive") {
+    return {};
+  }
+  if (element instanceof HTMLSelectElement) {
+    return {
+      value: sanitizeText(element.value, SANITIZE_LIMITS.elementText),
+      selectedValues: Array.from(element.selectedOptions, (option) =>
+        sanitizeText(option.value, SANITIZE_LIMITS.elementText),
+      ).slice(0, 50),
+    };
+  }
+  if (
+    element instanceof HTMLInputElement &&
+    !["checkbox", "radio", "file"].includes(element.type)
+  ) {
+    return {
+      value: sanitizeText(element.value, SANITIZE_LIMITS.elementText),
+    };
+  }
+  if (element instanceof HTMLTextAreaElement) {
+    return {
+      value: sanitizeText(element.value, SANITIZE_LIMITS.elementText),
+    };
+  }
+  return {};
 }
 
 function getSemanticRole(element: Element): string | undefined {

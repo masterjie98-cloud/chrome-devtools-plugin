@@ -9,6 +9,7 @@ import {
   selectedOptionIndices,
   type SelectOptionCandidate,
 } from "../src/shared/formControls";
+import { formControlInspectInput } from "../src/background/toolDispatcher";
 import { TOOL_NAMES, validateToolCall } from "../src/shared/tools";
 
 function options(
@@ -134,6 +135,22 @@ test("internal tool validation enforces bounded strict form contracts", () => {
       args: { selector: 'button[data-action="save"]' },
     }),
     null,
+  );
+});
+
+test("trusted form inspection preserves direct iframe routing metadata", () => {
+  assert.deepEqual(
+    formControlInspectInput({
+      selector: "#child-input",
+      value: "direct-frame-value",
+      frameId: 7,
+      documentId: "child-document",
+    }),
+    {
+      selector: "#child-input",
+      frameId: 7,
+      documentId: "child-document",
+    },
   );
 });
 

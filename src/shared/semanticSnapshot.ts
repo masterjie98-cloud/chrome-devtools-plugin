@@ -5,6 +5,27 @@ export interface SemanticSnapshotInput {
 
 export type SemanticCheckedState = boolean | "mixed";
 
+export const SEMANTIC_PROJECTION_FIELDS = [
+  "role",
+  "name",
+  "description",
+  "href",
+  "value",
+  "selectedValues",
+  "disabled",
+  "checked",
+  "pressed",
+  "expanded",
+  "selected",
+  "required",
+  "readOnly",
+  "focused",
+  "level",
+] as const;
+
+export type SemanticProjectionField =
+  (typeof SEMANTIC_PROJECTION_FIELDS)[number];
+
 export interface SemanticSnapshotNode {
   ref: string;
   targetRef: string;
@@ -14,6 +35,8 @@ export interface SemanticSnapshotNode {
   tagName: string;
   description?: string;
   href?: string;
+  value?: string;
+  selectedValues?: string[];
   disabled?: boolean;
   checked?: SemanticCheckedState;
   pressed?: SemanticCheckedState;
@@ -110,6 +133,10 @@ export function isSnapshotTargetRef(value: string): boolean {
   return /^sr1_[a-f0-9]{8}_s\d{1,6}$/.test(value);
 }
 
+export function isSnapshotFrameRef(value: string): boolean {
+  return /^fr1_[a-f0-9]{8}$/.test(value);
+}
+
 export function fingerprintSemanticSnapshot(
   sourceKey: string,
   candidates: SemanticSnapshotCandidate[],
@@ -123,6 +150,8 @@ export function fingerprintSemanticSnapshot(
         node.selector,
         node.description,
         node.href,
+        node.value,
+        node.selectedValues?.join("\u001e"),
         node.disabled,
         node.checked,
         node.pressed,

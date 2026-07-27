@@ -22,6 +22,7 @@ import {
   selectTargetTab,
   selectTargetFrame,
   setCookie,
+  type ContentFrameAddress,
 } from "./chromeApi";
 import { getTargetNavigationState } from "./targetNavigation";
 import {
@@ -136,6 +137,10 @@ type ContentRequestType =
   | typeof MESSAGE_TYPES.CONTENT_REMOVE_CSS_PATCH;
 
 const AGENT_POINTER_PRESENTATION_TIMEOUT_MS = 650;
+const screenshotBaselines = new Map<
+  string,
+  { dataUrl: string; capturedAt: string }
+>();
 
 export interface ToolExecutionAuthorization {
   approvalRequired: boolean;
@@ -165,6 +170,7 @@ export async function executeToolCall(
       const pageRead = await forwardContentRequestWithTarget(
         MESSAGE_TYPES.CONTENT_GET_PAGE_INFO,
         normalizedCall.args,
+        directFrameAddress(normalizedCall.args),
       );
       return {
         toolName: normalizedCall.toolName,
@@ -437,10 +443,13 @@ export async function executeToolCall(
     case TOOL_NAMES.BROWSER_WAIT_FOR:
       return {
         toolName: normalizedCall.toolName,
-        data: await forwardContentRequest(
+        data: (
+          await forwardContentRequestWithTarget(
           MESSAGE_TYPES.CONTENT_WAIT_FOR,
           normalizedCall.args,
-        ),
+          directFrameAddress(normalizedCall.args),
+          )
+        ).payload,
       };
     case TOOL_NAMES.BROWSER_EVALUATE:
       throw new Error(
@@ -841,7 +850,15 @@ async function fillFormWithTrustedInput(
 ): Promise<BrowserFillFormResult> {
   const plans: FormFieldPlan[] = [];
   for (const field of input.fields) {
-    plans.push({ field, resolved: await preflightFormField(field) });
+    const scopedField = {
+      ...field,
+      ...(input.frameId !== undefined ? { frameId: input.frameId } : {}),
+      ...(input.documentId ? { documentId: input.documentId } : {}),
+    };
+    plans.push({
+      field: scopedField,
+      resolved: await preflightFormField(scopedField),
+    });
   }
   for (const plan of plans) {
     requireResolvedTargetDecisionBarrier(
@@ -1014,8 +1031,15 @@ async function applyScopedSelect(
       expectedElementToken: token,
       expectedControlKind: controlKind,
     },
+    {
+      frameId: resolved.target.frameId,
+      documentId: resolved.target.documentId,
+    },
   );
-  const target = await assertTrustedContentTarget(response.target);
+  const target = await assertTrustedContentTarget(response.target, {
+    frameId: resolved.target.frameId,
+    documentId: resolved.target.documentId,
+  });
   assertSameTrustedTarget(resolved.target, target);
   return {
     ...response.payload,
@@ -1031,16 +1055,25 @@ async function resolveTrustedFormControl(
   focusElement: boolean,
   requirePoint: boolean,
 ): Promise<ResolvedTrustedFormControl> {
+  const {
+    frameId: _frameId,
+    documentId: _documentId,
+    ...contentInput
+  } = input;
   const response = await forwardContentRequestWithTarget(
     MESSAGE_TYPES.CONTENT_INSPECT_FORM_CONTROL,
     {
-      ...input,
+      ...contentInput,
       scrollIntoView,
       focusElement,
       requireHitTest: requirePoint,
     },
+    directFrameAddress(input),
   );
-  const target = await assertTrustedContentTarget(response.target);
+  const target = await assertTrustedContentTarget(
+    response.target,
+    directFrameAddress(input),
+  );
   if (!response.payload.matched) {
     throw new Error(
       `TRUSTED_INPUT_TARGET_NOT_FOUND: ${label} matched no element in the current document. Do not retry the unchanged selector. Read one fresh browser_snapshot or browser_query_dom result, reuse its exact native CSS selector, and then retry only if the target still exists.`,
@@ -1118,7 +1151,7 @@ function validateSelectControl(
   }
 }
 
-function formControlInspectInput(
+export function formControlInspectInput(
   field: BrowserFillFormInput["fields"][number],
   values?: string[],
 ): BrowserFormControlInspectInput {
@@ -1127,6 +1160,8 @@ function formControlInspectInput(
     ...(field.target ? { target: field.target } : {}),
     ...(field.element ? { element: field.element } : {}),
     ...(field.name ? { name: field.name } : {}),
+    ...(field.frameId !== undefined ? { frameId: field.frameId } : {}),
+    ...(field.documentId ? { documentId: field.documentId } : {}),
     ...(values ? { values } : {}),
   };
 }
@@ -1211,7 +1246,11 @@ async function pressKeyWithTrustedInput(
   requireKeyDecisionBarrier(input.key, authorization);
   if (selector) {
     const resolved = await focusTrustedElement(
-      { selector },
+      {
+        selector,
+        ...(input.frameId !== undefined ? { frameId: input.frameId } : {}),
+        ...(input.documentId ? { documentId: input.documentId } : {}),
+      },
       "key target",
     );
     await presentAgentPointerBestEffort(
@@ -1278,7 +1317,13 @@ function requireKeyDecisionBarrier(
 }
 
 async function focusTrustedElement(
-  input: { selector?: string; target?: string; element?: string },
+  input: {
+    selector?: string;
+    target?: string;
+    element?: string;
+    frameId?: number;
+    documentId?: string;
+  },
   label: string,
 ): Promise<ResolvedTrustedElement> {
   const resolved = await resolveTrustedElement(input, label, true, true);
@@ -1296,17 +1341,29 @@ async function dragElementWithTrustedInput(
   }
 
   const sourceInitial = await resolveTrustedElement(
-    { selector: sourceSelector },
+    {
+      selector: sourceSelector,
+      ...(input.frameId !== undefined ? { frameId: input.frameId } : {}),
+      ...(input.documentId ? { documentId: input.documentId } : {}),
+    },
     "drag source",
     true,
   );
   const target = await resolveTrustedElement(
-    { selector: targetSelector },
+    {
+      selector: targetSelector,
+      ...(input.frameId !== undefined ? { frameId: input.frameId } : {}),
+      ...(input.documentId ? { documentId: input.documentId } : {}),
+    },
     "drag target",
     false,
   );
   const source = await resolveTrustedElement(
-    { selector: sourceSelector },
+    {
+      selector: sourceSelector,
+      ...(input.frameId !== undefined ? { frameId: input.frameId } : {}),
+      ...(input.documentId ? { documentId: input.documentId } : {}),
+    },
     "drag source",
     false,
   );
@@ -1352,7 +1409,13 @@ interface ResolvedTrustedElement {
 }
 
 async function resolveTrustedElement(
-  input: { selector?: string; target?: string; element?: string },
+  input: {
+    selector?: string;
+    target?: string;
+    element?: string;
+    frameId?: number;
+    documentId?: string;
+  },
   label: string,
   scrollIntoView: boolean,
   focusElement = false,
@@ -1365,8 +1428,12 @@ async function resolveTrustedElement(
       requireHitTest: true,
       focusElement,
     },
+    directFrameAddress(input),
   );
-  const target = await assertTrustedContentTarget(response.target);
+  const target = await assertTrustedContentTarget(
+    response.target,
+    directFrameAddress(input),
+  );
   return {
     rect: response.payload,
     point: requireTrustedElementPoint(response.payload, label),
@@ -1376,18 +1443,26 @@ async function resolveTrustedElement(
 
 async function assertTrustedContentTarget(
   target: PageSnapshotTarget,
+  expectedFrame?: ContentFrameAddress,
 ): Promise<PageSnapshotTarget & { tabId: number }> {
   if (target.tabId === undefined) {
     throw new Error("STALE_CONTEXT: trusted input target has no tab identity.");
   }
   const tab = await queryActiveTab();
   const selectedFrame = getSelectedContentFrame(target.tabId);
+  const expected =
+    expectedFrame ?? {
+      frameId: selectedFrame.frameId,
+      documentId: selectedFrame.documentId,
+    };
+  const frameSnapshot = getContentFrameSnapshot(target.tabId, expected);
   const navigation = getTargetNavigationState(target.tabId, false);
   if (
     tab?.id !== target.tabId ||
-    selectedFrame.frameId !== target.frameId ||
-    (selectedFrame.documentId !== undefined &&
-      selectedFrame.documentId !== target.documentId) ||
+    !frameSnapshot ||
+    expected.frameId !== target.frameId ||
+    (expected.documentId !== undefined &&
+      expected.documentId !== target.documentId) ||
     navigation.navigationId !== target.navigationId ||
     navigation.revision !== target.revision
   ) {
@@ -1499,10 +1574,12 @@ async function takeScreenshot(
   const target = (input.target || input.selector || input.element || "").trim();
   let screenshot: Awaited<ReturnType<typeof captureDebuggerScreenshot>>;
   if (target) {
-    const rect = await forwardContentRequest(
+    const rectResponse = await forwardContentRequestWithTarget(
       MESSAGE_TYPES.CONTENT_GET_ELEMENT_RECT,
       { selector: target },
+      directFrameAddress(input),
     );
+    const rect = rectResponse.payload;
     if (!rect.matched || rect.pageX === undefined || rect.pageY === undefined) {
       throw new Error(`Element not found for screenshot: ${target}`);
     }
@@ -1518,7 +1595,7 @@ async function takeScreenshot(
         height: rect.height ?? rect.rect?.height ?? 1,
       },
     });
-    return saveScreenshotIfRequested(screenshot, input);
+    return finalizeScreenshot(screenshot, input);
   }
 
   try {
@@ -1529,7 +1606,201 @@ async function takeScreenshot(
     }
     screenshot = await captureVisibleTab();
   }
-  return saveScreenshotIfRequested(screenshot, input);
+  return finalizeScreenshot(screenshot, input);
+}
+
+async function finalizeScreenshot(
+  screenshot: Awaited<ReturnType<typeof captureDebuggerScreenshot>>,
+  input: ScreenshotCaptureInput,
+): Promise<Awaited<ReturnType<typeof captureDebuggerScreenshot>>> {
+  const saved = await saveScreenshotIfRequested(screenshot, input);
+  const compared = await compareWithPreviousScreenshot(saved, input);
+  const shouldReturnImage =
+    input.returnImage !== "never" &&
+    (input.returnImage !== "changed" ||
+      compared.comparison?.changed !== false);
+  return shouldReturnImage
+    ? compared
+    : {
+        ...compared,
+        dataUrl: `data:${compared.mimeType};base64,`,
+      };
+}
+
+async function compareWithPreviousScreenshot(
+  screenshot: Awaited<ReturnType<typeof captureDebuggerScreenshot>>,
+  input: ScreenshotCaptureInput,
+): Promise<Awaited<ReturnType<typeof captureDebuggerScreenshot>>> {
+  if (input.diffAgainst !== "previous") {
+    return screenshot;
+  }
+  const tab = await queryActiveTab();
+  const key = [
+    tab?.id ?? "unknown",
+    input.frameId ?? getSelectedContentFrame(tab?.id ?? -1).frameId,
+    input.documentId ?? "",
+    input.target ?? input.selector ?? input.element ?? "<viewport>",
+    Boolean(input.fullPage),
+    screenshot.mimeType,
+  ].join(":");
+  const baseline = screenshotBaselines.get(key);
+  screenshotBaselines.set(key, {
+    dataUrl: screenshot.dataUrl,
+    capturedAt: screenshot.capturedAt,
+  });
+  const threshold =
+    typeof input.diffThreshold === "number"
+      ? Math.max(0, Math.min(255, Math.round(input.diffThreshold)))
+      : 16;
+  if (!baseline) {
+    return {
+      ...screenshot,
+      comparison: {
+        baselineAvailable: false,
+        changed: null,
+        threshold,
+      },
+    };
+  }
+  return {
+    ...screenshot,
+    comparison: {
+      ...(await compareScreenshotPixels(
+        baseline.dataUrl,
+        screenshot.dataUrl,
+        threshold,
+      )),
+      baselineAvailable: true,
+      threshold,
+      baselineCapturedAt: baseline.capturedAt,
+    },
+  };
+}
+
+async function compareScreenshotPixels(
+  beforeDataUrl: string,
+  afterDataUrl: string,
+  threshold: number,
+): Promise<{
+  changed: boolean;
+  changedPixelRatio: number;
+  changedBounds?: { x: number; y: number; width: number; height: number };
+}> {
+  const [before, after] = await Promise.all([
+    createImageBitmap(screenshotDataUrlToBlob(beforeDataUrl)),
+    createImageBitmap(screenshotDataUrlToBlob(afterDataUrl)),
+  ]);
+  try {
+    const width = Math.max(before.width, after.width);
+    const height = Math.max(before.height, after.height);
+    const scale = Math.min(1, 1600 / Math.max(width, height));
+    const sampleWidth = Math.max(1, Math.round(width * scale));
+    const sampleHeight = Math.max(1, Math.round(height * scale));
+    const beforeCanvas = new OffscreenCanvas(sampleWidth, sampleHeight);
+    const afterCanvas = new OffscreenCanvas(sampleWidth, sampleHeight);
+    const beforeContext = beforeCanvas.getContext("2d", {
+      willReadFrequently: true,
+    });
+    const afterContext = afterCanvas.getContext("2d", {
+      willReadFrequently: true,
+    });
+    if (!beforeContext || !afterContext) {
+      throw new Error("SCREENSHOT_DIFF_UNAVAILABLE: 2D canvas is unavailable.");
+    }
+    beforeContext.clearRect(0, 0, sampleWidth, sampleHeight);
+    afterContext.clearRect(0, 0, sampleWidth, sampleHeight);
+    beforeContext.drawImage(before, 0, 0, sampleWidth, sampleHeight);
+    afterContext.drawImage(after, 0, 0, sampleWidth, sampleHeight);
+    const beforePixels = beforeContext.getImageData(
+      0,
+      0,
+      sampleWidth,
+      sampleHeight,
+    ).data;
+    const afterPixels = afterContext.getImageData(
+      0,
+      0,
+      sampleWidth,
+      sampleHeight,
+    ).data;
+    let changedPixels = 0;
+    let minX = sampleWidth;
+    let minY = sampleHeight;
+    let maxX = -1;
+    let maxY = -1;
+    for (let offset = 0; offset < beforePixels.length; offset += 4) {
+      const changed =
+        Math.abs((beforePixels[offset] ?? 0) - (afterPixels[offset] ?? 0)) >
+          threshold ||
+        Math.abs(
+          (beforePixels[offset + 1] ?? 0) -
+            (afterPixels[offset + 1] ?? 0),
+        ) > threshold ||
+        Math.abs(
+          (beforePixels[offset + 2] ?? 0) -
+            (afterPixels[offset + 2] ?? 0),
+        ) > threshold ||
+        Math.abs(
+          (beforePixels[offset + 3] ?? 0) -
+            (afterPixels[offset + 3] ?? 0),
+        ) > threshold;
+      if (!changed) continue;
+      changedPixels += 1;
+      const pixel = offset / 4;
+      const x = pixel % sampleWidth;
+      const y = Math.floor(pixel / sampleWidth);
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+    const totalPixels = sampleWidth * sampleHeight;
+    return {
+      changed: changedPixels > 0,
+      changedPixelRatio:
+        Math.round((changedPixels / totalPixels) * 1_000_000) / 1_000_000,
+      ...(changedPixels > 0
+        ? {
+            changedBounds: {
+              x: Math.floor(minX / scale),
+              y: Math.floor(minY / scale),
+              width: Math.ceil((maxX - minX + 1) / scale),
+              height: Math.ceil((maxY - minY + 1) / scale),
+            },
+          }
+        : {}),
+    };
+  } finally {
+    before.close();
+    after.close();
+  }
+}
+
+export function screenshotDataUrlToBlob(dataUrl: string): Blob {
+  const match =
+    /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/]*={0,2})$/.exec(
+      dataUrl,
+    );
+  if (!match) {
+    throw new Error(
+      "SCREENSHOT_DIFF_INVALID_IMAGE: expected a base64 PNG or JPEG data URL.",
+    );
+  }
+  const mimeType = match[1];
+  const encoded = match[2] ?? "";
+  let decoded: string;
+  try {
+    decoded = atob(encoded);
+  } catch {
+    throw new Error(
+      "SCREENSHOT_DIFF_INVALID_IMAGE: screenshot base64 could not be decoded.",
+    );
+  }
+  const bytes = new Uint8Array(decoded.length);
+  for (let index = 0; index < decoded.length; index += 1) {
+    bytes[index] = decoded.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: mimeType });
 }
 
 async function saveScreenshotIfRequested(
@@ -1590,6 +1861,7 @@ interface ForwardedContentResponse<T extends ContentRequestType> {
 async function forwardContentRequestWithTarget<T extends ContentRequestType>(
   type: T,
   payload: RequestOf<T>["payload"],
+  directFrame?: ContentFrameAddress,
 ): Promise<ForwardedContentResponse<T>> {
   const tab = await queryActiveTab();
   if (!tab?.id) {
@@ -1605,8 +1877,15 @@ async function forwardContentRequestWithTarget<T extends ContentRequestType>(
     type,
     payload,
   } as RequestOf<T>;
-  const selectedFrame = getSelectedContentFrame(tab.id);
-  const selectedFrameSnapshot = getSelectedContentFrameSnapshot(tab.id);
+  const selectedFrame = directFrame ?? getSelectedContentFrame(tab.id);
+  const selectedFrameSnapshot = directFrame
+    ? getContentFrameSnapshot(tab.id, directFrame)
+    : getSelectedContentFrameSnapshot(tab.id);
+  if (directFrame && !selectedFrameSnapshot) {
+    throw new Error(
+      "STALE_FRAME: the referenced frame document is no longer registered; observe the page again.",
+    );
+  }
   const navigation = getTargetNavigationState(tab.id, false);
   let response = await sendTabRequest(tab.id, request, selectedFrame);
 
@@ -1647,6 +1926,18 @@ async function forwardContentRequestWithTarget<T extends ContentRequestType>(
       navigationId: navigation.navigationId,
       revision: navigation.revision,
     },
+  };
+}
+
+function directFrameAddress(
+  input: { frameId?: number; documentId?: string },
+): ContentFrameAddress | undefined {
+  if (input.frameId === undefined) {
+    return undefined;
+  }
+  return {
+    frameId: input.frameId,
+    ...(input.documentId ? { documentId: input.documentId } : {}),
   };
 }
 

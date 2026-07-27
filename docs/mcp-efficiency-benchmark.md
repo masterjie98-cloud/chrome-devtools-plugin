@@ -224,8 +224,125 @@ iframe，而当时 AI DevTools 仍需 `browser_list_frames`、
   冲突拒绝，以及 frame 排序不会改变当前选择。真实热态中位数和 P95 待下方
   运行条件满足后写回本报告。
 
-待执行的真实复测命令与条件：加载最新 `dist`、重启 LaunchAgent，同时启动
-`tests/fixtures/frame-host` 的 8765 服务和 `frame-child` 的 8766 服务；随后对
-`browser_observe(interactive)` 连续采集至少 10 个热态样本，并确认同一次结果
-出现顶层和 child frame。当前受控执行环境禁止监听本机端口，因此本段不伪造
-运行结果。
+## 2026-07-23 最新构建真实复测
+
+本轮加载最新 `dist`、重启 LaunchAgent，并启动 8765 顶层 fixture 与 8766
+跨源 child fixture。结果如下；墙钟时间是从 Codex 工具调用侧测量，内部执行时间
+来自 daemon 的脱敏审计字段。
+
+### 热态 DOM 与 iframe
+
+| 页面与路径 | 10 次热态样本 | 中位数 | P95 | 输出字符数 |
+| --- | --- | ---: | ---: | ---: |
+| 安装页，Codex Chrome `domSnapshot()` | 53/25/21/16/21/16/17/16/19/25 ms | 20 ms | 53 ms | 7,094 |
+| 安装页，MCP `browser_observe(interactive)` | 65/63/61/66/68/64/64/68/63/74 ms | 64.5 ms | 74 ms | 4,143–4,145 |
+| iframe fixture，Codex Chrome `domSnapshot()` | 60/18/17/15/16/18/21/23/17/19 ms | 18 ms | 60 ms | 1,723 |
+| iframe fixture，MCP `browser_observe(auto)` | 80/43/44/43/41/39/38/38/39/39 ms | 40 ms | 80 ms | 约 3,727 |
+
+MCP 同一次结果包含顶层 19 个节点和跨源 child frame 2 个节点，且 child 明确
+标记 `actionable=false`、不返回 `targetRef`；因此“一次观察所有可访问 frame”
+真实通过，同时没有放宽写操作的 document/navigation 绑定。
+
+content 侧热态扫描通常只有 0.2–2.1 ms；daemon 审计中的观察总耗时通常为
+7–11 ms，`queueWaitMs=0`。模型侧 40–65 ms 的主要差额来自 stdio/MCP 编排和
+结果传递，不是 DOM 扫描。因此下一步应优先用组合工具摊薄往返，而不是继续微调
+节点扫描。
+
+iframe fixture 上，MCP 结果约为 Codex Chrome 的 2.16 倍。额外体积主要来自
+frame provenance、freshness、分页和 timing；这些字段有安全价值，但应支持投影，
+避免每个 child frame 重复页级元数据。
+
+### 批量动作、验证与截图
+
+同一 fixture 上，Codex Chrome 用 5 次控件操作加一次页面内验证，共 682 ms。
+MCP 用一次 `browser_act` 完成文本、checkbox、radio、单选和多选共 5 项：
+
+- 审计 `executorMs=324`、`transportMs=314`、`queueWaitMs=1`；
+- 人工审批等待为 81,802 ms，不属于浏览器执行耗时；
+- 页面真实值复核为 `MCP Benchmark 20260723`、`true`、`b`、`us`、
+  `beta,gamma`，5/5 成功。
+
+这证明批量动作的执行效率已经优于逐控件往返，但审批发现成本会完全淹没引擎收益。
+审批模式应对当前聊天与当前域名提供清晰常驻状态，并把决策屏障与普通表单动作区分。
+
+`browser_verify` 能正确验证 checkbox/radio，却不能用 `selected=true` 验证
+`<select>` 当前值；页面真实状态虽正确，验证结果仍为 false。这是验证协议缺口：
+应增加 `value` / `selectedValues`，不能要求模型再换一套读取工具。
+
+截图对照中，Codex Chrome 截图墙钟为 101 ms；MCP 截图审计
+`executorMs=81`，扣除审批后的总耗时为 82 ms。MCP 返回真实 `image/png`
+Base64 和 artifact URI，`structuredContent` 不含 `dataUrl`，且未写入 Chrome
+Downloads。一次 Network + Console 摘要的 `executorMs=25`、结果 597 字符；
+空白 fixture 正确返回零请求和零控制台消息。
+
+### 复测发现的运行时一致性缺口
+
+首次调用新参数 `frameScope` 时，工具 schema 已更新但旧 daemon 仍返回
+`Unrecognized key: "frameScope"`；重启 LaunchAgent 后立即恢复。这不是页面能力
+问题，而是 adapter/daemon/extension 版本不一致。`browser_status` 应公开三端
+build ID、schema hash 和兼容状态，并在不一致时提前给出可执行的重启提示，不能
+等到业务调用才暴露参数错误。
+
+### 基于最新数据的集成优先级
+
+1. 增加一个受限 `browser_workflow`：一次完成观察、最多 20 个动作、确定性验证、
+   URL/DOM delta 和可选 Network/Console 证据；跨导航或决策点仍保留 barrier。
+   这是当前最高收益项，可直接摊薄每次 40–65 ms 的 MCP 固定往返。
+2. 给验证协议增加 `value`、`selectedValues`、`textValue` 和逐动作 post-state，
+   让一次批量写入能自证，消除额外查询。
+3. 增加 runtime version/schema handshake 与 readiness：adapter、daemon、
+   extension build 不一致时 fail-fast，并支持安全读取链路自动恢复。
+4. 把动作前后窗口内的 DOM delta、路由、非心跳 Network、Console error 自动
+   关联成 operation evidence；不要让模型分别启动、读取、停止录制。
+5. 允许观察结果中的 child frame 携带只读 `frameRef`，动作工具显式消费
+   `frameRef + documentId + targetRef` 后直达该 frame；仍须重新授权和校验新鲜度，
+   从而省掉 list/set/re-observe 三次往返。
+6. 增加结果投影和预算：例如 `fields`、`roles`、`includeFrames`、
+   `includeFreshness`，并去除 child frame 重复页级元数据。
+7. 增加元素裁剪图、截图 hash/diff 和变化区域，只在语义证据不足或视觉状态变化时
+   回传像素；避免每轮发送整张截图。
+8. 暴露订阅式 page/network/console delta 资源，让 Codex 在页面变化时收到通知，
+   而不是轮询相同 DOM。
+
+### 2026-07-23 实现状态
+
+上述第 1–7 项已在当前工作树实现：`browser_workflow`、动作后状态、
+`value/selectedValues`、build/schema 握手、关联证据、直接 iframe 引用、字段
+投影、元素截图与截图 diff 已进入代码和自动化测试。第 8 项“订阅式增量资源”仍
+未实现。
+
+本节只记录实现状态，不伪造新的真实浏览器时延。完成扩展重新加载后，应运行：
+
+```bash
+npm run verify:workflow-evidence -- \
+  --tab-url-prefix http://127.0.0.1:8765/
+```
+
+再把同一代码状态的墙钟时间、结果字符数和图像字节变化追加到本文件。
+
+## 2026-07-24 组合工作流真实验收
+
+在相同 8765 顶层 fixture 与 8766 跨源 child fixture 上，最终构建通过
+`verify:workflow-evidence`。本轮用于正确性验收，没有把人工审批等待混入性能数据，
+也没有补造新的中位数或 P95。
+
+- 三端兼容身份一致：`0.1.0+ws7 / f085f1dd`。
+- 一个 `browser_workflow` 完成 4 个顶层表单动作，返回 4 个 post-state，并在同一
+  结果中完成文本值、checkbox、单选与多选值验证。
+- 同一结果携带 DOM、URL、Network、Console 四类证据，不再要求模型分别开启和读取
+  录制器。
+- 重新观察后的 `frameRef + documentId + targetRef` 完成 1 个 OOPIF 写动作；后续
+  观察确认 child input 为 `direct-frame-value`。
+- 两次相同元素截图的第二次结果为 `changed=false`、
+  `changedPixelRatio=0`、`baselineAvailable=true`，且未重复返回 image bytes。
+
+验收过程中暴露并修复的真实成本点：
+
+1. snapshot 引用按 generation 失效，独立后续动作必须重新观察，不能复用工作流前
+   的旧 `frameRef`；
+2. Chrome MV3 service worker 中 `fetch(data:)` 不可靠，截图 diff 改为本地 Base64
+   解码到 `Blob`；
+3. child trusted input 必须同时覆盖独立 OOPIF session 和同进程 frame。OOPIF 在
+   顶层 CDP 树缺失时只按唯一活跃 URL 关联；重复 sibling URL 继续失败关闭；
+4. 扩展重新加载后，已打开页面必须刷新才能重新注册 content scripts。这是开发态
+   装载前置条件，不计入运行时任务性能。

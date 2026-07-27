@@ -38,11 +38,11 @@ Allowed status values: `not-run`, `pass`, `fail`.
 | 3.5 | Tool-result completeness, virtual scrolling and copy | pass | A live read returned 15.6k characters and the collapsed row labeled it complete. Expansion reported the same complete count, used a 578-line virtual viewport, scrolled to later content, and changed the copy control to `已复制`. No 8k display-side slice remained. |
 | 4 | Deny/approve/one-time grants, trusted click and OOPIF routing | not-run | Denial, one-time approval, same-chat/domain grant, grant switch-off, origin invalidation and trusted input passed. The three approval modes passed bounded wait checks: agent mode covered ordinary task grants but not decision barriers; full mode resumed a pending barrier; ask mode restored prompting. A new chat reset to ask mode. Audit, OOPIF and remaining Section 4 cases are still pending. |
 | 4.1 | One-current-dialog CDP handling | not-run | |
-| 4.2 | Trusted typing/key input and fail-closed targets | pass | Replace and Unicode slow typing, Enter and ArrowLeft used CDP; fixture events were trusted and ArrowLeft did not submit. Oversized slow text and `Control+A` failed before approval. Readonly type failed without events. Child type failed closed as unsupported and remained `not typed`. |
-| 4.3 | Form preflight, CDP controls and scoped DOM select | pass | Missing-field preflight failed without events. Text, checkbox and radio used trusted CDP events; selects used scoped DOM events. Ambiguous labels, radio uncheck, readonly writes and child-frame fill failed closed. A real fast-mode five-field task used one broad DOM read, one `browser_fill_form` and one read-only verification; requested values changed, excluded controls did not, and expected trusted/scoped events were recorded. |
+| 4.2 | Trusted typing/key input and fail-closed targets | pass | Replace/Unicode typing and key input used trusted CDP events; invalid key, readonly and oversized inputs failed before mutation. The 2026-07-24 direct-frame gate supersedes the earlier unsupported child result: a fresh bound reference wrote the OOPIF input and a follow-up observation verified its exact value. Same-process coordinate routing remains automated-only. |
+| 4.3 | Form preflight, CDP controls and scoped DOM select | pass | Preflight and fail-closed edge cases passed. A real five-field task used one broad read, one `browser_fill_form` and one verification; all requested values changed while excluded controls did not. The 2026-07-24 OOPIF direct fill also passed exact post-value verification; multi-field child-frame form fill was not separately exercised. |
 | 4.4 | Stale approval, active Stop, pending Stop and unavailable UI | not-run | Approval remained visible for 52 seconds; rejection removed it and preserved `not clicked`. Reload returned `STALE_CONTEXT`; caller abort removed its card. Closing the only Side Panel set `uiConnected: false`, and an approval-gated read failed before execution with `APPROVAL_REQUIRED` and an explicit unavailable-UI message. Reopening restored the UI without restoring a grant. Active Stop remains. |
 | 4.5 | Sensitive default omission, deny/approve, redaction and destination | not-run | |
-| 4.6 | Screenshot MCP image, artifact binding and bounded metadata | not-run | |
+| 4.6 | Screenshot MCP image, artifact binding and bounded metadata | pass | Live MCP screenshot returned `image/png` content and a session artifact URI with MIME type, byte length, SHA-256 and expiry. `structuredContent` omitted `dataUrl`, Chrome Downloads was not used, and daemon audit separated 33,776 ms approval wait from 81 ms executor time. |
 | 4.7 | DNR upsert/remove deny/approve, one-time grant and exact cleanup | not-run | |
 | 5 | Credential migration and Provider-origin confirmation | not-run | Historical fast mode first-enable displayed the configured Provider destination. The former send-time initial screenshot behavior has been removed: current acceptance must prove a plain message captures no image, an Agent-requested screenshot still prompts, and only a successful explicit visual observation activates adaptive route/drawer/repeated-DOM checkpoints. API-key migration and Provider-origin-change confirmation remain. |
 | 6 | V3 reconnect/backoff/heartbeat without duplicate mutation | not-run | Live disconnect produced no false tool row, and a normal read recovered. Repeated collaboration-target schema violations caused the frequent close. After outbound projection and reload, three consecutive real reads stayed connected. Fast reconnect and disconnect-after-mutation evidence remain. |
@@ -50,12 +50,37 @@ Allowed status values: `not-run`, `pass`, `fail`.
 
 ## Supplementary live evidence
 
-- Multi-frame observation (implementation verified, live fixture pending):
-  `browser_observe` now defaults to a bounded parallel frame read, preserves
-  per-frame document/navigation provenance, and removes actionable references
-  from child-frame results. Automated routing and runtime tests passed; the
-  current controlled runner could not start the 8765/8766 fixture or restart
-  the LaunchAgent, so no live pass is recorded here.
+- Workflow-evidence upgrade (live passed on 2026-07-24): adapter, daemon and
+  browser negotiated `0.1.0+ws7 / f085f1dd`. One `browser_workflow` completed
+  four top-frame actions, returned four post-states, passed exact text,
+  checkbox, single-select and multi-select verification, and returned
+  DOM/URL/Network/Console evidence. A fresh child reference then completed one
+  OOPIF fill without changing the selected frame; a follow-up observation read
+  `direct-frame-value`. Two identical element screenshots produced
+  `baselineAvailable: true`, `changed: false` and `changedPixelRatio: 0`; the
+  unchanged result contained no image bytes and did not write Chrome Downloads.
+  Live hardening repaired three defects found by the gate: snapshot-scoped test
+  refs were refreshed before reuse, screenshot diff no longer calls
+  service-worker `fetch(data:)`, and trusted child-frame input now routes unique
+  OOPIF roots plus same-process frame content-box coordinates while preserving
+  exact document binding.
+- Multi-frame observation (live fixture passed on 2026-07-23):
+  after loading the latest extension build and restarting the LaunchAgent,
+  `browser_observe(frameScope=auto)` read the 8765 top frame and the cross-origin
+  8766 child in one call. Ten warm calls all returned 19 top-frame nodes and 2
+  child-frame nodes; the child was `actionable=false`, exposed no `targetRef`,
+  and retained its own frame/document provenance. Median model-visible latency
+  was 40 ms (P95 80 ms); content scans were 0.2–1.1 ms in the warm samples.
+- Batch action and screenshot evidence (live fixture passed on 2026-07-23):
+  one `browser_act` changed five controls and the page truth was 5/5 correct.
+  Daemon audit separated 81,802 ms of approval wait from 324 ms executor time.
+  A screenshot returned MCP image content plus a bounded artifact URI, omitted
+  `dataUrl` from structured content, and did not write Chrome Downloads.
+- Verification protocol gap (live failure on 2026-07-23):
+  `browser_verify(target_state)` passed checkbox/radio checks but cannot express
+  the selected value(s) of a select control; using `selected=true` against the
+  select root returned false despite the exact page value being `us` and
+  selected tags being `beta,gamma`.
 - Disclosure state: the approval-mode trigger exposed controlled open/closed
   state; the pending approval parameter control changed `展开` -> `收起`,
   mounted the full JSON region, then returned to `展开` and unmounted it. The

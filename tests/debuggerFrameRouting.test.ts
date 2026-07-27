@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createOopifAutoAttachParams,
+  frameOwnerContentOrigin,
   mapDebuggerFrameTree,
+  matchUniqueNavigationFrameRoute,
   requireDebuggerFrameRoute,
   type CdpFrameTreeNode,
   type NavigationFrameNode,
@@ -68,6 +70,29 @@ test("debugger frame routing rejects duplicate sibling URLs instead of guessing"
   assert.equal(routes.has("cdp-b"), false);
 });
 
+test("OOPIF root falls back to one unique active navigation URL", () => {
+  const frame = { id: "oopif-frame", url: "http://localhost:8766/child.html" };
+  assert.deepEqual(
+    matchUniqueNavigationFrameRoute(frame, [
+      navigationFrame(0, -1, "doc-root", "http://127.0.0.1:8765/"),
+      navigationFrame(7, 0, "doc-child", "http://localhost:8766/child.html"),
+    ]),
+    {
+      cdpFrameId: "oopif-frame",
+      frameId: 7,
+      documentId: "doc-child",
+      url: "http://localhost:8766/child.html",
+    },
+  );
+  assert.equal(
+    matchUniqueNavigationFrameRoute(frame, [
+      navigationFrame(7, 0, "doc-a", "http://localhost:8766/child.html"),
+      navigationFrame(8, 0, "doc-b", "http://localhost:8766/child.html"),
+    ]),
+    undefined,
+  );
+});
+
 test("debugger frame routing excludes stale lifecycle entries and mismatched roots", () => {
   const cdpTree: CdpFrameTreeNode = {
     frame: { id: "cdp-root", url: "https://host.test/" },
@@ -116,6 +141,19 @@ test("debugger frame routing binds the selected document and fails closed", () =
   assert.throws(
     () => requireDebuggerFrameRoute(routes, 8),
     /TRUSTED_INPUT_FRAME_UNSUPPORTED/,
+  );
+});
+
+test("same-process frame input uses the iframe content-box origin", () => {
+  assert.deepEqual(
+    frameOwnerContentOrigin({
+      content: [101, 52, 501, 52, 501, 352, 101, 352],
+    }),
+    { x: 101, y: 52 },
+  );
+  assert.throws(
+    () => frameOwnerContentOrigin({ content: [0, 1] }),
+    /invalid iframe content quad/,
   );
 });
 

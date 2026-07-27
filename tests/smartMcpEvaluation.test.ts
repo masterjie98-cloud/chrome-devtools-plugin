@@ -25,13 +25,14 @@ const target = {
   revision: 4,
 };
 
-test("[eval 01] smart profile exposes ten task-oriented tools", () => {
+test("[eval 01] smart profile exposes eleven task-oriented tools", () => {
   const tools = runtimeToolsForProfile("smart");
-  assert.equal(tools.length, 10);
+  assert.equal(tools.length, 11);
   assert.deepEqual(
-    tools.slice(0, 5).map((tool) => tool.definition.name),
+    tools.slice(0, 6).map((tool) => tool.definition.name),
     [
       MCP_TOOL_NAMES.BROWSER_STATUS,
+      MCP_TOOL_NAMES.BROWSER_WORKFLOW,
       MCP_TOOL_NAMES.BROWSER_OBSERVE,
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
@@ -98,7 +99,32 @@ test("[eval 04] browser_observe returns live actionable target refs", async () =
   });
 });
 
-test("[eval 04c] browser_observe returns bounded child-frame observations without actionable refs", async () => {
+test("[eval 04a] browser_observe projects only requested model-visible fields", async () => {
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_OBSERVE,
+    {
+      mode: "interactive",
+      limit: 10,
+      fields: ["name", "value"],
+    },
+    createBridge(),
+    { sessionId: "eval-observe-projection" },
+  );
+  const node = (
+    result as {
+      snapshot: {
+        nodes: Array<Record<string, unknown>>;
+      };
+    }
+  ).snapshot.nodes[0];
+  assert.deepEqual(Object.keys(node ?? {}).sort(), [
+    "name",
+    "targetRef",
+    "value",
+  ]);
+});
+
+test("[eval 04c] browser_observe returns bounded actionable child-frame references", async () => {
   const childTarget = {
     ...target,
     url: "https://child.fixture.test/frame",
@@ -139,14 +165,21 @@ test("[eval 04c] browser_observe returns bounded child-frame observations withou
   const frames = (result as {
     frames: Array<{
       actionable: boolean;
+      frameRef: string;
+      documentId: string;
       target: { frameId: number };
       snapshot: { nodes: Array<{ targetRef?: string }> };
     }>;
   }).frames;
   assert.equal(frames.length, 1);
   assert.equal(frames[0]?.target.frameId, 7);
-  assert.equal(frames[0]?.actionable, false);
-  assert.equal(frames[0]?.snapshot.nodes[0]?.targetRef, undefined);
+  assert.equal(frames[0]?.actionable, true);
+  assert.match(frames[0]?.frameRef ?? "", /^fr1_[a-f0-9]{8}$/);
+  assert.equal(frames[0]?.documentId, "child-document");
+  assert.match(
+    frames[0]?.snapshot.nodes[0]?.targetRef ?? "",
+    /^sr1_[a-f0-9]{8}_s1$/,
+  );
   assert.equal(read(result, "complete"), true);
 });
 
@@ -230,6 +263,10 @@ test("[eval 05] browser_act resolves an observed targetRef before execution", as
     (click?.args as { selector?: string } | undefined)?.selector,
     "#save",
   );
+  assert.equal(
+    (click?.args as { documentId?: string } | undefined)?.documentId,
+    target.documentId,
+  );
 });
 
 test("[eval 05b] browser_act resolves both drag target refs before execution", async () => {
@@ -272,6 +309,99 @@ test("[eval 05b] browser_act resolves both drag target refs before execution", a
   assert.deepEqual(drag?.args, {
     sourceSelector: "#name",
     targetSelector: "#save",
+    frameId: 0,
+    documentId: "fixture-document",
+  });
+});
+
+test("[eval 05c] frameRef and documentId execute directly in a child frame", async () => {
+  const sessionId = "eval-child-frame-act";
+  const childTarget = {
+    ...target,
+    url: "https://child.fixture.test/frame",
+    title: "Child fixture",
+    frameId: 7,
+    documentId: "child-document",
+  };
+  browserStateHub.setCurrentTab(target, sessionId);
+  const calls: AnyToolCall[] = [];
+  const bridge = {
+    connectedPluginClients: () => 1,
+    callBrowserTool: async (call: AnyToolCall) => {
+      calls.push(call);
+      if (call.toolName === TOOL_NAMES.DOM_GET_PAGE_INFO) {
+        if (call.args.frameId === 7) {
+          return pageSnapshot(childTarget);
+        }
+        return {
+          version: "multi-frame-page-snapshot-v1",
+          tabId: target.tabId,
+          selectedFrameId: target.frameId,
+          frameScope: "auto",
+          capturedAt: "2026-07-17T00:00:00.020Z",
+          complete: true,
+          omittedFrameCount: 0,
+          frames: [
+            {
+              frame: frameMetadata(target, true),
+              pageSnapshot: pageSnapshot(),
+            },
+            {
+              frame: frameMetadata(childTarget, false),
+              pageSnapshot: pageSnapshot(childTarget),
+            },
+          ],
+          unavailableFrames: [],
+        };
+      }
+      if (call.toolName === TOOL_NAMES.BROWSER_CLICK) {
+        return { selector: "#save", matched: true, action: "click" };
+      }
+      throw new Error(`Unexpected internal tool ${call.toolName}`);
+    },
+  } as unknown as PluginWebSocketServer;
+  const observed = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_OBSERVE,
+    { frameScope: "auto" },
+    bridge,
+    { sessionId },
+  ) as {
+    frames: Array<{
+      frameRef: string;
+      documentId: string;
+      snapshot: { nodes: Array<{ name: string; targetRef: string }> };
+    }>;
+  };
+  const child = observed.frames[0];
+  const saveRef = child?.snapshot.nodes.find(
+    (node) => node.name === "Save",
+  )?.targetRef;
+  assert.ok(child);
+  assert.ok(saveRef);
+
+  await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_ACT,
+    {
+      actions: [
+        {
+          id: "child-save",
+          type: "click",
+          frameRef: child.frameRef,
+          documentId: child.documentId,
+          ref: saveRef,
+        },
+      ],
+    },
+    bridge,
+    { sessionId },
+  );
+  const click = calls.find((call) => call.toolName === TOOL_NAMES.BROWSER_CLICK);
+  assert.deepEqual(click?.args, {
+    selector: "#save",
+    button: undefined,
+    doubleClick: undefined,
+    frameId: 7,
+    documentId: "child-document",
   });
 });
 
@@ -284,6 +414,12 @@ test("[eval 06] browser_verify evaluates multiple outcomes from one live read", 
         { id: "url", type: "url_contains", value: "/form" },
         { id: "text", type: "text_contains", value: "Save" },
         { id: "target", type: "target_present", selector: "#save" },
+        {
+          id: "value",
+          type: "target_state",
+          selector: "#name",
+          value: "Ada",
+        },
       ],
     },
     createBridge(calls),
@@ -292,7 +428,7 @@ test("[eval 06] browser_verify evaluates multiple outcomes from one live read", 
   assert.equal(read(result, "passed"), true);
   assert.equal(
     (result as { checks: Array<unknown> }).checks.length,
-    3,
+    4,
   );
   const pageRead = calls.find(
     (call) => call.toolName === TOOL_NAMES.DOM_GET_PAGE_INFO,
@@ -365,6 +501,50 @@ test("[eval 09] high-level tools keep explicit approval modes", () => {
     getToolPolicy(MCP_TOOL_NAMES.BROWSER_ACT).approvalMode,
     "task_grant",
   );
+  assert.equal(
+    getToolPolicy(MCP_TOOL_NAMES.BROWSER_WORKFLOW).approvalMode,
+    "task_grant",
+  );
+});
+
+test("[eval 09b] browser_workflow returns action, verification, and correlated evidence", async () => {
+  const sessionId = "eval-workflow";
+  browserStateHub.setCurrentTab(target, sessionId);
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+    {
+      observation: {
+        mode: "interactive",
+        fields: ["role", "name", "value"],
+      },
+      actions: [
+        { id: "name", type: "fill", selector: "#name", value: "Ada" },
+      ],
+      checks: [
+        {
+          id: "name-value",
+          type: "target_state",
+          selector: "#name",
+          value: "Ada",
+        },
+      ],
+      evidence: { dom: true, url: true, network: true, console: true },
+    },
+    createBridge(),
+    { sessionId },
+  );
+  assert.equal(read(result, "version"), "browser-workflow-v1");
+  assert.equal(read(result, "status"), "completed");
+  const workflow = result as {
+    actions: { completed: number; results: Array<Record<string, unknown>> };
+    verification: { passed: boolean };
+    evidence: { network: unknown; console: unknown };
+  };
+  assert.equal(workflow.actions.completed, 1);
+  assert.equal(workflow.verification.passed, true);
+  assert.equal("postState" in (workflow.actions.results[0] ?? {}), true);
+  assert.ok(workflow.evidence.network);
+  assert.ok(workflow.evidence.console);
 });
 
 test("[eval 10] audit output accepts bounded execution timing metrics", () => {
@@ -469,6 +649,22 @@ function createBridge(
           },
         };
       }
+      if (call.toolName === TOOL_NAMES.DEBUGGER_NETWORK_START) {
+        return {
+          attached: true,
+          networkEnabled: true,
+          tabId: target.tabId,
+          requestCount: 0,
+        };
+      }
+      if (call.toolName === TOOL_NAMES.DEBUGGER_NETWORK_STOP) {
+        return {
+          attached: true,
+          networkEnabled: false,
+          tabId: target.tabId,
+          requestCount: 1,
+        };
+      }
       if (call.toolName === TOOL_NAMES.BROWSER_CONSOLE_MESSAGES) {
         return {
           attached: true,
@@ -504,6 +700,7 @@ function pageSnapshot(snapshotTarget = target) {
           name: "Name",
           selector: "#name",
           tagName: "input",
+          value: "Ada",
           bounds: { x: 20, y: 20, width: 200, height: 32 },
         },
         {

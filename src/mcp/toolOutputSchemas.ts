@@ -151,6 +151,7 @@ const semanticSnapshotSchema = outputObject({
     capturedAt: outputString,
   }),
   target: nullableUnknown,
+  frameRef: outputString.nullable().optional(),
   freshness: outputObject({
     source: z.literal("live-browser"),
     capturedAt: outputString,
@@ -176,7 +177,9 @@ const semanticSnapshotSchema = outputObject({
         target: nullableUnknown,
         snapshot: z.unknown(),
         observation: z.unknown(),
-        actionable: z.literal(false),
+        frameRef: outputString.nullable(),
+        documentId: outputString.nullable(),
+        actionable: z.boolean(),
       }),
     )
     .max(11)
@@ -226,9 +229,29 @@ const domQuerySchema = outputObject({
   }
 });
 
+const screenshotComparisonSchema = z
+  .object({
+    baselineAvailable: z.boolean(),
+    changed: z.boolean().nullable(),
+    changedPixelRatio: z.number().min(0).max(1).optional(),
+    threshold: z.number().int().min(0).max(255),
+    baselineCapturedAt: outputString.optional(),
+    changedBounds: z
+      .object({
+        x: z.number().nonnegative(),
+        y: z.number().nonnegative(),
+        width: z.number().positive(),
+        height: z.number().positive(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
 const screenshotSchema = outputObject({
   capturedAt: outputString,
   mimeType: z.enum(["image/png", "image/jpeg"]),
+  comparison: screenshotComparisonSchema.optional(),
 });
 
 const tabListSchema = outputObject({ tabs: outputArray });
@@ -399,9 +422,26 @@ export const MCP_TOOL_OUTPUT_SCHEMAS = {
     browserConnected: z.boolean(),
     pluginConnected: z.boolean(),
     pageContextSynced: z.boolean(),
+    compatibility: z.unknown(),
     activeTab: nullableUnknown,
     currentConversationId: outputString,
     revision: z.number().int().nonnegative(),
+  }),
+  [MCP_TOOL_NAMES.BROWSER_WORKFLOW]: outputObject({
+    version: z.literal("browser-workflow-v1"),
+    status: z.enum([
+      "completed",
+      "action_stopped",
+      "verification_failed",
+    ]),
+    startedAt: outputString,
+    completedAt: outputString,
+    before: z.unknown(),
+    actions: z.unknown(),
+    verification: nullableUnknown,
+    after: z.unknown(),
+    evidence: z.unknown(),
+    timing: z.unknown(),
   }),
   [MCP_TOOL_NAMES.BROWSER_OBSERVE]: semanticSnapshotSchema,
   [MCP_TOOL_NAMES.BROWSER_ACT]: outputObject({

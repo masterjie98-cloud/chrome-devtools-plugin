@@ -35,7 +35,7 @@ import type {
 export const MCP_WS_URL = "ws://127.0.0.1:17321";
 // Bump whenever an extension-visible tool/resource schema changes so a newly
 // loaded extension cannot silently keep using an older daemon process.
-export const WS_PROTOCOL_VERSION = 6;
+export const WS_PROTOCOL_VERSION = 7;
 export const WS_HEARTBEAT_INTERVAL_MS = 15_000;
 
 export const WS_COMMANDS = {
@@ -74,6 +74,8 @@ export type WsClientRole = "plugin" | "observer" | "browser" | "ui" | "mcp";
 
 export interface ClientHelloPayload {
   protocolVersion: number;
+  buildId: string;
+  schemaHash: string;
   clientRole: WsClientRole;
   clientName?: string;
   installationId?: string;
@@ -101,6 +103,8 @@ export interface ProtocolLimits {
 
 export interface ServerWelcomePayload {
   protocolVersion: number;
+  buildId: string;
+  schemaHash: string;
   connectionId: string;
   assignedRole: WsClientRole;
   sessionId?: string;
@@ -785,6 +789,13 @@ function sanitizeSemanticSnapshotNode(
       ? sanitizeText(node.description, 300)
       : undefined,
     href: node.href ? sanitizeUrl(node.href) : undefined,
+    value:
+      node.value !== undefined
+        ? sanitizeText(node.value, SANITIZE_LIMITS.elementText)
+        : undefined,
+    selectedValues: node.selectedValues
+      ?.slice(0, 50)
+      .map((value) => sanitizeText(value, SANITIZE_LIMITS.elementText)),
     disabled: node.disabled,
     checked: node.checked,
     pressed: node.pressed,
@@ -838,6 +849,30 @@ export function sanitizeScreenshotForMcp(
     height: screenshot.height,
     filename: screenshot.filename,
     savedAs: screenshot.savedAs,
+    comparison: screenshot.comparison
+      ? {
+          baselineAvailable: Boolean(
+            screenshot.comparison.baselineAvailable,
+          ),
+          changed:
+            screenshot.comparison.changed === null
+              ? null
+              : Boolean(screenshot.comparison.changed),
+          changedPixelRatio:
+            screenshot.comparison.changedPixelRatio !== undefined
+              ? Math.max(
+                  0,
+                  Math.min(1, screenshot.comparison.changedPixelRatio),
+                )
+              : undefined,
+          threshold: Math.max(
+            0,
+            Math.min(255, Math.round(screenshot.comparison.threshold)),
+          ),
+          baselineCapturedAt: screenshot.comparison.baselineCapturedAt,
+          changedBounds: screenshot.comparison.changedBounds,
+        }
+      : undefined,
   };
 }
 

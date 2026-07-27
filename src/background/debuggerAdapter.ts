@@ -77,7 +77,9 @@ import {
 } from "../shared/trustedKeyboard";
 import {
   createOopifAutoAttachParams,
+  frameOwnerContentOrigin,
   mapDebuggerFrameTree,
+  matchUniqueNavigationFrameRoute,
   requireDebuggerFrameRoute,
   type CdpFrameTreeNode,
   type DebuggerFrameRoute,
@@ -250,6 +252,7 @@ export type TrustedInputTargetAddress = Pick<
 interface TrustedInputSession {
   tabId: number;
   target: DebuggerTarget;
+  coordinateOffset?: BrowserCoordinateInput;
 }
 
 interface ScreenshotClip {
@@ -264,6 +267,7 @@ let debuggerListenersRegistered = false;
 const proxyRules = new Map<string, DebuggerProxyRule>();
 const childDebuggerSessions = new Map<string, ChildDebuggerSession>();
 const childDebuggerRoutes = new Map<number, RoutedChildDebuggerSession>();
+const debuggerFrameRoutes = new Map<number, DebuggerFrameRoute>();
 let childRouteRefreshGeneration = 0;
 let proxyHits: DebuggerProxyHit[] = [];
 let proxyEnabled = false;
@@ -306,7 +310,15 @@ export async function captureDebuggerScreenshot(
   input: ScreenshotCaptureInput & { clip?: ScreenshotClip } = {},
 ): Promise<ScreenshotCaptureResult> {
   const session = await ensureDebuggerSession();
-  await debuggerSendCommand(session.target, "Page.enable", {}).catch(
+  const captureSession =
+    input.frameId !== undefined && input.frameId !== 0
+      ? await ensureTrustedInputSession({
+          tabId: session.tabId,
+          frameId: input.frameId,
+          documentId: input.documentId,
+        })
+      : { tabId: session.tabId, target: session.target };
+  await debuggerSendCommand(captureSession.target, "Page.enable", {}).catch(
     () => undefined,
   );
 
@@ -324,7 +336,11 @@ export async function captureDebuggerScreenshot(
   let height: number | undefined;
 
   if (input.clip) {
-    const clip = normalizeScreenshotClip(input.clip);
+    const clip = normalizeScreenshotClip({
+      ...input.clip,
+      x: input.clip.x + (captureSession.coordinateOffset?.x ?? 0),
+      y: input.clip.y + (captureSession.coordinateOffset?.y ?? 0),
+    });
     params.clip = { ...clip, scale: 1 };
     params.captureBeyondViewport = true;
     width = Math.round(clip.width);
@@ -333,7 +349,7 @@ export async function captureDebuggerScreenshot(
     const metrics = await debuggerSendCommand<
       Record<string, never>,
       PageLayoutMetrics
-    >(session.target, "Page.getLayoutMetrics", {});
+    >(captureSession.target, "Page.getLayoutMetrics", {});
     const contentSize = metrics.cssContentSize ?? metrics.contentSize;
     const clip = normalizeScreenshotClip({
       x: contentSize.x ?? 0,
@@ -350,7 +366,7 @@ export async function captureDebuggerScreenshot(
   const result = await debuggerSendCommand<
     Record<string, unknown>,
     { data: string }
-  >(session.target, "Page.captureScreenshot", params);
+  >(captureSession.target, "Page.captureScreenshot", params);
   const mimeType = format === "jpeg" ? "image/jpeg" : "image/png";
 
   return {
@@ -499,12 +515,25 @@ async function ensureTrustedInputSession(
 
   await ensureOopifAutoAttach(session);
   await refreshChildDebuggerRoutes(session);
+  const oopifRoute = childDebuggerRoutes.get(expectedTarget.frameId);
+  if (oopifRoute) {
+    const route = requireDebuggerFrameRoute(
+      childDebuggerRoutes,
+      expectedTarget.frameId,
+      expectedTarget.documentId,
+    );
+    return { tabId: session.tabId, target: route.target };
+  }
   const route = requireDebuggerFrameRoute(
-    childDebuggerRoutes,
+    debuggerFrameRoutes,
     expectedTarget.frameId,
     expectedTarget.documentId,
   );
-  return { tabId: session.tabId, target: route.target };
+  return {
+    tabId: session.tabId,
+    target: session.target,
+    coordinateOffset: await resolveFrameContentOrigin(session.target, route),
+  };
 }
 
 async function dispatchTrustedMouseEvents(
@@ -513,10 +542,17 @@ async function dispatchTrustedMouseEvents(
   paceMoves = false,
 ): Promise<void> {
   for (const event of events) {
+    const translated = session.coordinateOffset
+      ? {
+          ...event,
+          x: event.x + session.coordinateOffset.x,
+          y: event.y + session.coordinateOffset.y,
+        }
+      : event;
     await debuggerSendCommand(
       session.target,
       "Input.dispatchMouseEvent",
-      event,
+      translated,
     );
     if (paceMoves && event.type === "mouseMoved") {
       await delayMs(16);
@@ -1310,6 +1346,7 @@ function clearChildDebuggerSessions(): void {
   childRouteRefreshGeneration += 1;
   childDebuggerSessions.clear();
   childDebuggerRoutes.clear();
+  debuggerFrameRoutes.clear();
 }
 
 async function ensureOopifAutoAttach(session: NetworkSession): Promise<void> {
@@ -1355,7 +1392,13 @@ async function refreshChildDebuggerRoutes(
     navigationFrames,
   );
   const resolvedRoutes = new Map<number, RoutedChildDebuggerSession>();
+  const resolvedFrameRoutes = new Map<number, DebuggerFrameRoute>();
   const ambiguousFrameIds = new Set<number>();
+  for (const route of frameRoutes.values()) {
+    if (route.frameId !== 0) {
+      resolvedFrameRoutes.set(route.frameId, route);
+    }
+  }
 
   await Promise.all(
     [...childDebuggerSessions.entries()].map(async ([sessionId, child]) => {
@@ -1367,7 +1410,12 @@ async function refreshChildDebuggerRoutes(
       if (!cdpFrameId) {
         return;
       }
-      const route = frameRoutes.get(cdpFrameId);
+      const route =
+        frameRoutes.get(cdpFrameId) ??
+        matchUniqueNavigationFrameRoute(
+          childFrameTree.frameTree.frame,
+          navigationFrames,
+        );
       if (!route || route.frameId === 0 || ambiguousFrameIds.has(route.frameId)) {
         return;
       }
@@ -1388,11 +1436,31 @@ async function refreshChildDebuggerRoutes(
     return;
   }
   childDebuggerRoutes.clear();
+  debuggerFrameRoutes.clear();
+  for (const [frameId, route] of resolvedFrameRoutes) {
+    debuggerFrameRoutes.set(frameId, route);
+  }
   for (const [frameId, route] of resolvedRoutes) {
     if (!ambiguousFrameIds.has(frameId)) {
       childDebuggerRoutes.set(frameId, route);
     }
   }
+}
+
+async function resolveFrameContentOrigin(
+  target: DebuggerTarget,
+  route: DebuggerFrameRoute,
+): Promise<BrowserCoordinateInput> {
+  await debuggerSendCommand(target, "DOM.enable", {}).catch(() => undefined);
+  const owner = await debuggerSendCommand<
+    { frameId: string },
+    DomGetFrameOwnerResult
+  >(target, "DOM.getFrameOwner", { frameId: route.cdpFrameId });
+  const box = await debuggerSendCommand<
+    { backendNodeId: number },
+    DomGetBoxModelResult
+  >(target, "DOM.getBoxModel", { backendNodeId: owner.backendNodeId });
+  return frameOwnerContentOrigin(box.model);
 }
 
 function handleDetachedFromTarget(event: TargetDetachedFromTargetEvent): void {
@@ -3089,6 +3157,16 @@ interface CdpTargetInfo {
 
 interface PageFrameTreeResult {
   frameTree: CdpFrameTreeNode;
+}
+
+interface DomGetFrameOwnerResult {
+  backendNodeId: number;
+}
+
+interface DomGetBoxModelResult {
+  model: {
+    content: number[];
+  };
 }
 
 interface TargetDetachedFromTargetEvent {

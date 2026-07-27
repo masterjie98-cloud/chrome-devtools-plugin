@@ -2,6 +2,7 @@ import { SUPPORTED_COMPUTED_STYLE_PROPERTIES } from "./dom";
 
 export const MCP_TOOL_NAMES = {
   BROWSER_STATUS: "browser_status",
+  BROWSER_WORKFLOW: "browser_workflow",
   BROWSER_OBSERVE: "browser_observe",
   BROWSER_ACT: "browser_act",
   BROWSER_VERIFY: "browser_verify",
@@ -168,6 +169,192 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     parameters: NO_ARG_PARAMETERS,
   },
   {
+    name: MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+    title: "Run browser workflow with evidence",
+    description:
+      "Observe the current page, execute a bounded action stage, verify outcomes, and return correlated DOM, URL, Network, and Console evidence in one model-visible call. Mutations retain the same approval and stale-document barriers as browser_act.",
+    parameters: {
+      type: "object",
+      properties: {
+        observation: {
+          type: "object",
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["interactive", "outline", "full"],
+            },
+            limit: { type: "number", minimum: 1, maximum: 100 },
+            sourceLimit: { type: "number", minimum: 100, maximum: 10000 },
+            frameScope: {
+              type: "string",
+              enum: ["selected", "auto", "all-accessible"],
+            },
+            maxFrames: { type: "number", minimum: 1, maximum: 12 },
+            fields: {
+              type: "array",
+              minItems: 1,
+              maxItems: 16,
+              uniqueItems: true,
+              items: {
+                type: "string",
+                enum: [
+                  "role",
+                  "name",
+                  "description",
+                  "href",
+                  "value",
+                  "selectedValues",
+                  "disabled",
+                  "checked",
+                  "pressed",
+                  "expanded",
+                  "selected",
+                  "required",
+                  "readOnly",
+                  "focused",
+                  "level",
+                ],
+              },
+            },
+          },
+          additionalProperties: false,
+        },
+        actions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              type: {
+                type: "string",
+                enum: [
+                  "fill",
+                  "select",
+                  "click",
+                  "hover",
+                  "drag",
+                  "scroll",
+                  "resize",
+                  "press_key",
+                  "wait",
+                ],
+              },
+              frameRef: {
+                type: "string",
+                pattern: "^fr1_[a-f0-9]{8}$",
+              },
+              documentId: { type: "string" },
+              ref: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
+              selector: { type: "string" },
+              sourceRef: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
+              sourceSelector: { type: "string" },
+              targetRef: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
+              targetSelector: { type: "string" },
+              value: {
+                oneOf: [
+                  { type: "string" },
+                  { type: "boolean" },
+                  { type: "array", items: { type: "string" } },
+                ],
+              },
+              values: { type: "array", items: { type: "string" } },
+              button: {
+                type: "string",
+                enum: ["left", "right", "middle"],
+              },
+              doubleClick: { type: "boolean" },
+              key: { type: "string" },
+              time: { type: "number" },
+              timeoutMs: { type: "number" },
+              deltaX: { type: "number" },
+              deltaY: { type: "number" },
+              x: { type: "number" },
+              y: { type: "number" },
+              width: { type: "number", minimum: 320, maximum: 10000 },
+              height: { type: "number", minimum: 240, maximum: 10000 },
+              dependsOn: { type: "array", items: { type: "string" } },
+              expectedOutcome: { type: "string" },
+              barrier: { type: "boolean" },
+            },
+            required: ["id", "type"],
+            additionalProperties: false,
+          },
+        },
+        checks: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              type: {
+                type: "string",
+                enum: [
+                  "url_contains",
+                  "title_contains",
+                  "text_contains",
+                  "target_present",
+                  "target_state",
+                ],
+              },
+              frameRef: {
+                type: "string",
+                pattern: "^fr1_[a-f0-9]{8}$",
+              },
+              documentId: { type: "string" },
+              value: { type: "string" },
+              selectedValues: {
+                type: "array",
+                maxItems: 50,
+                uniqueItems: true,
+                items: { type: "string" },
+              },
+              ref: {
+                type: "string",
+                pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+              },
+              selector: { type: "string" },
+              nameContains: { type: "string" },
+              disabled: { type: "boolean" },
+              checked: { type: "boolean" },
+              selected: { type: "boolean" },
+              expanded: { type: "boolean" },
+            },
+            required: ["id", "type"],
+            additionalProperties: false,
+          },
+        },
+        evidence: {
+          type: "object",
+          properties: {
+            dom: { type: "boolean" },
+            url: { type: "boolean" },
+            network: { type: "boolean" },
+            console: { type: "boolean" },
+            networkLimit: { type: "number", minimum: 1, maximum: 100 },
+            consoleLimit: { type: "number", minimum: 1, maximum: 200 },
+          },
+          additionalProperties: false,
+        },
+        stopOnFailure: { type: "boolean" },
+        decisionBarrier: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: MCP_TOOL_NAMES.BROWSER_OBSERVE,
     title: "Observe current page",
     description:
@@ -194,6 +381,34 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
           minimum: 1,
           maximum: 12,
           description: "Maximum accessible frames included in one observation.",
+        },
+        fields: {
+          type: "array",
+          minItems: 1,
+          maxItems: 16,
+          uniqueItems: true,
+          items: {
+            type: "string",
+            enum: [
+              "role",
+              "name",
+              "description",
+              "href",
+              "value",
+              "selectedValues",
+              "disabled",
+              "checked",
+              "pressed",
+              "expanded",
+              "selected",
+              "required",
+              "readOnly",
+              "focused",
+              "level",
+            ],
+          },
+          description:
+            "Optional model-visible semantic field projection. targetRef remains included for actionable selected-frame nodes.",
         },
       },
       additionalProperties: false,
@@ -313,6 +528,12 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
                 ],
               },
               value: { type: "string" },
+              selectedValues: {
+                type: "array",
+                maxItems: 50,
+                uniqueItems: true,
+                items: { type: "string" },
+              },
               ref: {
                 type: "string",
                 pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
@@ -585,6 +806,20 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
           type: "string",
           description: "Alias for selector when no target is provided.",
         },
+        ref: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description: "Observed semantic targetRef for an element screenshot.",
+        },
+        frameRef: {
+          type: "string",
+          pattern: "^fr1_[a-f0-9]{8}$",
+          description: "Frame reference returned by browser_observe.",
+        },
+        documentId: {
+          type: "string",
+          description: "Exact documentId paired with frameRef.",
+        },
         fullPage: {
           type: "boolean",
           description: "Capture the full scrollable page.",
@@ -592,6 +827,24 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         quality: {
           type: "number",
           description: "JPEG quality from 0 to 100.",
+        },
+        diffAgainst: {
+          type: "string",
+          enum: ["previous"],
+          description:
+            "Compare with the previous compatible screenshot baseline.",
+        },
+        returnImage: {
+          type: "string",
+          enum: ["always", "changed", "never"],
+          description:
+            "Control whether image bytes are returned after comparison.",
+        },
+        diffThreshold: {
+          type: "number",
+          minimum: 0,
+          maximum: 255,
+          description: "Per-channel pixel difference threshold. Defaults to 16.",
         },
       },
       additionalProperties: false,
@@ -1928,6 +2181,7 @@ const MCP_TOOL_NAME_ALIASES: Record<string, McpToolName> = {
 
 const MCP_EXPOSED_TOOL_ORDER: readonly McpToolName[] = [
   MCP_TOOL_NAMES.BROWSER_STATUS,
+  MCP_TOOL_NAMES.BROWSER_WORKFLOW,
   MCP_TOOL_NAMES.BROWSER_OBSERVE,
   MCP_TOOL_NAMES.BROWSER_ACT,
   MCP_TOOL_NAMES.BROWSER_VERIFY,

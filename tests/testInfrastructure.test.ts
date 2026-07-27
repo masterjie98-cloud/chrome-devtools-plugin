@@ -4,6 +4,10 @@ import { dirname } from "node:path";
 import test from "node:test";
 import { WS_COMMANDS, WS_PROTOCOL_VERSION } from "../src/shared/wsProtocol";
 import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+} from "../src/shared/runtimeIdentity";
+import {
   clientHelloMessage,
   createDeterministicIdFactory,
   TEST_BRIDGE_TOKEN,
@@ -12,7 +16,7 @@ import {
 import { createTestDataDirectory } from "./helpers/tempDataDir";
 
 test("protocol fixtures centralize token, version, timestamp, and deterministic IDs", () => {
-  assert.equal(WS_PROTOCOL_VERSION, 6);
+  assert.equal(WS_PROTOCOL_VERSION, 7);
   const createId = createDeterministicIdFactory("message");
   assert.equal(createId(), "message-1");
   assert.equal(createId(), "message-2");
@@ -24,6 +28,8 @@ test("protocol fixtures centralize token, version, timestamp, and deterministic 
   assert.equal(hello.sentAt, TEST_PROTOCOL_TIME);
   assert.deepEqual(hello.payload, {
     protocolVersion: WS_PROTOCOL_VERSION,
+    buildId: RUNTIME_BUILD_ID,
+    schemaHash: RUNTIME_SCHEMA_HASH,
     clientRole: "mcp",
     clientName: "codex-stdio-adapter",
     sessionId: "profile-fixture",

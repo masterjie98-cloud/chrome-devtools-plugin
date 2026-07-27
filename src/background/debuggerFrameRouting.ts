@@ -21,6 +21,10 @@ export interface DebuggerFrameRoute {
   url: string;
 }
 
+export interface CdpBoxModel {
+  content: number[];
+}
+
 const MAX_ROUTABLE_FRAME_COUNT = 512;
 const MAX_ROUTABLE_FRAME_DEPTH = 64;
 
@@ -72,6 +76,23 @@ export function mapDebuggerFrameTree(
   return routes;
 }
 
+export function matchUniqueNavigationFrameRoute(
+  cdpFrame: CdpFrameTreeNode["frame"],
+  navigationFrames: readonly NavigationFrameNode[],
+): DebuggerFrameRoute | undefined {
+  const url = normalizeFrameUrl(cdpFrame.url);
+  const matches = navigationFrames.filter(
+    (frame) =>
+      frame.frameId !== 0 &&
+      (frame.documentLifecycle === undefined ||
+        frame.documentLifecycle === "active") &&
+      normalizeFrameUrl(frame.url) === url,
+  );
+  return matches.length === 1
+    ? toRoute({ frame: cdpFrame }, matches[0] as NavigationFrameNode)
+    : undefined;
+}
+
 export function requireDebuggerFrameRoute<T extends DebuggerFrameRoute>(
   routes: ReadonlyMap<number, T>,
   frameId: number,
@@ -80,7 +101,7 @@ export function requireDebuggerFrameRoute<T extends DebuggerFrameRoute>(
   const route = routes.get(frameId);
   if (!route) {
     throw new Error(
-      "TRUSTED_INPUT_FRAME_UNSUPPORTED: the selected child frame has no unique Chrome 125+ OOPIF debugger session. Same-process frames, duplicate sibling URLs, and unavailable flat sessions fail closed; select frame 0 or choose a uniquely routable OOPIF.",
+      "TRUSTED_INPUT_FRAME_UNSUPPORTED: the selected child frame has no unique live CDP route. Duplicate sibling URLs and stale or unavailable frame trees fail closed; observe the page again or select frame 0.",
     );
   }
   if (documentId && route.documentId !== documentId) {
@@ -89,6 +110,35 @@ export function requireDebuggerFrameRoute<T extends DebuggerFrameRoute>(
     );
   }
   return route;
+}
+
+export function frameOwnerContentOrigin(
+  model: CdpBoxModel,
+): { x: number; y: number } {
+  if (
+    model.content.length !== 8 ||
+    model.content.some((value) => !Number.isFinite(value))
+  ) {
+    throw new Error(
+      "TRUSTED_INPUT_FRAME_UNSUPPORTED: CDP returned an invalid iframe content quad.",
+    );
+  }
+  const xs = [
+    model.content[0] ?? 0,
+    model.content[2] ?? 0,
+    model.content[4] ?? 0,
+    model.content[6] ?? 0,
+  ];
+  const ys = [
+    model.content[1] ?? 0,
+    model.content[3] ?? 0,
+    model.content[5] ?? 0,
+    model.content[7] ?? 0,
+  ];
+  return {
+    x: Math.min(...xs),
+    y: Math.min(...ys),
+  };
 }
 
 function mapChildren(

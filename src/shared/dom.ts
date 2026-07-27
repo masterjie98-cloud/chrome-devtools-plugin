@@ -14,6 +14,9 @@ export interface PageSnapshotInput extends SemanticSnapshotInput {
   frameScope?: "selected" | "auto" | "all-accessible";
   /** Bounded number of frames included by a multi-frame observation. */
   maxFrames?: number;
+  /** Internal direct-frame routing. Child frames require an exact documentId. */
+  frameId?: number;
+  documentId?: string;
 }
 
 export interface DomMutationDelta {
@@ -302,6 +305,25 @@ export interface ScreenshotCaptureInput {
   quality?: number;
   filename?: string;
   saveToDownloads?: boolean;
+  frameId?: number;
+  documentId?: string;
+  diffAgainst?: "previous";
+  returnImage?: "always" | "changed" | "never";
+  diffThreshold?: number;
+}
+
+export interface ScreenshotComparisonResult {
+  baselineAvailable: boolean;
+  changed: boolean | null;
+  changedPixelRatio?: number;
+  threshold: number;
+  baselineCapturedAt?: string;
+  changedBounds?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 export interface ScreenshotCaptureResult {
@@ -316,6 +338,7 @@ export interface ScreenshotCaptureResult {
   height?: number;
   filename?: string;
   savedAs?: string;
+  comparison?: ScreenshotComparisonResult;
 }
 
 export interface BrowserTargetTab {
@@ -392,6 +415,8 @@ export interface BrowserElementTargetInput {
   selector?: string;
   target?: string;
   element?: string;
+  frameId?: number;
+  documentId?: string;
 }
 
 export interface BrowserElementActionResult {
@@ -423,9 +448,7 @@ export interface BrowserTypeInput extends BrowserElementTargetInput {
   decisionBarrier?: boolean;
 }
 
-export interface BrowserPressKeyInput {
-  selector?: string;
-  target?: string;
+export interface BrowserPressKeyInput extends BrowserElementTargetInput {
   key: string;
   decisionBarrier?: boolean;
 }
@@ -474,6 +497,8 @@ export interface BrowserFormFieldInput extends BrowserElementTargetInput {
 export interface BrowserFillFormInput {
   fields: BrowserFormFieldInput[];
   decisionBarrier?: boolean;
+  frameId?: number;
+  documentId?: string;
 }
 
 export interface BrowserFillFormFieldResult extends BrowserElementActionResult {
@@ -491,6 +516,8 @@ export interface BrowserDragInput {
   sourceSelector?: string;
   target?: string;
   targetSelector?: string;
+  frameId?: number;
+  documentId?: string;
 }
 
 export interface BrowserDragResult {
@@ -572,6 +599,8 @@ export interface BrowserWaitForInput {
   textGone?: string;
   selector?: string;
   timeoutMs?: number;
+  frameId?: number;
+  documentId?: string;
 }
 
 export interface BrowserWaitForResult {

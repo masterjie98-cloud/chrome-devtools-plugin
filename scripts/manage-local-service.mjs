@@ -70,7 +70,13 @@ async function main() {
     await mkdir(logDir, { recursive: true });
     await writeFile(plistPath, plist, { encoding: "utf8", mode: 0o600 });
     runLaunchctl(["bootout", `gui/${process.getuid()}/${label}`], true);
-    runLaunchctl(["bootstrap", `gui/${process.getuid()}`, plistPath]);
+    await runLaunchctlWithRetry(
+      ["bootstrap", `gui/${process.getuid()}`, plistPath],
+      {
+        attempts: 10,
+        delayMs: 200,
+      },
+    );
     runLaunchctl(["enable", `gui/${process.getuid()}/${label}`]);
     process.stdout.write(
       `Installed ${label} at ${plistPath}. Logs: ${stdoutPath}, ${stderrPath}\n`,
@@ -91,6 +97,28 @@ function runLaunchctl(args, ignoreFailure = false) {
       `launchctl ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
     );
   }
+}
+
+async function runLaunchctlWithRetry(
+  args,
+  { attempts, delayMs },
+) {
+  let lastResult;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = spawnSync("/bin/launchctl", args, { encoding: "utf8" });
+    if (result.status === 0) {
+      return;
+    }
+    lastResult = result;
+    if (attempt < attempts) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+    }
+  }
+  throw new Error(
+    `launchctl ${args.join(" ")} failed after ${attempts} attempts: ${
+      lastResult?.stderr || lastResult?.stdout
+    }`,
+  );
 }
 
 function renderPlist({

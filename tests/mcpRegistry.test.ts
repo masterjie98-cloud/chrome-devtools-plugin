@@ -395,11 +395,12 @@ test("MCP tool profiles reduce model-visible capability without changing policy"
   );
   assert.equal(inspect.length < read.length, true);
   assert.equal(read.length < full.length, true);
-  assert.equal(smart.length, 10);
+  assert.equal(smart.length, 11);
   assert.deepEqual(
-    smart.slice(0, 5).map((tool) => tool.definition.name),
+    smart.slice(0, 6).map((tool) => tool.definition.name),
     [
       MCP_TOOL_NAMES.BROWSER_STATUS,
+      MCP_TOOL_NAMES.BROWSER_WORKFLOW,
       MCP_TOOL_NAMES.BROWSER_OBSERVE,
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,

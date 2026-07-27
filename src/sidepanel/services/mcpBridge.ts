@@ -35,6 +35,11 @@ import {
   type ScreenshotSnapshot,
 } from "../../shared/wsProtocol";
 import { WS_CLIENT_IDENTITIES } from "../../shared/wsClientIdentity";
+import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+  runtimeIdentityMismatch,
+} from "../../shared/runtimeIdentity";
 import { toAbortError } from "./abortError";
 import { McpToolTransportError } from "./mcpTransport";
 
@@ -464,6 +469,8 @@ class McpBridge {
       sentAt: new Date().toISOString(),
       payload: {
         protocolVersion: WS_PROTOCOL_VERSION,
+        buildId: RUNTIME_BUILD_ID,
+        schemaHash: RUNTIME_SCHEMA_HASH,
         clientRole,
         clientName,
         installationId,
@@ -484,9 +491,11 @@ class McpBridge {
     }
 
     if (message.command === WS_COMMANDS.SERVER_WELCOME) {
+      const identityMismatch = runtimeIdentityMismatch(message.payload);
       if (
         this.socket !== socket ||
         message.payload.protocolVersion !== WS_PROTOCOL_VERSION ||
+        identityMismatch !== undefined ||
         message.payload.assignedRole !== "ui"
       ) {
         socket.close(1002, "PROTOCOL_NEGOTIATION_FAILED");

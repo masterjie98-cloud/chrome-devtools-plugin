@@ -50,6 +50,10 @@ import {
   type McpWsAck,
 } from "../shared/wsProtocol";
 import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+} from "../shared/runtimeIdentity";
+import {
   executeMcpToolData,
   listRuntimeMcpTools,
   parseMcpToolArgs,
@@ -1271,8 +1275,28 @@ function handleRawMessage(
       socket.close(1002, "PROTOCOL_VERSION_UNSUPPORTED");
       return;
     }
+    if (parsed.data.payload.buildId !== RUNTIME_BUILD_ID) {
+      sendAck(socket, {
+        requestId: parsed.data.requestId,
+        ok: false,
+        receivedAt: new Date().toISOString(),
+        error: `BUILD_ID_MISMATCH: daemon=${RUNTIME_BUILD_ID}, ${parsed.data.payload.clientRole}=${parsed.data.payload.buildId}. Restart the daemon and MCP client, then reload the Chrome extension.`,
+      });
+      socket.close(1002, "BUILD_ID_MISMATCH");
+      return;
+    }
+    if (parsed.data.payload.schemaHash !== RUNTIME_SCHEMA_HASH) {
+      sendAck(socket, {
+        requestId: parsed.data.requestId,
+        ok: false,
+        receivedAt: new Date().toISOString(),
+        error: `SCHEMA_HASH_MISMATCH: daemon=${RUNTIME_SCHEMA_HASH}, ${parsed.data.payload.clientRole}=${parsed.data.payload.schemaHash}. Restart the daemon and MCP client, then reload the Chrome extension.`,
+      });
+      socket.close(1002, "SCHEMA_HASH_MISMATCH");
+      return;
+    }
     const authentication = authenticateClientHello(
-      parsed.data.payload,
+      parsed.data.payload as ClientHelloPayload,
       origin,
       bridgeToken,
       allowedExtensionIds,
@@ -1452,7 +1476,7 @@ async function handlePluginMessage(
   if (message.command === WS_COMMANDS.CLIENT_HELLO) {
     handleClientHello(
       socket,
-      message.payload,
+      message.payload as ClientHelloPayload,
       clientRoles,
       clientSessionIds,
       registerPluginSocket,
@@ -2536,6 +2560,11 @@ async function persistScreenshotArtifact(
   sessionId: string,
   artifactStore: ArtifactStore,
 ): Promise<ScreenshotCaptureResult> {
+  if (
+    screenshot.dataUrl === `data:${screenshot.mimeType};base64,`
+  ) {
+    return screenshot;
+  }
   const artifact = await artifactStore.putDataUrl(
     sessionId,
     "screenshot",
@@ -2689,6 +2718,8 @@ function sendServerWelcome(
     sentAt: new Date().toISOString(),
     payload: {
       protocolVersion: WS_PROTOCOL_VERSION,
+      buildId: RUNTIME_BUILD_ID,
+      schemaHash: RUNTIME_SCHEMA_HASH,
       connectionId,
       assignedRole,
       ...(hello.sessionId ? { sessionId: hello.sessionId } : {}),

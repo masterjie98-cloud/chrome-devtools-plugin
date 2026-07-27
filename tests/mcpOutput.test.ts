@@ -44,6 +44,30 @@ test("screenshot MCP results use image content without base64 JSON text", () => 
   );
 });
 
+test("unchanged screenshot diffs omit image bytes and dataUrl", () => {
+  const result = formatMcpToolResult({
+    capturedAt: "2026-07-10T00:00:01.000Z",
+    mimeType: "image/png",
+    dataUrl: "data:image/png;base64,",
+    comparison: {
+      baselineAvailable: true,
+      changed: false,
+      changedPixelRatio: 0,
+      threshold: 16,
+      baselineCapturedAt: "2026-07-10T00:00:00.000Z",
+    },
+  });
+
+  assert.equal(result.content.some((entry) => entry.type === "image"), false);
+  assert.equal("dataUrl" in result.structuredContent, false);
+  assert.equal(
+    MCP_TOOL_OUTPUT_SCHEMAS[
+      MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT
+    ].safeParse(result.structuredContent).success,
+    true,
+  );
+});
+
 test("ordinary MCP result summaries and collections are bounded", () => {
   const result = formatMcpToolResult({
     query: "button",

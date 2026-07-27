@@ -23,6 +23,10 @@ import {
   type WsClientRole,
 } from "../src/shared/wsProtocol";
 import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+} from "../src/shared/runtimeIdentity";
+import {
   clientHelloMessage,
   createDeterministicIdFactory,
   TEST_BRIDGE_TOKEN,
@@ -219,6 +223,8 @@ test("daemon advertises the assigned role and protocol limits", async () => {
     const welcome = await welcomePromise;
     assert.equal(welcome.payload.assignedRole, "browser");
     assert.equal(welcome.payload.protocolVersion, WS_PROTOCOL_VERSION);
+    assert.equal(welcome.payload.buildId, RUNTIME_BUILD_ID);
+    assert.equal(welcome.payload.schemaHash, RUNTIME_SCHEMA_HASH);
     assert.equal(welcome.payload.sessionId, "welcome-session");
     assert.equal(welcome.payload.connectionId, "server-id-1");
     assert.equal(welcome.payload.limits.maxFrameBytes, 8 * 1024 * 1024);
@@ -276,6 +282,63 @@ test("daemon rejects an unsupported WebSocket protocol version", async () => {
       { clientRole: "mcp", protocolVersion: WS_PROTOCOL_VERSION - 1 },
       undefined,
       /PROTOCOL_VERSION_UNSUPPORTED/,
+    );
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon rejects stale build and schema identities with restart guidance", async () => {
+  const daemon = startPluginWebSocketServer(0);
+  const address = await daemon.ready();
+  const url = `ws://${address.host}:${address.port}`;
+  try {
+    await expectHelloRejected(
+      url,
+      {
+        clientRole: "mcp",
+        buildId: "0.0.0+stale",
+      },
+      undefined,
+      /BUILD_ID_MISMATCH:.*Restart the daemon and MCP client.*reload the Chrome extension/i,
+    );
+    await expectHelloRejected(
+      url,
+      {
+        clientRole: "mcp",
+        schemaHash: "00000000",
+      },
+      undefined,
+      /SCHEMA_HASH_MISMATCH:.*Restart the daemon and MCP client.*reload the Chrome extension/i,
+    );
+    await expectHelloRejected(
+      url,
+      {
+        clientRole: "mcp",
+        protocolVersion: WS_PROTOCOL_VERSION - 1,
+        buildId: undefined,
+        schemaHash: undefined,
+      },
+      undefined,
+      /PROTOCOL_VERSION_UNSUPPORTED:.*Rebuild or update the extension and MCP adapter together/i,
+    );
+    await expectHelloRejected(
+      url,
+      {
+        clientRole: "mcp",
+        buildId: undefined,
+      },
+      undefined,
+      /BUILD_ID_MISMATCH:.*Restart the daemon and MCP client.*reload the Chrome extension/i,
+    );
+    await expectHelloRejected(
+      url,
+      {
+        clientRole: "mcp",
+        schemaHash: undefined,
+      },
+      undefined,
+      /SCHEMA_HASH_MISMATCH:.*Restart the daemon and MCP client.*reload the Chrome extension/i,
     );
   } finally {
     await daemon.close();
@@ -2297,6 +2360,8 @@ async function expectHelloRejected(
     sentAt: new Date().toISOString(),
     payload: {
       protocolVersion: WS_PROTOCOL_VERSION,
+      buildId: RUNTIME_BUILD_ID,
+      schemaHash: RUNTIME_SCHEMA_HASH,
       ...payload,
     },
   }));

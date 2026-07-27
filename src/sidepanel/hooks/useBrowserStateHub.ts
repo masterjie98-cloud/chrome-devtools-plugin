@@ -17,6 +17,11 @@ import {
   type ActiveTabSnapshot,
 } from "../../shared/wsProtocol";
 import { WS_CLIENT_IDENTITIES } from "../../shared/wsClientIdentity";
+import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+  runtimeIdentityMismatch,
+} from "../../shared/runtimeIdentity";
 
 interface BrowserStateHubState {
   connected: boolean;
@@ -63,6 +68,8 @@ export function useBrowserStateHub(): BrowserStateHubState {
           sentAt: new Date().toISOString(),
           payload: {
             protocolVersion: WS_PROTOCOL_VERSION,
+            buildId: RUNTIME_BUILD_ID,
+            schemaHash: RUNTIME_SCHEMA_HASH,
             clientRole:
               WS_CLIENT_IDENTITIES.CHROME_SIDEPANEL_OBSERVER.assignedRole,
             clientName:
@@ -118,6 +125,7 @@ export function useBrowserStateHub(): BrowserStateHubState {
         case WS_COMMANDS.SERVER_WELCOME: {
           if (
             parsed.payload?.protocolVersion !== WS_PROTOCOL_VERSION ||
+            runtimeIdentityMismatch(parsed.payload) !== undefined ||
             parsed.payload.assignedRole !== "observer" ||
             typeof parsed.payload.sessionId !== "string"
           ) {

@@ -42,6 +42,11 @@ import {
   type ServerWelcomePayload,
 } from "../shared/wsProtocol";
 import { WS_CLIENT_IDENTITIES } from "../shared/wsClientIdentity";
+import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+  runtimeIdentityMismatch,
+} from "../shared/runtimeIdentity";
 
 
 class BackgroundStateHubBridge {
@@ -140,6 +145,8 @@ class BackgroundStateHubBridge {
         sentAt: new Date().toISOString(),
         payload: {
           protocolVersion: WS_PROTOCOL_VERSION,
+          buildId: RUNTIME_BUILD_ID,
+          schemaHash: RUNTIME_SCHEMA_HASH,
           clientRole: "browser",
           clientName: WS_CLIENT_IDENTITIES.CHROME_BACKGROUND.clientName,
           installationId,
@@ -208,9 +215,11 @@ class BackgroundStateHubBridge {
       return;
     }
     if (message.command === WS_COMMANDS.SERVER_WELCOME) {
+      const identityMismatch = runtimeIdentityMismatch(message.payload);
       if (
         this.socket !== socket ||
         message.payload.protocolVersion !== WS_PROTOCOL_VERSION ||
+        identityMismatch !== undefined ||
         message.payload.assignedRole !== "browser" ||
         !message.payload.sessionId
       ) {
@@ -317,7 +326,8 @@ class BackgroundStateHubBridge {
 
     if (
       call.toolName === TOOL_NAMES.BROWSER_TAKE_SCREENSHOT &&
-      isScreenshotCaptureResult(data)
+      isScreenshotCaptureResult(data) &&
+      data.dataUrl !== `data:${data.mimeType};base64,`
     ) {
       this.sendScreenshot(data);
     }

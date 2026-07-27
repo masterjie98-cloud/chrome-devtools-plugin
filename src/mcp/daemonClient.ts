@@ -15,6 +15,11 @@ import {
   type StateGetResultPayload,
 } from "../shared/wsProtocol";
 import { WS_CLIENT_IDENTITIES } from "../shared/wsClientIdentity";
+import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+  runtimeIdentityMismatch,
+} from "../shared/runtimeIdentity";
 import { ADAPTER_ROUTING_TOOL_NAMES } from "./adapterRoutingTools";
 
 interface PendingRequest {
@@ -291,6 +296,15 @@ export class DaemonClient {
               );
               return;
             }
+            const identityMismatch = runtimeIdentityMismatch(message.payload);
+            if (identityMismatch) {
+              failConnection(
+                new Error(
+                  `${identityMismatch === "buildId" ? "BUILD_ID_MISMATCH" : "SCHEMA_HASH_MISMATCH"}: adapter=${identityMismatch === "buildId" ? RUNTIME_BUILD_ID : RUNTIME_SCHEMA_HASH}, daemon=${message.payload[identityMismatch]}. Restart the daemon and MCP client, then reload the Chrome extension.`,
+                ),
+              );
+              return;
+            }
             if (message.payload.assignedRole !== "mcp") {
               failConnection(
                 new Error(
@@ -340,6 +354,8 @@ export class DaemonClient {
           sentAt: new Date().toISOString(),
           payload: {
             protocolVersion: WS_PROTOCOL_VERSION,
+            buildId: RUNTIME_BUILD_ID,
+            schemaHash: RUNTIME_SCHEMA_HASH,
             clientRole: WS_CLIENT_IDENTITIES.CODEX_STDIO_ADAPTER.assignedRole,
             clientName: WS_CLIENT_IDENTITIES.CODEX_STDIO_ADAPTER.clientName,
             bridgeToken,

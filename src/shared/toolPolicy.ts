@@ -225,6 +225,7 @@ const POLICY_GROUPS = {
     MCP_TOOL_NAMES.BROWSER_DEBUGGER_DETACH,
   ],
   page_action: [
+    MCP_TOOL_NAMES.BROWSER_WORKFLOW,
     MCP_TOOL_NAMES.BROWSER_ACT,
     MCP_TOOL_NAMES.BROWSER_CLICK,
     MCP_TOOL_NAMES.BROWSER_DRAG,
@@ -336,7 +337,8 @@ export function getToolPolicy(
   }
 
   if (
-    normalizedName === MCP_TOOL_NAMES.BROWSER_EXECUTE_ACTION_STAGE &&
+    (normalizedName === MCP_TOOL_NAMES.BROWSER_EXECUTE_ACTION_STAGE ||
+      normalizedName === MCP_TOOL_NAMES.BROWSER_WORKFLOW) &&
     containsCommitLikeStageAction(args)
   ) {
     return overridePolicy(createPolicy(normalizedName, baseClass, true), {
@@ -550,7 +552,7 @@ function containsSensitiveFieldHint(args: Record<string, unknown>): boolean {
 
 function containsCommitLikeStageAction(args: Record<string, unknown>): boolean {
   if (!Array.isArray(args.actions)) {
-    return true;
+    return false;
   }
   return args.actions.some((action) => {
     if (!action || typeof action !== "object") {

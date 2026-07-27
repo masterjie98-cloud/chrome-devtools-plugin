@@ -32,20 +32,30 @@ import type {
   RedactedAuditEvent,
 } from "../daemon/store/stateStore";
 import { isSupportedTrustedKey } from "../shared/trustedKeyboard";
-import { isSnapshotTargetRef } from "../shared/semanticSnapshot";
+import {
+  isSnapshotTargetRef,
+  isSnapshotFrameRef,
+  SEMANTIC_PROJECTION_FIELDS,
+  type SemanticProjectionField,
+} from "../shared/semanticSnapshot";
 import {
   SUPPORTED_COMPUTED_STYLE_PROPERTIES,
   type ComputedStyleProperty,
   type DomQueryInput,
   type DomQueryResult,
 } from "../shared/dom";
+import {
+  RUNTIME_BUILD_ID,
+  RUNTIME_SCHEMA_HASH,
+} from "../shared/runtimeIdentity";
 
 const noArgSchema = z.object({});
 interface SnapshotReferenceBinding {
   selector: string;
 }
 
-interface SnapshotReferenceSet {
+interface SnapshotFrameReferenceSet {
+  frameRef: string;
   fingerprint: string;
   target: import("../shared/wsProtocol").ActiveTabSnapshot;
   mode: "interactive" | "outline" | "full";
@@ -53,10 +63,16 @@ interface SnapshotReferenceSet {
   references: Map<string, SnapshotReferenceBinding>;
 }
 
+interface SnapshotReferenceGeneration {
+  selectedFrameRef: string;
+  frames: Map<string, SnapshotFrameReferenceSet>;
+}
+
 const SNAPSHOT_REFERENCE_SESSION_LIMIT = 32;
 // Approval may stay pending indefinitely. References are capacity-bounded and
 // always revalidated against a live target/fingerprint instead of expiring by time.
-const snapshotReferencesBySession = new Map<string, SnapshotReferenceSet>();
+const snapshotReferencesBySession =
+  new Map<string, SnapshotReferenceGeneration>();
 const semanticSnapshotInputShape = {
   cursor: z.string().regex(/^ss1_[a-f0-9]{8}_\d{1,6}$/).optional(),
   limit: z.number().int().min(1).max(100).optional(),
@@ -74,6 +90,14 @@ const browserObserveInputSchema = z
       .enum(["selected", "auto", "all-accessible"])
       .optional(),
     maxFrames: z.number().int().min(1).max(12).optional(),
+    fields: z
+      .array(z.enum(SEMANTIC_PROJECTION_FIELDS))
+      .min(1)
+      .max(SEMANTIC_PROJECTION_FIELDS.length)
+      .refine((value) => new Set(value).size === value.length, {
+        message: "fields must be unique",
+      })
+      .optional(),
   })
   .strict()
   .refine(
@@ -207,16 +231,33 @@ const highlightElementSchema = z.object({
   durationMs: z.number().int().positive().max(15000).optional(),
 });
 
+const frameReferenceShape = {
+  frameRef: z
+    .string()
+    .refine(isSnapshotFrameRef, "invalid snapshot frame ref")
+    .optional(),
+  documentId: z.string().min(1).max(300).optional(),
+};
+
 const screenshotSchema = z.object({
+  ...frameReferenceShape,
+  ref: z
+    .string()
+    .refine(isSnapshotTargetRef, "invalid snapshot target ref")
+    .optional(),
   type: z.enum(["png", "jpeg"]).optional(),
   selector: z.string().min(1).optional(),
   target: z.string().min(1).optional(),
   element: z.string().min(1).optional(),
   fullPage: z.boolean().optional(),
   quality: z.number().int().min(0).max(100).optional(),
+  diffAgainst: z.literal("previous").optional(),
+  returnImage: z.enum(["always", "changed", "never"]).optional(),
+  diffThreshold: z.number().int().min(0).max(255).optional(),
 });
 
 const elementTargetShape = {
+  ...frameReferenceShape,
   ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
   selector: z.string().min(1).optional(),
   target: z.string().min(1).optional(),
@@ -224,6 +265,7 @@ const elementTargetShape = {
 };
 
 const formControlTargetShape = {
+  ...frameReferenceShape,
   ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
   selector: z.string().min(1).max(2000).optional(),
   target: z.string().min(1).max(2000).optional(),
@@ -267,6 +309,7 @@ const typeTextSchema = z
   });
 
 const pressKeySchema = z.object({
+  ...frameReferenceShape,
   ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
   selector: z.string().min(1).optional(),
   target: z.string().min(1).optional(),
@@ -332,6 +375,7 @@ const targetFrameSchema = z.object({
 
 const dragSchema = z
   .object({
+    ...frameReferenceShape,
     sourceRef: z.string().refine(isSnapshotTargetRef, "invalid source snapshot ref").optional(),
     source: z.string().min(1).optional(),
     sourceSelector: z.string().min(1).optional(),
@@ -389,10 +433,12 @@ const fillFormSchema = z
   .object({
     fields: z.array(fillFormFieldSchema).min(1).max(50),
     decisionBarrier: z.boolean().optional(),
+    ...frameReferenceShape,
   })
   .strict();
 
 const actionStageMetadataSchema = z.object({
+  ...frameReferenceShape,
   dependsOn: z.array(z.string().min(1).max(80)).max(20).optional(),
   expectedOutcome: z.string().min(1).max(500).optional(),
   barrier: z.boolean().optional(),
@@ -540,7 +586,14 @@ const verifyCheckSchema = z
       "target_present",
       "target_state",
     ]),
-    value: z.string().min(1).max(1000).optional(),
+    value: z.string().max(4000).optional(),
+    selectedValues: z
+      .array(z.string().max(4000))
+      .max(50)
+      .refine((values) => new Set(values).size === values.length, {
+        message: "selectedValues must be unique",
+      })
+      .optional(),
     ref: z.string().refine(isSnapshotTargetRef, "invalid snapshot target ref").optional(),
     selector: z.string().min(1).max(1000).optional(),
     nameContains: z.string().min(1).max(240).optional(),
@@ -580,6 +633,47 @@ const browserVerifySchema = z
   .object({
     sinceRevision: z.number().int().nonnegative().optional(),
     checks: z.array(verifyCheckSchema).min(1).max(20),
+  })
+  .strict();
+
+const workflowObservationSchema = z
+  .object({
+    limit: z.number().int().min(1).max(100).optional(),
+    mode: z.enum(["interactive", "outline", "full"]).optional(),
+    sourceLimit: z.number().int().min(100).max(10000).optional(),
+    frameScope: z
+      .enum(["selected", "auto", "all-accessible"])
+      .optional(),
+    maxFrames: z.number().int().min(1).max(12).optional(),
+    fields: z
+      .array(z.enum(SEMANTIC_PROJECTION_FIELDS))
+      .min(1)
+      .max(SEMANTIC_PROJECTION_FIELDS.length)
+      .refine((value) => new Set(value).size === value.length, {
+        message: "fields must be unique",
+      })
+      .optional(),
+  })
+  .strict();
+
+const browserWorkflowSchema = z
+  .object({
+    observation: workflowObservationSchema.optional(),
+    actions: actionStageSchema.shape.actions.optional(),
+    checks: z.array(verifyCheckSchema).min(1).max(20).optional(),
+    evidence: z
+      .object({
+        dom: z.boolean().optional(),
+        url: z.boolean().optional(),
+        network: z.boolean().optional(),
+        console: z.boolean().optional(),
+        networkLimit: z.number().int().min(1).max(100).optional(),
+        consoleLimit: z.number().int().min(1).max(200).optional(),
+      })
+      .strict()
+      .optional(),
+    stopOnFailure: z.boolean().optional(),
+    decisionBarrier: z.boolean().optional(),
   })
   .strict();
 
@@ -825,6 +919,7 @@ const removeCssPatchSchema = z.object({
 
 const MCP_TOOL_INPUT_SCHEMA_BASE: Record<McpToolName, ZodTypeAny> = {
   [MCP_TOOL_NAMES.BROWSER_STATUS]: noArgSchema,
+  [MCP_TOOL_NAMES.BROWSER_WORKFLOW]: browserWorkflowSchema,
   [MCP_TOOL_NAMES.BROWSER_OBSERVE]: browserObserveInputSchema,
   [MCP_TOOL_NAMES.BROWSER_ACT]: actionStageSchema,
   [MCP_TOOL_NAMES.BROWSER_VERIFY]: browserVerifySchema,
@@ -954,6 +1049,7 @@ export function runtimeToolsForProfile(
   if (profile === "smart") {
     const smartTools = new Set<McpToolName>([
       MCP_TOOL_NAMES.BROWSER_STATUS,
+      MCP_TOOL_NAMES.BROWSER_WORKFLOW,
       MCP_TOOL_NAMES.BROWSER_OBSERVE,
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
@@ -1101,6 +1197,12 @@ export async function executeMcpToolData(
   switch (normalizedToolName) {
     case MCP_TOOL_NAMES.BROWSER_STATUS:
       return readBrowserStatus(context.sessionId);
+    case MCP_TOOL_NAMES.BROWSER_WORKFLOW:
+      return executeBrowserWorkflow(
+        pluginBridge,
+        parsedArgs,
+        context.sessionId,
+      );
     case MCP_TOOL_NAMES.BROWSER_OBSERVE:
       return readSemanticSnapshot(
         pluginBridge,
@@ -1674,6 +1776,23 @@ function readBrowserStatus(sessionId?: string): Record<string, unknown> {
     browserConnected: state.browserConnected,
     pluginConnected: state.pluginConnected,
     pageContextSynced: Boolean(state.pageContext),
+    compatibility: {
+      compatible: true,
+      adapter: {
+        buildId: RUNTIME_BUILD_ID,
+        schemaHash: RUNTIME_SCHEMA_HASH,
+      },
+      daemon: {
+        buildId: RUNTIME_BUILD_ID,
+        schemaHash: RUNTIME_SCHEMA_HASH,
+      },
+      browser: state.browserConnected
+        ? {
+            buildId: RUNTIME_BUILD_ID,
+            schemaHash: RUNTIME_SCHEMA_HASH,
+          }
+        : null,
+    },
     activeTab: state.activeTab ?? null,
     currentConversationId: state.currentConversationId,
     revision: state.revision,
@@ -1683,11 +1802,419 @@ function readBrowserStatus(sessionId?: string): Record<string, unknown> {
   };
 }
 
+async function executeBrowserWorkflow(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+  sessionId?: string,
+): Promise<Record<string, unknown>> {
+  const startedAt = new Date().toISOString();
+  const evidence = isRecordValue(args.evidence) ? args.evidence : {};
+  const includeNetwork = evidence.network !== false;
+  const includeConsole = evidence.console !== false;
+  let networkOwned = false;
+  let networkStart: unknown = null;
+  let consoleBefore: unknown = null;
+
+  if (includeNetwork) {
+    try {
+      networkStart = await proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DEBUGGER_NETWORK_START,
+        args: { preserveLog: false, maxEntries: 500 },
+      });
+      networkOwned = true;
+    } catch (error) {
+      networkStart = {
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+  if (includeConsole) {
+    consoleBefore = await proxyBrowserTool(pluginBridge, {
+      id: createMessageId(),
+      toolName: TOOL_NAMES.BROWSER_CONSOLE_MESSAGES,
+      args: {
+        limit:
+          typeof evidence.consoleLimit === "number"
+            ? evidence.consoleLimit
+            : 50,
+      },
+    }).catch((error) => ({
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+
+  try {
+    const observation = isRecordValue(args.observation)
+      ? args.observation
+      : {};
+    const before = await readSemanticSnapshot(
+      pluginBridge,
+      {
+        ...observation,
+        frameScope: observation.frameScope ?? "auto",
+      },
+      sessionId,
+      { compact: true, retryStaleOnce: true },
+    ) as Record<string, unknown>;
+    const beforePage = isRecordValue(before.page) ? before.page : {};
+    const beforeObservation = isRecordValue(before.observation)
+      ? before.observation
+      : {};
+    const actions = Array.isArray(args.actions)
+      ? (args.actions as Record<string, unknown>[])
+      : [];
+    const actionStage = actions.length > 0
+      ? await executeActionStage(pluginBridge, {
+          actions,
+          stopOnFailure: args.stopOnFailure,
+          decisionBarrier: args.decisionBarrier,
+        })
+      : {
+          version: "action-stage-v1",
+          completed: 0,
+          requested: 0,
+          stoppedAt: null,
+          barrierReached: false,
+          requiresVerification: false,
+          results: [],
+        };
+    const after = await readSemanticSnapshot(
+      pluginBridge,
+      {
+        ...observation,
+        frameScope: observation.frameScope ?? "auto",
+        ...(typeof beforeObservation.domRevision === "number"
+          ? { sinceRevision: beforeObservation.domRevision }
+          : {}),
+      },
+      sessionId,
+      { compact: true, retryStaleOnce: true },
+    ) as Record<string, unknown>;
+    const checks = Array.isArray(args.checks)
+      ? await verifyBrowserState(
+          pluginBridge,
+          {
+            checks: args.checks,
+            ...(typeof beforeObservation.domRevision === "number"
+              ? { sinceRevision: beforeObservation.domRevision }
+              : {}),
+          },
+          sessionId,
+        )
+      : null;
+    const afterPage = isRecordValue(after.page) ? after.page : {};
+    const afterObservation = isRecordValue(after.observation)
+      ? after.observation
+      : {};
+
+    const activity = await readWorkflowActivity(
+      pluginBridge,
+      {
+        includeNetwork,
+        includeConsole,
+        networkLimit:
+          typeof evidence.networkLimit === "number"
+            ? evidence.networkLimit
+            : 50,
+        consoleLimit:
+          typeof evidence.consoleLimit === "number"
+            ? evidence.consoleLimit
+            : 50,
+      },
+      consoleBefore,
+    );
+    const completedAt = new Date().toISOString();
+    return {
+      version: "browser-workflow-v1",
+      status:
+        isRecordValue(checks) && checks.passed === false
+          ? "verification_failed"
+          : actionStage.stoppedAt
+            ? "action_stopped"
+            : "completed",
+      startedAt,
+      completedAt,
+      before,
+      actions: actionStage,
+      verification: checks,
+      after,
+      evidence: {
+        dom:
+          evidence.dom === false
+            ? null
+            : {
+                revisionBefore: beforeObservation.domRevision ?? null,
+                revisionAfter: afterObservation.domRevision ?? null,
+                delta: afterObservation.delta ?? null,
+                complete: afterObservation.truncated !== true,
+              },
+        url:
+          evidence.url === false
+            ? null
+            : {
+                before: beforePage.url ?? null,
+                after: afterPage.url ?? null,
+                changed:
+                  typeof beforePage.url === "string" &&
+                  typeof afterPage.url === "string"
+                    ? beforePage.url !== afterPage.url
+                    : null,
+              },
+        network: includeNetwork
+          ? {
+              started: networkStart,
+              result: activity.network,
+              complete: !isToolDataError(activity.network),
+            }
+          : null,
+        console: includeConsole
+          ? {
+              result: activity.console,
+              complete: !isToolDataError(activity.console),
+            }
+          : null,
+      },
+      timing: {
+        totalMs: Math.max(
+          0,
+          Date.parse(completedAt) - Date.parse(startedAt),
+        ),
+      },
+    };
+  } finally {
+    if (networkOwned) {
+      await proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DEBUGGER_NETWORK_STOP,
+        args: {},
+      }).catch(() => undefined);
+    }
+  }
+}
+
+async function readWorkflowActivity(
+  pluginBridge: PluginWebSocketServer,
+  options: {
+    includeNetwork: boolean;
+    includeConsole: boolean;
+    networkLimit: number;
+    consoleLimit: number;
+  },
+  consoleBefore: unknown,
+): Promise<{ network: unknown; console: unknown }> {
+  const [network, consoleAfter] = await Promise.all([
+    options.includeNetwork
+      ? proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.DEBUGGER_NETWORK_LIST,
+          args: { digestOnly: true, limit: options.networkLimit },
+        }).catch((error) => ({
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      : Promise.resolve(null),
+    options.includeConsole
+      ? proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.BROWSER_CONSOLE_MESSAGES,
+          args: { limit: options.consoleLimit },
+        }).catch((error) => ({
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      : Promise.resolve(null),
+  ]);
+  return {
+    network,
+    console: subtractConsoleSnapshot(consoleBefore, consoleAfter),
+  };
+}
+
+function subtractConsoleSnapshot(before: unknown, after: unknown): unknown {
+  if (!isRecordValue(after) || !Array.isArray(after.messages)) {
+    return after;
+  }
+  const beforeMessages =
+    isRecordValue(before) && Array.isArray(before.messages)
+      ? before.messages
+      : [];
+  const counts = new Map<string, number>();
+  for (const message of beforeMessages) {
+    const key = JSON.stringify(message);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const messages = after.messages.filter((message) => {
+    const key = JSON.stringify(message);
+    const count = counts.get(key) ?? 0;
+    if (count <= 0) {
+      return true;
+    }
+    counts.set(key, count - 1);
+    return false;
+  });
+  return {
+    ...after,
+    messages,
+    returned: messages.length,
+    correlation: "entries not present in the pre-action bounded snapshot",
+  };
+}
+
+async function readActionPostStates(
+  pluginBridge: PluginWebSocketServer,
+  actions: Record<string, unknown>[],
+): Promise<Record<string, unknown>> {
+  const groups = new Map<
+    string,
+    {
+      frameId?: number;
+      documentId?: string;
+      actions: Record<string, unknown>[];
+    }
+  >();
+  for (const action of actions) {
+    if (
+      action.type === "wait" ||
+      action.type === "scroll" ||
+      action.type === "resize"
+    ) {
+      continue;
+    }
+    const key = `${action.frameId ?? ""}:${action.documentId ?? ""}`;
+    const group = groups.get(key) ?? {
+      ...(typeof action.frameId === "number"
+        ? { frameId: action.frameId }
+        : {}),
+      ...(typeof action.documentId === "string"
+        ? { documentId: action.documentId }
+        : {}),
+      actions: [],
+    };
+    group.actions.push(action);
+    groups.set(key, group);
+  }
+  const states: Record<string, unknown> = {};
+  await Promise.all(
+    [...groups.values()].map(async (group) => {
+      try {
+        const value = await proxyBrowserTool(pluginBridge, {
+          id: createMessageId(),
+          toolName: TOOL_NAMES.DOM_GET_PAGE_INFO,
+          args: {
+            limit: 100,
+            mode: "full",
+            sourceLimit: 10_000,
+            ...(group.frameId !== undefined
+              ? {
+                  frameScope: "selected",
+                  frameId: group.frameId,
+                  documentId: group.documentId,
+                }
+              : {}),
+          },
+        } as unknown as AnyToolCall);
+        if (!isSemanticPageSnapshot(value)) {
+          throw new Error("post-action semantic snapshot unavailable");
+        }
+        for (const action of group.actions) {
+          const selector =
+            action.type === "drag"
+              ? action.targetSelector
+              : action.selector;
+          const node =
+            typeof selector === "string"
+              ? value.semanticSnapshot.nodes.find(
+                  (candidate) => candidate.selector === selector,
+                )
+              : undefined;
+          states[String(action.id)] = node
+            ? {
+                available: true,
+                target: {
+                  role: node.role,
+                  name: node.name,
+                  value: node.value,
+                  selectedValues: node.selectedValues,
+                  disabled: node.disabled,
+                  checked: node.checked,
+                  selected: node.selected,
+                  expanded: node.expanded,
+                  focused: node.focused,
+                },
+                observedAt: value.capturedAt,
+                documentId: value.provenance?.target.documentId ?? null,
+              }
+            : {
+                available: false,
+                reason: "target_not_found_or_document_changed",
+                observedAt: value.capturedAt,
+              };
+        }
+      } catch (error) {
+        for (const action of group.actions) {
+          states[String(action.id)] = {
+            available: false,
+            reason:
+              error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
+    }),
+  );
+  return states;
+}
+
+function attachActionPostStates(
+  actionStage: Record<string, unknown>,
+  postStates: Record<string, unknown>,
+): void {
+  if (!Array.isArray(actionStage.results)) {
+    return;
+  }
+  actionStage.results = actionStage.results.map((result) => {
+    if (!isRecordValue(result) || typeof result.id !== "string") {
+      return result;
+    }
+    return {
+      ...result,
+      postState: postStates[result.id] ?? {
+        available: false,
+        reason: "action_has_no_element_post_state",
+      },
+    };
+  });
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
 async function verifyBrowserState(
   pluginBridge: PluginWebSocketServer,
   args: Record<string, unknown>,
   sessionId?: string,
 ): Promise<Record<string, unknown>> {
+  const verificationChecks = args.checks as Array<Record<string, unknown>>;
+  const frameScopes = new Map<string, { frameId: number; documentId?: string }>();
+  for (const check of verificationChecks) {
+    if (typeof check.frameId !== "number") {
+      continue;
+    }
+    const scope = {
+      frameId: check.frameId,
+      ...(typeof check.documentId === "string"
+        ? { documentId: check.documentId }
+        : {}),
+    };
+    frameScopes.set(`${scope.frameId}:${scope.documentId ?? ""}`, scope);
+  }
+  if (frameScopes.size > 1) {
+    throw new Error(
+      "MIXED_FRAME_VERIFICATION_UNSUPPORTED: one browser_verify call must target one frame.",
+    );
+  }
+  const directFrame = frameScopes.values().next().value as
+    | { frameId: number; documentId?: string }
+    | undefined;
   const value = await proxyBrowserTool(pluginBridge, {
     id: createMessageId(),
     toolName: TOOL_NAMES.DOM_GET_PAGE_INFO,
@@ -1697,6 +2224,13 @@ async function verifyBrowserState(
       // aria-live regions), while the source walk remains bounded.
       mode: "full",
       sourceLimit: 2_000,
+      ...(directFrame
+        ? {
+            frameScope: "selected",
+            frameId: directFrame.frameId,
+            documentId: directFrame.documentId,
+          }
+        : {}),
       ...(typeof args.sinceRevision === "number"
         ? { sinceRevision: args.sinceRevision }
         : {}),
@@ -1709,20 +2243,24 @@ async function verifyBrowserState(
   }
   const state = getBrowserStateSnapshot(sessionId);
   const target = value.provenance?.target ?? state.activeTab;
-  if (value.provenance?.target && state.activeTab &&
-      !sameBrowserTarget(value.provenance.target, state.activeTab)) {
+  if (
+    value.provenance?.target &&
+    state.activeTab &&
+    !(directFrame
+      ? sameTopLevelBrowserTarget(value.provenance.target, state.activeTab)
+      : sameBrowserTarget(value.provenance.target, state.activeTab))
+  ) {
     throw new Error(
       "STALE_CONTEXT: verification snapshot does not match the selected browser target.",
     );
   }
   registerSnapshotReferences(
-    pluginBridge,
     state.sessionId,
-    value,
+    [value],
     target,
   );
   const nodes = value.semanticSnapshot.nodes;
-  const checks = (args.checks as Array<Record<string, unknown>>).map((check) => {
+  const checks = verificationChecks.map((check) => {
     const type = check.type as string;
     const id = check.id as string;
     const expected = check.value as string | undefined;
@@ -1779,6 +2317,12 @@ async function verifyBrowserState(
       ...(typeof check.expanded === "boolean"
         ? { expanded: check.expanded }
         : {}),
+      ...(typeof check.value === "string"
+        ? { value: check.value }
+        : {}),
+      ...(Array.isArray(check.selectedValues)
+        ? { selectedValues: check.selectedValues as string[] }
+        : {}),
     };
     const passed = Boolean(
       node &&
@@ -1791,7 +2335,14 @@ async function verifyBrowserState(
         (stateExpectations.selected === undefined ||
           node.selected === stateExpectations.selected) &&
         (stateExpectations.expanded === undefined ||
-          node.expanded === stateExpectations.expanded),
+          node.expanded === stateExpectations.expanded) &&
+        (stateExpectations.value === undefined ||
+          node.value === stateExpectations.value) &&
+        (stateExpectations.selectedValues === undefined ||
+          sameStringSet(
+            node.selectedValues ?? [],
+            stateExpectations.selectedValues,
+          )),
     );
     return {
       id,
@@ -1808,6 +2359,8 @@ async function verifyBrowserState(
             checked: node.checked,
             selected: node.selected,
             expanded: node.expanded,
+            value: node.value,
+            selectedValues: node.selectedValues,
           }
         : null,
     };
@@ -1825,6 +2378,14 @@ async function verifyBrowserState(
     delta: value.delta ?? null,
     checks,
   };
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  const expected = new Set(right);
+  return left.every((value) => expected.has(value));
 }
 
 async function readDebugActivity(
@@ -2155,8 +2716,32 @@ async function readSemanticSnapshotOnce(
       "STALE_CONTEXT: semantic snapshot provenance does not match the browser session state; retry browser_snapshot.",
     );
   }
+  const projectedFields = Array.isArray(args.fields)
+    ? (args.fields as SemanticProjectionField[])
+    : undefined;
+  const observedPages = multiFrameValue
+    ? multiFrameValue.frames
+        .map((entry) => entry.pageSnapshot)
+        .filter(isSemanticPageSnapshot)
+    : [pageValue];
+  const frameRefs = registerSnapshotReferences(
+    stateAfterRead.sessionId,
+    observedPages,
+    capturedTarget ??
+      stateBeforeRead.activeTab ??
+      stateAfterRead.activeTab,
+  );
+  const primaryFrameRef = snapshotFrameKey(
+    capturedTarget ??
+      stateBeforeRead.activeTab ??
+      stateAfterRead.activeTab,
+  );
   const snapshot = compact
-    ? compactSemanticSnapshot(pageValue.semanticSnapshot)
+    ? compactSemanticSnapshot(
+        pageValue.semanticSnapshot,
+        true,
+        projectedFields,
+      )
     : pageValue.semanticSnapshot;
   const result = {
     version: "browser-semantic-snapshot-v1",
@@ -2171,6 +2756,7 @@ async function readSemanticSnapshotOnce(
       stateBeforeRead.activeTab ??
       stateAfterRead.activeTab ??
       null,
+    frameRef: primaryFrameRef ? frameRefs.get(primaryFrameRef) ?? null : null,
     freshness: {
       source: "live-browser",
       capturedAt: pageValue.capturedAt,
@@ -2212,7 +2798,8 @@ async function readSemanticSnapshotOnce(
               snapshot: compact
                 ? compactSemanticSnapshot(
                     entry.pageSnapshot.semanticSnapshot!,
-                    false,
+                    true,
+                    projectedFields,
                   )
                 : entry.pageSnapshot.semanticSnapshot,
               observation: {
@@ -2225,40 +2812,46 @@ async function readSemanticSnapshotOnce(
                 truncated: entry.pageSnapshot.truncated,
                 timing: entry.pageSnapshot.timing ?? null,
               },
-              actionable: false,
+              frameRef:
+                frameRefs.get(
+                  snapshotFrameKey(entry.pageSnapshot.provenance?.target) ?? "",
+                ) ?? null,
+              documentId:
+                entry.pageSnapshot.provenance?.target.documentId ?? null,
+              actionable: Boolean(
+                frameRefs.get(
+                  snapshotFrameKey(entry.pageSnapshot.provenance?.target) ?? "",
+                ),
+              ),
             })),
           unavailableFrames: multiFrameValue.unavailableFrames,
         }
       : {}),
   };
-  registerSnapshotReferences(
-    pluginBridge,
-    stateAfterRead.sessionId,
-    pageValue,
-    capturedTarget ??
-      stateBeforeRead.activeTab ??
-      stateAfterRead.activeTab,
-  );
   return result;
 }
 
 function compactSemanticSnapshot(
   snapshot: import("../shared/semanticSnapshot").SemanticSnapshotCollection,
   includeTargetRef = true,
+  fields?: SemanticProjectionField[],
 ) {
-  const nodes = snapshot.nodes.map(
-    ({
-      selector: _selector,
-      tagName: _tagName,
-      bounds: _bounds,
-      ref: _ref,
-      targetRef: _targetRef,
-      ...node
-    }) => ({
-      ...node,
-      ...(includeTargetRef ? { targetRef: _targetRef } : {}),
-    }),
-  );
+  const selectedFields = fields ? new Set(fields) : undefined;
+  const nodes = snapshot.nodes.map((source) => {
+    const node: Record<string, unknown> = {};
+    for (const field of SEMANTIC_PROJECTION_FIELDS) {
+      if (
+        (!selectedFields || selectedFields.has(field)) &&
+        source[field] !== undefined
+      ) {
+        node[field] = source[field];
+      }
+    }
+    if (includeTargetRef) {
+      node.targetRef = source.targetRef;
+    }
+    return node;
+  });
   const base = {
     ...snapshot,
     nodes,
@@ -2276,26 +2869,57 @@ function compactSemanticSnapshot(
 }
 
 function registerSnapshotReferences(
-  _pluginBridge: PluginWebSocketServer,
   sessionId: string,
-  page: import("../shared/dom").PageSnapshot & {
-    semanticSnapshot: import("../shared/semanticSnapshot").SemanticSnapshotCollection;
-  },
-  target: import("../shared/wsProtocol").ActiveTabSnapshot | undefined,
-): void {
-  if (!target) {
-    return;
-  }
-  const snapshot = page.semanticSnapshot;
+  pages: Array<
+    import("../shared/dom").PageSnapshot & {
+      semanticSnapshot: import("../shared/semanticSnapshot").SemanticSnapshotCollection;
+    }
+  >,
+  fallbackTarget: import("../shared/wsProtocol").ActiveTabSnapshot | undefined,
+): Map<string, string> {
   const existing = snapshotReferencesBySession.get(sessionId);
-  const references =
-    existing &&
-    existing.fingerprint === snapshot.fingerprint &&
-    sameBrowserTarget(existing.target, target)
-      ? existing.references
-      : new Map<string, SnapshotReferenceBinding>();
-  for (const node of snapshot.nodes) {
-    references.set(node.targetRef, { selector: node.selector });
+  const frames = new Map<string, SnapshotFrameReferenceSet>();
+  const refsByFrameKey = new Map<string, string>();
+  let selectedFrameRef = "";
+  for (const page of pages) {
+    const target = page.provenance?.target ?? fallbackTarget;
+    const key = snapshotFrameKey(target);
+    if (!target || !key) {
+      continue;
+    }
+    const snapshot = page.semanticSnapshot;
+    const frameRef = createSnapshotFrameRef(target, snapshot.fingerprint);
+    const previous = existing?.frames.get(frameRef);
+    const references =
+      previous &&
+      previous.fingerprint === snapshot.fingerprint &&
+      sameBrowserTarget(previous.target, target)
+        ? new Map(previous.references)
+        : new Map<string, SnapshotReferenceBinding>();
+    for (const node of snapshot.nodes) {
+      references.set(node.targetRef, { selector: node.selector });
+    }
+    frames.set(frameRef, {
+      frameRef,
+      fingerprint: snapshot.fingerprint,
+      target,
+      mode: page.mode ?? "interactive",
+      sourceLimit: page.sourceLimit ?? 2000,
+      references,
+    });
+    refsByFrameKey.set(key, frameRef);
+    if (
+      fallbackTarget &&
+      sameBrowserTarget(target, fallbackTarget)
+    ) {
+      selectedFrameRef = frameRef;
+    }
+  }
+  if (!selectedFrameRef) {
+    selectedFrameRef = frames.keys().next().value as string | undefined ?? "";
+  }
+  if (!selectedFrameRef) {
+    return refsByFrameKey;
   }
   if (
     !snapshotReferencesBySession.has(sessionId) &&
@@ -2308,12 +2932,38 @@ function registerSnapshotReferences(
     }
   }
   snapshotReferencesBySession.set(sessionId, {
-    fingerprint: snapshot.fingerprint,
-    target,
-    mode: page.mode ?? "interactive",
-    sourceLimit: page.sourceLimit ?? 2000,
-    references,
+    selectedFrameRef,
+    frames,
   });
+  return refsByFrameKey;
+}
+
+function snapshotFrameKey(
+  target: import("../shared/wsProtocol").ActiveTabSnapshot | undefined,
+): string | undefined {
+  if (!target || typeof target.frameId !== "number") {
+    return undefined;
+  }
+  return [
+    target.tabId,
+    target.windowId,
+    target.frameId,
+    target.documentId ?? "",
+    target.navigationId ?? "",
+  ].join(":");
+}
+
+function createSnapshotFrameRef(
+  target: import("../shared/wsProtocol").ActiveTabSnapshot,
+  fingerprint: string,
+): string {
+  const value = `${snapshotFrameKey(target) ?? ""}:${fingerprint}`;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `fr1_${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
 async function resolveSnapshotReferences(
@@ -2322,85 +2972,161 @@ async function resolveSnapshotReferences(
   pluginBridge: PluginWebSocketServer,
   sessionId?: string,
 ): Promise<Record<string, unknown>> {
-  const references = collectSnapshotRefs(toolName, args);
-  if (references.length === 0) {
+  const requestedReferences = collectSnapshotRefs(toolName, args);
+  if (requestedReferences.length === 0) {
     return args;
   }
   const state = getBrowserStateSnapshot(sessionId);
-  const referenceSet = snapshotReferencesBySession.get(state.sessionId);
-  if (!referenceSet) {
+  const generation = snapshotReferencesBySession.get(state.sessionId);
+  if (!generation) {
     throw new Error(
       "SNAPSHOT_REF_UNKNOWN: read a fresh browser_snapshot and reuse its targetRef.",
     );
   }
-  if (
-    !state.activeTab ||
-    !sameBrowserTarget(referenceSet.target, state.activeTab)
-  ) {
-    snapshotReferencesBySession.delete(state.sessionId);
-    throw new Error(
-      "STALE_SNAPSHOT_REF: the selected tab, frame, or document changed; read a fresh browser_snapshot.",
-    );
+  const selectedSets = new Map<string, SnapshotFrameReferenceSet>();
+  for (const request of requestedReferences) {
+    const frameRef = request.frameRef ?? generation.selectedFrameRef;
+    const referenceSet = generation.frames.get(frameRef);
+    if (!referenceSet) {
+      throw new Error(
+        "SNAPSHOT_FRAME_REF_UNKNOWN: observe the page again and use frameRef from that result.",
+      );
+    }
+    if (
+      request.frameRef &&
+      (!request.documentId ||
+        request.documentId !== referenceSet.target.documentId)
+    ) {
+      throw new Error(
+        "STALE_FRAME_REF: frameRef requires the exact documentId returned by browser_observe.",
+      );
+    }
+    if (
+      !state.activeTab ||
+      !sameTopLevelBrowserTarget(referenceSet.target, state.activeTab)
+    ) {
+      snapshotReferencesBySession.delete(state.sessionId);
+      throw new Error(
+        "STALE_SNAPSHOT_REF: the selected tab or navigation changed; observe the page again.",
+      );
+    }
+    selectedSets.set(frameRef, referenceSet);
   }
+  await Promise.all(
+    [...selectedSets.values()].map(async (referenceSet) => {
+      const live = await proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DOM_GET_PAGE_INFO,
+        args: {
+          limit: 1,
+          mode: referenceSet.mode,
+          sourceLimit: referenceSet.sourceLimit,
+          frameScope: "selected",
+          frameId: referenceSet.target.frameId,
+          documentId: referenceSet.target.documentId,
+        },
+      } as unknown as AnyToolCall);
+      if (
+        !isSemanticPageSnapshot(live) ||
+        live.semanticSnapshot.fingerprint !== referenceSet.fingerprint ||
+        !live.provenance?.target ||
+        !sameBrowserTarget(referenceSet.target, live.provenance.target)
+      ) {
+        snapshotReferencesBySession.delete(state.sessionId);
+        throw new Error(
+          "STALE_SNAPSHOT_REF: the frame document or semantic structure changed; observe the page again.",
+        );
+      }
+    }),
+  );
 
-  const live = await proxyBrowserTool(pluginBridge, {
-    id: createMessageId(),
-    toolName: TOOL_NAMES.DOM_GET_PAGE_INFO,
-    args: {
-      limit: 1,
-      mode: referenceSet.mode,
-      sourceLimit: referenceSet.sourceLimit,
-    },
-  });
-  if (
-    !isSemanticPageSnapshot(live) ||
-    live.semanticSnapshot.fingerprint !== referenceSet.fingerprint ||
-    (live.provenance?.target &&
-      !sameBrowserTarget(referenceSet.target, live.provenance.target))
-  ) {
-    snapshotReferencesBySession.delete(state.sessionId);
-    throw new Error(
-      "STALE_SNAPSHOT_REF: the page semantic structure changed; read a fresh browser_snapshot.",
+  const resolve = (
+    ref: string,
+    frameRef?: string,
+  ): SnapshotReferenceBinding & {
+    frameId?: number;
+    documentId?: string;
+  } => {
+    const referenceSet = generation.frames.get(
+      frameRef ?? generation.selectedFrameRef,
     );
-  }
-
-  const resolve = (ref: string): string => {
-    const binding = referenceSet.references.get(ref);
+    const binding = referenceSet?.references.get(ref);
     if (!binding) {
       throw new Error(
         "SNAPSHOT_REF_UNKNOWN: the targetRef was not returned by the latest browser_snapshot pages.",
       );
     }
-    return binding.selector;
+    return {
+      ...binding,
+      frameId: referenceSet?.target.frameId,
+      documentId: referenceSet?.target.documentId,
+    };
   };
   return replaceSnapshotRefs(toolName, args, resolve);
+}
+
+interface SnapshotRefRequest {
+  ref: string;
+  frameRef?: string;
+  documentId?: string;
 }
 
 function collectSnapshotRefs(
   toolName: McpToolName,
   args: Record<string, unknown>,
-): string[] {
+): SnapshotRefRequest[] {
+  const fromTarget = (value: Record<string, unknown>): SnapshotRefRequest[] =>
+    typeof value.ref === "string"
+      ? [{
+          ref: value.ref,
+          ...(typeof value.frameRef === "string"
+            ? { frameRef: value.frameRef }
+            : {}),
+          ...(typeof value.documentId === "string"
+            ? { documentId: value.documentId }
+            : {}),
+        }]
+      : [];
+  if (toolName === MCP_TOOL_NAMES.BROWSER_WORKFLOW) {
+    return [
+      ...collectSnapshotRefs(
+        MCP_TOOL_NAMES.BROWSER_ACT,
+        { actions: args.actions },
+      ),
+      ...collectSnapshotRefs(
+        MCP_TOOL_NAMES.BROWSER_VERIFY,
+        { checks: args.checks },
+      ),
+    ];
+  }
   if (
     toolName === MCP_TOOL_NAMES.BROWSER_CLICK ||
     toolName === MCP_TOOL_NAMES.BROWSER_HOVER ||
     toolName === MCP_TOOL_NAMES.BROWSER_TYPE ||
     toolName === MCP_TOOL_NAMES.BROWSER_PRESS_KEY ||
-    toolName === MCP_TOOL_NAMES.BROWSER_SELECT_OPTION
+    toolName === MCP_TOOL_NAMES.BROWSER_SELECT_OPTION ||
+    toolName === MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT
   ) {
-    return typeof args.ref === "string" ? [args.ref] : [];
+    return fromTarget(args);
   }
   if (toolName === MCP_TOOL_NAMES.BROWSER_DRAG) {
-    return [args.sourceRef, args.targetRef].filter(
-      (value): value is string => typeof value === "string",
-    );
+    return [args.sourceRef, args.targetRef]
+      .filter((value): value is string => typeof value === "string")
+      .map((ref) => ({
+        ref,
+        ...(typeof args.frameRef === "string"
+          ? { frameRef: args.frameRef }
+          : {}),
+        ...(typeof args.documentId === "string"
+          ? { documentId: args.documentId }
+          : {}),
+      }));
   }
   if (toolName === MCP_TOOL_NAMES.BROWSER_FILL_FORM) {
     return Array.isArray(args.fields)
       ? args.fields.flatMap((field) =>
-          field &&
-          typeof field === "object" &&
-          typeof (field as { ref?: unknown }).ref === "string"
-            ? [(field as { ref: string }).ref]
+          field && typeof field === "object"
+            ? fromTarget(field as Record<string, unknown>)
             : [],
         )
       : [];
@@ -2414,24 +3140,29 @@ function collectSnapshotRefs(
           if (!action || typeof action !== "object") {
             return [];
           }
-          const value = action as {
-            ref?: unknown;
-            sourceRef?: unknown;
-            targetRef?: unknown;
-          };
-          return [value.ref, value.sourceRef, value.targetRef].filter(
-            (reference): reference is string => typeof reference === "string",
-          );
+          const value = action as Record<string, unknown>;
+          const direct = fromTarget(value);
+          const dragRefs = [value.sourceRef, value.targetRef]
+            .filter((reference): reference is string =>
+              typeof reference === "string")
+            .map((ref) => ({
+              ref,
+              ...(typeof value.frameRef === "string"
+                ? { frameRef: value.frameRef }
+                : {}),
+              ...(typeof value.documentId === "string"
+                ? { documentId: value.documentId }
+                : {}),
+            }));
+          return [...direct, ...dragRefs];
         })
       : [];
   }
   if (toolName === MCP_TOOL_NAMES.BROWSER_VERIFY) {
     return Array.isArray(args.checks)
       ? args.checks.flatMap((check) =>
-          check &&
-          typeof check === "object" &&
-          typeof (check as { ref?: unknown }).ref === "string"
-            ? [(check as { ref: string }).ref]
+          check && typeof check === "object"
+            ? fromTarget(check as Record<string, unknown>)
             : [],
         )
       : [];
@@ -2442,40 +3173,105 @@ function collectSnapshotRefs(
 function replaceSnapshotRefs(
   toolName: McpToolName,
   args: Record<string, unknown>,
-  resolve: (ref: string) => string,
+  resolve: (
+    ref: string,
+    frameRef?: string,
+  ) => SnapshotReferenceBinding & {
+    frameId?: number;
+    documentId?: string;
+  },
 ): Record<string, unknown> {
   const replaceTarget = (value: Record<string, unknown>) => {
     if (typeof value.ref !== "string") {
       return value;
     }
-    const { ref, ...rest } = value;
-    return { ...rest, selector: resolve(ref) };
+    const { ref, frameRef, documentId: _documentId, ...rest } = value;
+    const binding = resolve(
+      ref,
+      typeof frameRef === "string" ? frameRef : undefined,
+    );
+    return {
+      ...rest,
+      selector: binding.selector,
+      ...(binding.frameId !== undefined ? { frameId: binding.frameId } : {}),
+      ...(binding.documentId ? { documentId: binding.documentId } : {}),
+    };
   };
+  if (toolName === MCP_TOOL_NAMES.BROWSER_WORKFLOW) {
+    const replacedActions = Array.isArray(args.actions)
+      ? replaceSnapshotRefs(
+          MCP_TOOL_NAMES.BROWSER_ACT,
+          { actions: args.actions },
+          resolve,
+        ).actions
+      : undefined;
+    const replacedChecks = Array.isArray(args.checks)
+      ? replaceSnapshotRefs(
+          MCP_TOOL_NAMES.BROWSER_VERIFY,
+          { checks: args.checks },
+          resolve,
+        ).checks
+      : undefined;
+    return {
+      ...args,
+      ...(replacedActions ? { actions: replacedActions } : {}),
+      ...(replacedChecks ? { checks: replacedChecks } : {}),
+    };
+  }
   if (
     toolName === MCP_TOOL_NAMES.BROWSER_CLICK ||
     toolName === MCP_TOOL_NAMES.BROWSER_HOVER ||
     toolName === MCP_TOOL_NAMES.BROWSER_TYPE ||
     toolName === MCP_TOOL_NAMES.BROWSER_PRESS_KEY ||
-    toolName === MCP_TOOL_NAMES.BROWSER_SELECT_OPTION
+    toolName === MCP_TOOL_NAMES.BROWSER_SELECT_OPTION ||
+    toolName === MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT
   ) {
     return replaceTarget(args);
   }
   if (toolName === MCP_TOOL_NAMES.BROWSER_DRAG) {
-    const { sourceRef, targetRef, ...rest } = args;
+    const { sourceRef, targetRef, frameRef, documentId: _documentId, ...rest } = args;
+    const sourceBinding =
+      typeof sourceRef === "string"
+        ? resolve(sourceRef, typeof frameRef === "string" ? frameRef : undefined)
+        : undefined;
+    const targetBinding =
+      typeof targetRef === "string"
+        ? resolve(targetRef, typeof frameRef === "string" ? frameRef : undefined)
+        : undefined;
     return {
       ...rest,
-      ...(typeof sourceRef === "string"
-        ? { sourceSelector: resolve(sourceRef) }
+      ...(sourceBinding
+        ? { sourceSelector: sourceBinding.selector }
         : {}),
-      ...(typeof targetRef === "string"
-        ? { targetSelector: resolve(targetRef) }
+      ...(targetBinding
+        ? { targetSelector: targetBinding.selector }
+        : {}),
+      ...(sourceBinding?.frameId !== undefined
+        ? { frameId: sourceBinding.frameId }
+        : {}),
+      ...(sourceBinding?.documentId
+        ? { documentId: sourceBinding.documentId }
         : {}),
     };
   }
   if (toolName === MCP_TOOL_NAMES.BROWSER_FILL_FORM) {
+    const fields = (args.fields as Record<string, unknown>[]).map(replaceTarget);
+    const scopes = new Set(
+      fields.map((field) => `${field.frameId ?? ""}:${field.documentId ?? ""}`),
+    );
+    if (scopes.size > 1) {
+      throw new Error(
+        "MIXED_FRAME_BATCH_UNSUPPORTED: one browser_fill_form call must target one frame.",
+      );
+    }
+    const first = fields[0];
     return {
       ...args,
-      fields: (args.fields as Record<string, unknown>[]).map(replaceTarget),
+      fields: fields.map(({ frameId: _frameId, documentId: _documentId, ...field }) => field),
+      ...(typeof first?.frameId === "number" ? { frameId: first.frameId } : {}),
+      ...(typeof first?.documentId === "string"
+        ? { documentId: first.documentId }
+        : {}),
     };
   }
   if (
@@ -2486,14 +3282,40 @@ function replaceSnapshotRefs(
       if (value.type !== "drag") {
         return replaceTarget(value);
       }
-      const { sourceRef, targetRef, ...rest } = value;
+      const {
+        sourceRef,
+        targetRef,
+        frameRef,
+        documentId: _documentId,
+        ...rest
+      } = value;
+      const sourceBinding =
+        typeof sourceRef === "string"
+          ? resolve(
+              sourceRef,
+              typeof frameRef === "string" ? frameRef : undefined,
+            )
+          : undefined;
+      const targetBinding =
+        typeof targetRef === "string"
+          ? resolve(
+              targetRef,
+              typeof frameRef === "string" ? frameRef : undefined,
+            )
+          : undefined;
       return {
         ...rest,
-        ...(typeof sourceRef === "string"
-          ? { sourceSelector: resolve(sourceRef) }
+        ...(sourceBinding
+          ? { sourceSelector: sourceBinding.selector }
           : {}),
-        ...(typeof targetRef === "string"
-          ? { targetSelector: resolve(targetRef) }
+        ...(targetBinding
+          ? { targetSelector: targetBinding.selector }
+          : {}),
+        ...(sourceBinding?.frameId !== undefined
+          ? { frameId: sourceBinding.frameId }
+          : {}),
+        ...(sourceBinding?.documentId
+          ? { documentId: sourceBinding.documentId }
           : {}),
       };
     };
@@ -2512,6 +3334,10 @@ function replaceSnapshotRefs(
 }
 
 type ParsedActionStage = z.infer<typeof actionStageSchema>;
+type ResolvedActionStageAction = ParsedActionStage["actions"][number] & {
+  frameId?: number;
+  documentId?: string;
+};
 
 async function executeActionStage(
   pluginBridge: PluginWebSocketServer,
@@ -2541,7 +3367,7 @@ async function executeActionStage(
   const stopOnFailure = stage.stopOnFailure !== false;
 
   for (let index = 0; index < stage.actions.length; ) {
-    const action = stage.actions[index];
+    const action = stage.actions[index] as ResolvedActionStageAction | undefined;
     if (!action) {
       break;
     }
@@ -2563,7 +3389,9 @@ async function executeActionStage(
       const batch: Array<Extract<ParsedActionStage["actions"][number], { type: "fill" | "select" }>> = [];
       let cursor = index;
       while (cursor < stage.actions.length) {
-        const candidate = stage.actions[cursor];
+        const candidate = stage.actions[cursor] as
+          | ResolvedActionStageAction
+          | undefined;
         if (!candidate) {
           break;
         }
@@ -2571,6 +3399,9 @@ async function executeActionStage(
           candidate.type !== "fill" &&
           candidate.type !== "select"
         ) {
+          break;
+        }
+        if (actionFrameKey(candidate) !== actionFrameKey(action)) {
           break;
         }
         if (
@@ -2597,6 +3428,12 @@ async function executeActionStage(
               selector: entry.selector,
               value: entry.type === "select" ? entry.values : entry.value,
             })),
+            ...(typeof action.frameId === "number"
+              ? { frameId: action.frameId }
+              : {}),
+            ...(typeof action.documentId === "string"
+              ? { documentId: action.documentId }
+              : {}),
           },
         } as unknown as AnyToolCall);
         for (const entry of batch) {
@@ -2614,7 +3451,7 @@ async function executeActionStage(
           data,
         });
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = actionFailureMessage(error);
         for (const entry of batch) {
           results.push({
             id: entry.id,
@@ -2640,13 +3477,27 @@ async function executeActionStage(
             selector: action.selector,
             button: action.button,
             doubleClick: action.doubleClick,
+            ...(typeof action.frameId === "number"
+              ? { frameId: action.frameId }
+              : {}),
+            ...(typeof action.documentId === "string"
+              ? { documentId: action.documentId }
+              : {}),
           },
         } as unknown as AnyToolCall);
       } else if (action.type === "hover") {
         data = await proxyBrowserTool(pluginBridge, {
           id: createMessageId(),
           toolName: TOOL_NAMES.BROWSER_HOVER,
-          args: { selector: action.selector },
+          args: {
+            selector: action.selector,
+            ...(typeof action.frameId === "number"
+              ? { frameId: action.frameId }
+              : {}),
+            ...(typeof action.documentId === "string"
+              ? { documentId: action.documentId }
+              : {}),
+          },
         } as unknown as AnyToolCall);
       } else if (action.type === "drag") {
         data = await proxyBrowserTool(pluginBridge, {
@@ -2655,6 +3506,12 @@ async function executeActionStage(
           args: {
             sourceSelector: action.sourceSelector,
             targetSelector: action.targetSelector,
+            ...(typeof action.frameId === "number"
+              ? { frameId: action.frameId }
+              : {}),
+            ...(typeof action.documentId === "string"
+              ? { documentId: action.documentId }
+              : {}),
           },
         } as unknown as AnyToolCall);
       } else if (action.type === "scroll") {
@@ -2678,7 +3535,16 @@ async function executeActionStage(
         data = await proxyBrowserTool(pluginBridge, {
           id: createMessageId(),
           toolName: TOOL_NAMES.BROWSER_PRESS_KEY,
-          args: { key: action.key, selector: action.selector },
+          args: {
+            key: action.key,
+            selector: action.selector,
+            ...(typeof action.frameId === "number"
+              ? { frameId: action.frameId }
+              : {}),
+            ...(typeof action.documentId === "string"
+              ? { documentId: action.documentId }
+              : {}),
+          },
         } as unknown as AnyToolCall);
       } else if (action.type === "wait") {
         data = await proxyBrowserTool(pluginBridge, {
@@ -2688,6 +3554,12 @@ async function executeActionStage(
             selector: action.selector,
             time: action.time,
             timeoutMs: action.timeoutMs,
+            ...(typeof action.frameId === "number"
+              ? { frameId: action.frameId }
+              : {}),
+            ...(typeof action.documentId === "string"
+              ? { documentId: action.documentId }
+              : {}),
           },
         } as unknown as AnyToolCall);
       } else {
@@ -2711,7 +3583,7 @@ async function executeActionStage(
         id: action.id,
         type: action.type,
         status: "failed",
-        error: error instanceof Error ? error.message : String(error),
+        error: actionFailureMessage(error),
       });
       stoppedAt = action.id;
       if (stopOnFailure) break;
@@ -2719,7 +3591,7 @@ async function executeActionStage(
     index += 1;
   }
 
-  return {
+  const result: Record<string, unknown> = {
     version: "action-stage-v1",
     completed: succeeded.size,
     requested: stage.actions.length,
@@ -2730,6 +3602,30 @@ async function executeActionStage(
     ),
     results,
   };
+  const postStates = await readActionPostStates(
+    pluginBridge,
+    stage.actions as unknown as Record<string, unknown>[],
+  );
+  attachActionPostStates(result, postStates);
+  return result;
+}
+
+function actionFailureMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    /(?:connection closed|disconnected|transport|deadline exceeded|REQUEST_DEADLINE_EXCEEDED)/i.test(
+      message,
+    )
+  ) {
+    return `UNKNOWN_WRITE_OUTCOME: the executor transport ended before the action result was confirmed. The action was not replayed. Re-observe the page before deciding whether to retry. Cause: ${message}`;
+  }
+  return message;
+}
+
+function actionFrameKey(
+  action: { frameId?: number; documentId?: string },
+): string {
+  return `${action.frameId ?? ""}:${action.documentId ?? ""}`;
 }
 
 function isNativeStageSelector(selector: string): boolean {
@@ -2754,6 +3650,19 @@ function sameBrowserTarget(
     left.documentId === right.documentId &&
     left.navigationId === right.navigationId &&
     left.url === right.url
+  );
+}
+
+function sameTopLevelBrowserTarget(
+  left: import("../shared/wsProtocol").ActiveTabSnapshot | undefined,
+  right: import("../shared/wsProtocol").ActiveTabSnapshot | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.tabId === right.tabId &&
+    left.targetId === right.targetId &&
+    left.windowId === right.windowId &&
+    left.navigationId === right.navigationId
   );
 }
 
@@ -2874,7 +3783,11 @@ export function formatMcpToolResult(
 ): McpSuccessToolResult | McpErrorToolResult {
   const image = extractScreenshotImage(value);
   const structuredContent = toBoundedStructuredContent(value);
-  if (image) {
+  if (
+    image ||
+    (isRecordValue(value) &&
+      (value.mimeType === "image/png" || value.mimeType === "image/jpeg"))
+  ) {
     delete structuredContent.dataUrl;
   }
   const content: McpFormattedContent = [
