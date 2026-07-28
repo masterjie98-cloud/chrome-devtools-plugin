@@ -31,6 +31,11 @@ export const MCP_DIRECT_STATE_RESOURCES = [
     stateKey: "collaborationWorkspace",
     scope: "session",
   },
+  {
+    name: "activity-stream",
+    stateKey: "activityStream",
+    scope: "session",
+  },
 ] as const satisfies readonly {
   name: string;
   stateKey: DaemonStateResourceKey;

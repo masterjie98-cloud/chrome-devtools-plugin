@@ -13,6 +13,8 @@ export const COLLABORATION_TOOL_NAMES = {
   PUBLISH_ITEM: "browser_publish_collaboration_item",
   DELEGATE_TASK: "browser_delegate_collaboration_task",
   WAIT_FOR_TASK_RESULT: "browser_wait_for_collaboration_result",
+  UPDATE_TASK: "browser_update_collaboration_task",
+  CANCEL_TASK: "browser_cancel_collaboration_task",
   CLAIM_TASK: "browser_claim_collaboration_task",
   COMPLETE_TASK: "browser_complete_collaboration_task",
 } as const;
@@ -29,6 +31,14 @@ export const DELEGATED_TASK_RESULT_STATUSES = [
 ] as const;
 export type DelegatedTaskResultStatus =
   (typeof DELEGATED_TASK_RESULT_STATUSES)[number];
+export const DELEGATED_TASK_EVENT_TYPES = [
+  "progress",
+  "clarification",
+  "requirement",
+  "evidence",
+] as const;
+export type DelegatedTaskEventType =
+  (typeof DELEGATED_TASK_EVENT_TYPES)[number];
 export const DELEGATED_TASK_PHASES = [
   "pending",
   "claimed",
@@ -68,6 +78,20 @@ export interface DelegatedTaskResultContent {
   resultFingerprint: string;
 }
 
+export interface DelegatedTaskEventContent {
+  version: typeof DELEGATED_TASK_VERSION;
+  type: "event";
+  taskId: string;
+  eventId: string;
+  eventType: DelegatedTaskEventType;
+  message: string;
+  progress?: number;
+  requirements?: string[];
+  artifactUris?: string[];
+  eventFingerprint: string;
+  publishedAt: string;
+}
+
 export type DelegatedTaskPhase = (typeof DELEGATED_TASK_PHASES)[number];
 
 export interface DelegatedTaskSnapshot {
@@ -77,6 +101,10 @@ export interface DelegatedTaskSnapshot {
   request: DelegatedTaskRequestContent;
   claimItem?: CollaborationItem;
   claim?: DelegatedTaskClaimContent;
+  events: Array<{
+    item: CollaborationItem;
+    content: DelegatedTaskEventContent;
+  }>;
   resultItem?: CollaborationItem;
   result?: DelegatedTaskResultContent;
 }
@@ -94,6 +122,34 @@ export function delegatedTaskClaimItemId(taskId: string): string {
 export function delegatedTaskResultItemId(taskId: string): string {
   assertDelegatedTaskId(taskId);
   return `ctx_result_${taskId.slice("task_".length)}`;
+}
+
+export function delegatedTaskEventItemId(
+  taskId: string,
+  eventId: string,
+): string {
+  assertDelegatedTaskId(taskId);
+  if (!/^evt_[A-Za-z0-9_-]{8,80}$/.test(eventId)) {
+    throw new Error(
+      "Delegated task event ID must match evt_[A-Za-z0-9_-]{8,80}.",
+    );
+  }
+  const itemId =
+    `ctx_event_${taskId.slice("task_".length)}_${eventId.slice("evt_".length)}`;
+  if (itemId.length <= 200) {
+    return itemId;
+  }
+  const suffix = stableIdFingerprint(itemId);
+  return `${itemId.slice(0, 200 - suffix.length - 1)}_${suffix}`;
+}
+
+function stableIdFingerprint(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 export function assertDelegatedTaskId(taskId: string): void {
@@ -151,6 +207,22 @@ export function listDelegatedTasks(
         .sort((left, right) =>
           right.item.updatedAt.localeCompare(left.item.updatedAt),
         );
+      const eventEntries = children
+        .map((candidate) => ({
+          item: candidate,
+          content: parseDelegatedTaskEvent(candidate),
+        }))
+        .filter(
+          (
+            candidate,
+          ): candidate is {
+            item: CollaborationItem;
+            content: DelegatedTaskEventContent;
+          } => candidate.content?.taskId === request.taskId,
+        )
+        .sort((left, right) =>
+          left.item.createdAt.localeCompare(right.item.createdAt),
+        );
       const claimEntry = claimEntries[0];
       const resultEntry = resultEntries[0];
       return [
@@ -165,6 +237,7 @@ export function listDelegatedTasks(
           request,
           claimItem: claimEntry?.item,
           claim: claimEntry?.content,
+          events: eventEntries,
           resultItem: resultEntry?.item,
           result: resultEntry?.content,
         } satisfies DelegatedTaskSnapshot,
@@ -299,7 +372,12 @@ export function parseDelegatedTaskResult(
 ): DelegatedTaskResultContent | undefined {
   if (
     item.kind !== "task.result" ||
-    item.source.actor !== "extension_agent" ||
+    (item.source.actor !== "extension_agent" &&
+      !(
+        item.source.actor === "mcp_agent" &&
+        isRecord(item.content) &&
+        item.content.status === "cancelled"
+      )) ||
     !isRecord(item.content) ||
     item.content.version !== DELEGATED_TASK_VERSION ||
     item.content.type !== "result" ||
@@ -323,6 +401,53 @@ export function parseDelegatedTaskResult(
     agentSessionId: item.content.agentSessionId,
     completedAt: item.updatedAt,
     resultFingerprint: item.content.resultFingerprint,
+  };
+}
+
+export function parseDelegatedTaskEvent(
+  item: CollaborationItem,
+): DelegatedTaskEventContent | undefined {
+  if (
+    item.kind !== "task.state" ||
+    (item.source.actor !== "extension_agent" &&
+      item.source.actor !== "mcp_agent") ||
+    !isRecord(item.content) ||
+    item.content.version !== DELEGATED_TASK_VERSION ||
+    item.content.type !== "event" ||
+    typeof item.content.taskId !== "string" ||
+    !DELEGATED_TASK_ID_PATTERN.test(item.content.taskId) ||
+    typeof item.content.eventId !== "string" ||
+    !/^evt_[A-Za-z0-9_-]{8,80}$/.test(item.content.eventId) ||
+    !DELEGATED_TASK_EVENT_TYPES.includes(
+      item.content.eventType as DelegatedTaskEventType,
+    ) ||
+    typeof item.content.message !== "string" ||
+    typeof item.content.eventFingerprint !== "string" ||
+    (item.content.progress !== undefined &&
+      (typeof item.content.progress !== "number" ||
+        item.content.progress < 0 ||
+        item.content.progress > 100)) ||
+    (item.content.requirements !== undefined &&
+      (!Array.isArray(item.content.requirements) ||
+        !item.content.requirements.every((value) => typeof value === "string"))) ||
+    (item.content.artifactUris !== undefined &&
+      (!Array.isArray(item.content.artifactUris) ||
+        !item.content.artifactUris.every((value) => typeof value === "string")))
+  ) {
+    return undefined;
+  }
+  return {
+    version: DELEGATED_TASK_VERSION,
+    type: "event",
+    taskId: item.content.taskId,
+    eventId: item.content.eventId,
+    eventType: item.content.eventType as DelegatedTaskEventType,
+    message: item.content.message,
+    progress: item.content.progress as number | undefined,
+    requirements: item.content.requirements as string[] | undefined,
+    artifactUris: item.content.artifactUris as string[] | undefined,
+    eventFingerprint: item.content.eventFingerprint,
+    publishedAt: item.updatedAt,
   };
 }
 

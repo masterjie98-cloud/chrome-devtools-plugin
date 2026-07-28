@@ -8,6 +8,7 @@ import {
   sanitizeAgentToolCallForPersistence,
   sanitizeAgentToolResultForPersistence,
   updateAgentSessionTaskState,
+  type AgentSessionExecutionBinding,
   type AgentSessionSnapshot,
   type AgentSessionToolCallSnapshot,
   type AgentSessionToolResultSnapshot,
@@ -53,9 +54,16 @@ import {
   MAX_AGENT_TOOL_BATCH_SIZE,
 } from "./agentExecutionStrategy";
 import {
+  getAgentToolPreExecutionFailure,
   isAgentToolResultDefinitelyNotExecuted,
   isSuccessfulAgentToolResultContent,
+  type AgentToolPreExecutionFailure,
 } from "./agentToolResult";
+import {
+  arbitrateAgentFinalResult,
+  createAgentResultEvidenceState,
+  recordAgentResultEvidence,
+} from "./agentResultEvidence";
 import { isMcpToolTransportError } from "./mcpTransport";
 import {
   acceptFastAgentVisualCheckpoint,
@@ -81,6 +89,12 @@ interface RepeatedReadOnlyObservation {
   count: number;
 }
 
+interface FailedPreExecutionToolCall {
+  failure: AgentToolPreExecutionFailure;
+  progressVersion: number;
+  blockedRetries: number;
+}
+
 class AgentRunBudgetSummaryRequestedError extends Error {
   constructor(readonly budgetError: AgentRunBudgetExceededError) {
     super("The user requested a summary at the agent run budget boundary.");
@@ -98,6 +112,7 @@ export interface RunAutonomousAgentSessionParams {
   context: AgentContext;
   tools?: AiFunctionToolDefinition[];
   assistantMessageId: string;
+  executionBinding?: AgentSessionExecutionBinding;
   abortSignal?: AbortSignal;
   runBudgetLimits?: Partial<AgentRunBudgetLimits>;
   requestBudgetExtension?: (
@@ -136,7 +151,12 @@ export async function runAutonomousAgentSession(
   const reserveBudget: ReserveAgentRunBudget = (reservation) =>
     reserveAgentRunBudget(params, runBudget, reservation);
   let visibleContent = "";
-  let session = createAgentSessionSnapshot(createMessageId(), params.input);
+  let session = createAgentSessionSnapshot(
+    createMessageId(),
+    params.input,
+    undefined,
+    params.executionBinding,
+  );
   let context = params.context;
   const activeAttachments = [...params.attachments];
   const toolExchanges: AiToolExchange[] = [];
@@ -248,8 +268,64 @@ export async function runAutonomousAgentSession(
     let lastReadOnlyBatchResultFingerprint = "";
     let consecutiveIdenticalReadOnlyBatches = 0;
     const readOnlyObservationCounts = new Map<string, number>();
+    const failedPreExecutionToolCalls = new Map<
+      string,
+      FailedPreExecutionToolCall
+    >();
+    let executionProgressVersion = 0;
     let postMutationVerificationRequired = false;
     let blockedReason = "";
+    let resultEvidence = createAgentResultEvidenceState(params.input);
+    let resultArbiterRetryUsed = false;
+
+    if (
+      toolExecutionEnabled &&
+      aiResult.toolCalls.length === 0 &&
+      !arbitrateAgentFinalResult(resultEvidence, initialAssistantContent).accepted
+    ) {
+      resultArbiterRetryUsed = true;
+      visibleContent = "";
+      params.onVisibleContent("");
+      session = publishEvent(
+        session,
+        params.onSessionUpdate,
+        "context",
+        "模型声称页面操作完成但没有执行记录；Agent 正在要求它实际调用工具。",
+      );
+      const continuation = await requestToolContinuationAfterPlanningText({
+        config: params.config,
+        messages: params.messages,
+        input: params.input,
+        attachments: activeAttachments,
+        context,
+        toolExchanges,
+        visualCheckpoint: latestVisualCheckpoint,
+        tools: params.tools,
+        abortSignal: params.abortSignal,
+        visibleContent,
+        onVisibleContent: params.onVisibleContent,
+        onStatusUpdate: params.onStatusUpdate,
+        runBudget,
+        reserveBudget,
+        continuationInstruction:
+          "You claimed that a browser action completed, but no browser mutation tool was executed. Emit the required tool call now. Do not claim success in prose. If the target is unknown, observe the page first.",
+      });
+      aiResult = continuation.result;
+      currentAssistantContent = sanitizeAssistantVisibleContent(
+        continuation.result.content || continuation.chunk,
+      );
+      if (aiResult.toolCalls.length === 0) {
+        const decision = arbitrateAgentFinalResult(
+          resultEvidence,
+          currentAssistantContent || initialAssistantContent,
+        );
+        if (!decision.accepted) {
+          blockedReason = decision.message;
+          visibleContent = appendParagraph(visibleContent, blockedReason);
+          params.onVisibleContent(visibleContent);
+        }
+      }
+    }
 
     for (
       let round = 0;
@@ -271,6 +347,8 @@ export async function runAutonomousAgentSession(
         requestedBatchCallSignature === lastReadOnlyBatchCallSignature &&
         isNoProgressObservationBatch(requestedToolCalls);
       const blockedRepeatResults: AiToolResultMessage[] = [];
+      const replanBlockedResults: AiToolResultMessage[] = [];
+      let repeatedPreExecutionFailureNotice = "";
       let preBlockedReadOnlyObservation:
         | RepeatedReadOnlyObservation
         | undefined;
@@ -317,6 +395,47 @@ export async function runAutonomousAgentSession(
         }
 
         const signature = getToolCallSignature(toolCall);
+        const priorFailure = failedPreExecutionToolCalls.get(signature);
+        if (
+          priorFailure &&
+          (!priorFailure.failure.retryAfterProgress ||
+            priorFailure.progressVersion === executionProgressVersion)
+        ) {
+          priorFailure.blockedRetries += 1;
+          const terminal = priorFailure.blockedRetries > 1;
+          const reason = describeRepeatedPreExecutionFailure(
+            toolCall,
+            priorFailure,
+            terminal,
+          );
+          (terminal ? blockedRepeatResults : replanBlockedResults).push({
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            content: JSON.stringify(
+              {
+                blocked: true,
+                errorCode: terminal
+                  ? "REPEATED_PRE_EXECUTION_FAILURE"
+                  : "UNCHANGED_PRE_EXECUTION_RETRY_BLOCKED",
+                requiresReplan: true,
+                retryable: !terminal,
+                reason,
+              },
+              null,
+              2,
+            ),
+          });
+          if (terminal) {
+            repeatedPreExecutionFailureNotice = reason;
+          }
+          return false;
+        }
+        if (
+          priorFailure?.failure.retryAfterProgress &&
+          priorFailure.progressVersion < executionProgressVersion
+        ) {
+          failedPreExecutionToolCalls.delete(signature);
+        }
         const seenCount = seenToolSignatures.get(signature) ?? 0;
         seenToolSignatures.set(signature, seenCount + 1);
         const toolNameCount = toolNameCounts.get(toolCall.name) ?? 0;
@@ -412,7 +531,7 @@ export async function runAutonomousAgentSession(
       const toolResults = mergeToolResultsInRequestOrder(
         requestedToolCalls,
         executedToolResults,
-        blockedRepeatResults,
+        [...blockedRepeatResults, ...replanBlockedResults],
       );
       const modelRequestedScreenshot = findSuccessfulScreenshotAttachment(
         executableToolCalls,
@@ -427,6 +546,12 @@ export async function runAutonomousAgentSession(
       }
       const executedResultsById = new Map(
         executedToolResults.map((result) => [result.toolCallId, result]),
+      );
+      executionProgressVersion = recordPreExecutionToolResults(
+        executableToolCalls,
+        executedToolResults,
+        failedPreExecutionToolCalls,
+        executionProgressVersion,
       );
       const mutationMayHaveExecuted = executableToolCalls.some((toolCall) => {
         const result = executedResultsById.get(toolCall.id);
@@ -454,6 +579,11 @@ export async function runAutonomousAgentSession(
         }) &&
         executedToolResults.length === executableToolCalls.length &&
         executedToolResults.every(isSuccessfulToolResult);
+      resultEvidence = recordAgentResultEvidence(
+        resultEvidence,
+        executableToolCalls,
+        executedToolResults,
+      );
       if (mutationMayHaveExecuted) {
         postMutationVerificationRequired = true;
       } else if (
@@ -647,6 +777,23 @@ export async function runAutonomousAgentSession(
         );
       }
 
+      if (repeatedPreExecutionFailureNotice) {
+        blockedReason = repeatedPreExecutionFailureNotice;
+        visibleContent = appendParagraph(
+          visibleContent,
+          repeatedPreExecutionFailureNotice,
+        );
+        params.onVisibleContent(
+          sanitizeAssistantVisibleContent(visibleContent),
+        );
+        session = publishEvent(
+          session,
+          params.onSessionUpdate,
+          "context",
+          repeatedPreExecutionFailureNotice,
+        );
+      }
+
       if (
         blockedRepeatResults.length > 0 ||
         crossRoundNoProgressObservation
@@ -757,6 +904,12 @@ export async function runAutonomousAgentSession(
             visualCheckpoint: latestVisualCheckpoint,
             tools: params.tools,
             enableTools: true,
+            requireContinuation: replanBlockedResults.length > 0,
+            continuationInstruction:
+              replanBlockedResults.length > 0
+                ? "The previous tool call was rejected before execution because the same tool and arguments already failed. Do not repeat that unchanged call. For invalid arguments, inspect the tool schema and provide a selector or fresh targetRef. For stale, unavailable, or missing targets, call browser_observe, browser_snapshot, or a bounded wait first, then retry only with fresh evidence. Continue the original task now."
+                : undefined,
+            forceToolChoice: replanBlockedResults.length > 0,
             abortSignal: params.abortSignal,
             onDelta: (delta) => {
               firstDeltaReceived = true;
@@ -803,6 +956,78 @@ export async function runAutonomousAgentSession(
       // page action. Some local models narrate the next step instead of
       // emitting the function call, so give those cases one tool-call retry.
       if (firstContent.trim()) {
+        const resultDecision = arbitrateAgentFinalResult(
+          resultEvidence,
+          firstContent,
+        );
+        if (
+          !resultDecision.accepted &&
+          resultDecision.code === "UNSUPPORTED_BROWSER_EFFECT_CLAIM"
+        ) {
+          if (resultArbiterRetryUsed) {
+            blockedReason = resultDecision.message;
+            visibleContent = appendParagraph(visibleContent, blockedReason);
+            params.onVisibleContent(
+              sanitizeAssistantVisibleContent(visibleContent),
+            );
+            break;
+          }
+          resultArbiterRetryUsed = true;
+          params.onVisibleContent(
+            sanitizeAssistantVisibleContent(visibleContent),
+          );
+          session = publishEvent(
+            session,
+            params.onSessionUpdate,
+            "context",
+            "模型声称页面操作完成但没有对应工具记录；Agent 正在要求实际执行。",
+          );
+          const correction = await requestToolContinuationAfterPlanningText({
+            config: params.config,
+            messages: params.messages,
+            input: params.input,
+            attachments: activeAttachments,
+            context,
+            toolExchanges,
+            visualCheckpoint: latestVisualCheckpoint,
+            tools: params.tools,
+            abortSignal: params.abortSignal,
+            visibleContent,
+            onVisibleContent: params.onVisibleContent,
+            onStatusUpdate: params.onStatusUpdate,
+            runBudget,
+            reserveBudget,
+            continuationInstruction:
+              "The final answer claims a browser effect succeeded, but no successful browser mutation tool supports that claim. Emit the necessary tool call now, or clearly state that the action was not performed.",
+          });
+          const correctionContent = sanitizeAssistantVisibleContent(
+            correction.result.content || correction.chunk,
+          );
+          if (correction.result.toolCalls.length > 0) {
+            currentAssistantContent = correctionContent || firstContent;
+            aiResult = correction.result;
+            continue;
+          }
+          const correctedDecision = arbitrateAgentFinalResult(
+            resultEvidence,
+            correctionContent || firstContent,
+          );
+          if (!correctedDecision.accepted) {
+            blockedReason = correctedDecision.message;
+            visibleContent = appendParagraph(visibleContent, blockedReason);
+            params.onVisibleContent(
+              sanitizeAssistantVisibleContent(visibleContent),
+            );
+            break;
+          }
+          visibleContent = appendParagraph(visibleContent, correctionContent);
+          params.onVisibleContent(
+            sanitizeAssistantVisibleContent(visibleContent),
+          );
+          currentAssistantContent = correctionContent;
+          aiResult = correction.result;
+          break;
+        }
         if (postMutationVerificationRequired) {
           params.onVisibleContent(
             sanitizeAssistantVisibleContent(visibleContent),
@@ -998,10 +1223,21 @@ export async function runAutonomousAgentSession(
       }
     }
 
-    const sanitizedFinalContent = sanitizeAssistantVisibleContent(
+    let sanitizedFinalContent = sanitizeAssistantVisibleContent(
       visibleContent,
       toolExecutionEnabled,
     );
+    const finalDecision = arbitrateAgentFinalResult(
+      resultEvidence,
+      sanitizedFinalContent,
+    );
+    if (!finalDecision.accepted && !blockedReason) {
+      blockedReason = finalDecision.message;
+      sanitizedFinalContent = appendParagraph(
+        sanitizedFinalContent,
+        finalDecision.message,
+      );
+    }
     if (!sanitizedFinalContent && !blockedReason) {
       blockedReason = "模型没有返回可显示的最终内容。";
     }
@@ -1676,6 +1912,56 @@ function getToolCallSignature(toolCall: AiRequestedToolCall): string {
 
 function getToolBatchCallSignature(toolCalls: AiRequestedToolCall[]): string {
   return toolCalls.map(getToolCallSignature).join("\n");
+}
+
+function recordPreExecutionToolResults(
+  toolCalls: AiRequestedToolCall[],
+  toolResults: AiToolResultMessage[],
+  failures: Map<string, FailedPreExecutionToolCall>,
+  currentProgressVersion: number,
+): number {
+  const resultsById = new Map(
+    toolResults.map((result) => [result.toolCallId, result]),
+  );
+  let nextProgressVersion = currentProgressVersion;
+  for (const toolCall of toolCalls) {
+    const result = resultsById.get(toolCall.id);
+    if (result && isSuccessfulToolResult(result)) {
+      nextProgressVersion += 1;
+    }
+  }
+  for (const toolCall of toolCalls) {
+    const result = resultsById.get(toolCall.id);
+    if (!result) {
+      continue;
+    }
+    const signature = getToolCallSignature(toolCall);
+    const failure = getAgentToolPreExecutionFailure(result.content);
+    if (failure) {
+      failures.set(signature, {
+        failure,
+        progressVersion: nextProgressVersion,
+        blockedRetries: failures.get(signature)?.blockedRetries ?? 0,
+      });
+    } else if (isSuccessfulToolResult(result)) {
+      failures.delete(signature);
+    }
+  }
+  return nextProgressVersion;
+}
+
+function describeRepeatedPreExecutionFailure(
+  toolCall: AiRequestedToolCall,
+  record: FailedPreExecutionToolCall,
+  terminal: boolean,
+): string {
+  const recovery =
+    record.failure.kind === "invalid_arguments"
+      ? "检查工具参数 schema，并提供有效 selector 或最新 targetRef"
+      : "先重新观察或等待页面稳定，再基于新证据修改目标";
+  return terminal
+    ? `工具 ${toolCall.name} 在执行前失败后仍连续提交完全相同的参数。Agent 已停止这个重复分支；${recovery}。`
+    : `已阻止工具 ${toolCall.name} 使用完全相同参数重复执行。上一次调用未执行；${recovery}，然后继续原任务。`;
 }
 
 function isNoProgressObservationBatch(

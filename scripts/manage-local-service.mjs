@@ -7,6 +7,9 @@ import { spawnSync } from "node:child_process";
 
 const action = process.argv[2] ?? "print";
 const dryRun = process.argv.includes("--dry-run");
+const serverPathFlag = process.argv.indexOf("--server-path");
+const serverPathValue =
+  serverPathFlag >= 0 ? process.argv[serverPathFlag + 1]?.trim() : undefined;
 const label = "com.ai-devtools-assistant.daemon";
 const plistPath = resolve(
   homedir(),
@@ -14,7 +17,7 @@ const plistPath = resolve(
   "LaunchAgents",
   `${label}.plist`,
 );
-const serverPath = resolve("dist/daemon/server.js");
+const serverPath = resolve(serverPathValue || "dist/daemon/server.js");
 const logDir = resolve(
   homedir(),
   "Library",

@@ -2300,6 +2300,199 @@ test("fast Agent starts adaptive checkpoints only after the model requests a scr
   }
 });
 
+test("Agent blocks one unchanged invalid click retry and continues with corrected arguments", async () => {
+  const toolCallResponse = (
+    id: string,
+    name: string,
+    argumentsValue: Record<string, unknown>,
+  ) => ({
+    choices: [
+      {
+        message: {
+          content: "",
+          tool_calls: [
+            {
+              id,
+              type: "function",
+              function: {
+                name,
+                arguments: JSON.stringify(argumentsValue),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  const responses = [
+    toolCallResponse("click-invalid-1", "browser_click", {}),
+    toolCallResponse("click-invalid-2", "browser_click", {}),
+    toolCallResponse("click-corrected", "browser_click", {
+      selector: "#save",
+    }),
+    { choices: [{ message: { content: "保存已完成。" } }] },
+    toolCallResponse("verify-corrected-click", "browser_snapshot", {}),
+    { choices: [{ message: { content: "保存已完成并验证。" } }] },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+    (body) => requestBodies.push(body),
+  );
+  const executedIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 10,
+        autoContinueAfterToolRoundLimit: true,
+      },
+      messages: [],
+      input: "点击保存并验证结果。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-invalid-click-recovery",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_click",
+            description: "Click a page element.",
+            parameters: {
+              type: "object",
+              properties: { selector: { type: "string" } },
+              required: ["selector"],
+              additionalProperties: false,
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "browser_snapshot",
+            description: "Read the current page.",
+            parameters: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content:
+            call.id === "click-invalid-1"
+              ? JSON.stringify({
+                  error:
+                    "browser_click arguments invalid: selector or target is required.",
+                })
+              : JSON.stringify({ ok: true }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.deepEqual(executedIds, [
+      "click-invalid-1",
+      "click-corrected",
+      "verify-corrected-click",
+    ]);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /验证/);
+    assert.match(JSON.stringify(requestBodies[2]), /Do not repeat/);
+  } finally {
+    restore();
+  }
+});
+
+test("Agent terminates an unchanged invalid mutation branch after one corrective retry", async () => {
+  const invalidClick = (id: string) => ({
+    choices: [
+      {
+        message: {
+          content: "",
+          tool_calls: [
+            {
+              id,
+              type: "function",
+              function: {
+                name: "browser_click",
+                arguments: "{}",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  const responses = [
+    invalidClick("invalid-branch-1"),
+    invalidClick("invalid-branch-2"),
+    invalidClick("invalid-branch-3"),
+    { choices: [{ message: { content: "无法在现有参数下继续点击。" } }] },
+  ];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+  );
+  const executedIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 10,
+        autoContinueAfterToolRoundLimit: true,
+      },
+      messages: [],
+      input: "点击保存。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-invalid-click-terminal",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_click",
+            description: "Click a page element.",
+            parameters: {
+              type: "object",
+              properties: { selector: { type: "string" } },
+              required: ["selector"],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            error:
+              "browser_click arguments invalid: selector or target is required.",
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.deepEqual(executedIds, ["invalid-branch-1"]);
+    assert.equal(result.status, "blocked");
+    assert.match(result.finalContent, /连续提交完全相同的参数/);
+  } finally {
+    restore();
+  }
+});
+
 function collectRequestImageUrls(body: Record<string, unknown>): string[] {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   return messages.flatMap((message) => {

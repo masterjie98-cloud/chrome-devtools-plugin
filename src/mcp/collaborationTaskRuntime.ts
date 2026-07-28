@@ -8,6 +8,7 @@ import {
   DELEGATED_TASK_VERSION,
   delegatedTaskConversationKey,
   delegatedTaskClaimItemId,
+  delegatedTaskEventItemId,
   delegatedTaskRequestItemId,
   delegatedTaskResultItemId,
   findDelegatedTask,
@@ -19,8 +20,10 @@ import {
 } from "./browserStateHub";
 import type {
   claimCollaborationTaskInputSchema,
+  cancelCollaborationTaskInputSchema,
   completeCollaborationTaskInputSchema,
   delegateCollaborationTaskInputSchema,
+  updateCollaborationTaskInputSchema,
 } from "./collaborationTools";
 import { ExecutionBrokerError } from "../daemon/executionBroker";
 import type { z } from "zod";
@@ -28,6 +31,8 @@ import type { z } from "zod";
 type DelegateArgs = z.infer<typeof delegateCollaborationTaskInputSchema>;
 type ClaimArgs = z.infer<typeof claimCollaborationTaskInputSchema>;
 type CompleteArgs = z.infer<typeof completeCollaborationTaskInputSchema>;
+type UpdateArgs = z.infer<typeof updateCollaborationTaskInputSchema>;
+type CancelArgs = z.infer<typeof cancelCollaborationTaskInputSchema>;
 
 export interface CollaborationTaskMutation<T> {
   data: T;
@@ -206,7 +211,14 @@ export function completeCollaborationTask(
   sessionId: string,
   clientId: string,
   hub: BrowserStateHub = browserStateHub,
+  actor: "extension_agent" | "mcp_agent" = "extension_agent",
 ): CollaborationTaskMutation<Record<string, unknown>> {
+  if (actor === "mcp_agent" && args.status !== "cancelled") {
+    throw new ExecutionBrokerError(
+      "ROLE_FORBIDDEN",
+      "The MCP Agent may cancel delegated work but cannot publish an extension Agent result.",
+    );
+  }
   const snapshot = hub.snapshot(sessionId);
   const task = requireDelegatedTask(snapshot.collaborationWorkspace, args.taskId);
   const staleUnclaimedCancellation =
@@ -218,7 +230,8 @@ export function completeCollaborationTask(
   if (
     args.status !== "rejected" &&
     !task.claim &&
-    !staleUnclaimedCancellation
+    !staleUnclaimedCancellation &&
+    actor !== "mcp_agent"
   ) {
     throw new ExecutionBrokerError(
       "ROLE_FORBIDDEN",
@@ -249,7 +262,7 @@ export function completeCollaborationTask(
       },
     };
   }
-  if (task.claim) {
+  if (task.claim && actor === "extension_agent") {
     if (!task.claim.conversationKey) {
       throw new ExecutionBrokerError(
         "ROLE_FORBIDDEN",
@@ -298,7 +311,7 @@ export function completeCollaborationTask(
       parentId: task.requestItem.id,
       target: task.requestItem.target,
     },
-    { actor: "extension_agent", clientId },
+    { actor, clientId },
     sessionId,
   );
   return {
@@ -311,6 +324,134 @@ export function completeCollaborationTask(
       resultItem: mutation.item,
     },
   };
+}
+
+export function updateCollaborationTask(
+  args: UpdateArgs,
+  sessionId: string,
+  clientId: string,
+  actor: "extension_agent" | "mcp_agent",
+  hub: BrowserStateHub = browserStateHub,
+): CollaborationTaskMutation<Record<string, unknown>> {
+  const snapshot = hub.snapshot(sessionId);
+  const task = requireDelegatedTask(snapshot.collaborationWorkspace, args.taskId);
+  if (task.result) {
+    throw new ExecutionBrokerError(
+      "IDEMPOTENCY_CONFLICT",
+      `Delegated task ${args.taskId} is already ${task.result.status}.`,
+    );
+  }
+  if (actor === "extension_agent") {
+    if (!task.claim?.conversationKey || !args.conversationId) {
+      throw new ExecutionBrokerError(
+        "ROLE_FORBIDDEN",
+        `Delegated task ${args.taskId} progress requires its bound plugin conversation.`,
+      );
+    }
+    if (
+      task.claim.conversationKey !==
+      delegatedTaskConversationKey(args.conversationId)
+    ) {
+      throw new ExecutionBrokerError(
+        "STALE_CONTEXT",
+        `Delegated task ${args.taskId} cannot be updated from another plugin conversation.`,
+      );
+    }
+  }
+
+  const eventFingerprint = hashStable({
+    taskId: args.taskId,
+    eventId: args.eventId,
+    eventType: args.eventType,
+    message: args.message,
+    progress: args.progress ?? null,
+    requirements: args.requirements ?? null,
+    artifactUris: args.artifactUris ?? null,
+    actor,
+  });
+  const itemId = delegatedTaskEventItemId(args.taskId, args.eventId);
+  const existing = snapshot.collaborationWorkspace.items.find(
+    (item) => item.id === itemId,
+  );
+  if (existing) {
+    const content =
+      existing.content && typeof existing.content === "object"
+        ? (existing.content as Record<string, unknown>)
+        : {};
+    if (content.eventFingerprint !== eventFingerprint) {
+      throw new ExecutionBrokerError(
+        "IDEMPOTENCY_CONFLICT",
+        `eventId ${args.eventId} already belongs to different task progress.`,
+      );
+    }
+    return {
+      data: {
+        taskId: args.taskId,
+        eventId: args.eventId,
+        deduplicated: true,
+        workspaceRevision: snapshot.collaborationWorkspace.revision,
+        eventItem: existing,
+      },
+    };
+  }
+
+  const mutation = hub.upsertCollaborationItem(
+    {
+      id: itemId,
+      kind: "task.state",
+      title: `${args.eventType}: ${task.requestItem.title}`,
+      summary: args.message,
+      content: {
+        version: DELEGATED_TASK_VERSION,
+        type: "event",
+        taskId: args.taskId,
+        eventId: args.eventId,
+        eventType: args.eventType,
+        message: args.message,
+        ...(args.progress !== undefined ? { progress: args.progress } : {}),
+        ...(args.requirements ? { requirements: args.requirements } : {}),
+        ...(args.artifactUris ? { artifactUris: args.artifactUris } : {}),
+        eventFingerprint,
+      },
+      tags: ["delegated-task", "event", args.eventType],
+      visibility: "shared",
+      sensitivity: task.requestItem.sensitivity,
+      status: "active",
+      parentId: task.requestItem.id,
+      target: task.requestItem.target,
+    },
+    { actor, clientId },
+    sessionId,
+  );
+  return {
+    mutation,
+    data: {
+      taskId: args.taskId,
+      eventId: args.eventId,
+      deduplicated: false,
+      workspaceRevision: mutation.workspace.revision,
+      eventItem: mutation.item,
+    },
+  };
+}
+
+export function cancelCollaborationTask(
+  args: CancelArgs,
+  sessionId: string,
+  clientId: string,
+  hub: BrowserStateHub = browserStateHub,
+): CollaborationTaskMutation<Record<string, unknown>> {
+  return completeCollaborationTask(
+    {
+      taskId: args.taskId,
+      status: "cancelled",
+      summary: args.reason,
+    },
+    sessionId,
+    clientId,
+    hub,
+    "mcp_agent",
+  );
 }
 
 export async function waitForCollaborationTaskResult(

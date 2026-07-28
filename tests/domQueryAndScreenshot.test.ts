@@ -8,6 +8,7 @@ import {
 } from "../src/mcp/toolRuntime";
 import { MCP_TOOL_OUTPUT_SCHEMAS } from "../src/mcp/toolOutputSchemas";
 import {
+  requiresRegisteredDirectFrame,
   screenshotDataUrlToBlob,
   shouldSaveScreenshotToDownloads,
 } from "../src/background/toolDispatcher";
@@ -64,6 +65,21 @@ test("screenshot diff decodes data URLs without extension fetch", async () => {
   assert.throws(
     () => screenshotDataUrlToBlob("data:text/plain;base64,aGVsbG8="),
     /SCREENSHOT_DIFF_INVALID_IMAGE/,
+  );
+});
+
+test("only the current unversioned top frame may recover without registration", () => {
+  assert.equal(
+    requiresRegisteredDirectFrame({ frameId: 0 }),
+    false,
+  );
+  assert.equal(
+    requiresRegisteredDirectFrame({ frameId: 0, documentId: "document-1" }),
+    true,
+  );
+  assert.equal(
+    requiresRegisteredDirectFrame({ frameId: 2 }),
+    true,
   );
 });
 

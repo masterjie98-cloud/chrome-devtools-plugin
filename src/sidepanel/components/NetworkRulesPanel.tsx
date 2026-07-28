@@ -23,6 +23,7 @@ import type {
   DebuggerProxyHit,
   DebuggerProxyRule,
   DebuggerProxyRuleInput,
+  DebuggerProxyScenarioStep,
   DebuggerProxyStage,
   DebuggerProxyStatus,
 } from "../../shared/debugger";
@@ -123,6 +124,21 @@ export function NetworkRulesPanel({
   const [proxyStatusCode, setProxyStatusCode] = useState(200);
   const [proxyContentType, setProxyContentType] = useState("application/json; charset=utf-8");
   const [proxyBody, setProxyBody] = useState("{\"ok\":true}");
+  const [proxyScenarioEnabled, setProxyScenarioEnabled] = useState(false);
+  const [proxyScenarioText, setProxyScenarioText] = useState(
+    JSON.stringify(
+      [
+        { name: "首次", statusCode: 202, responseBody: "{\"state\":\"pending\"}" },
+        { name: "完成", statusCode: 200, responseBody: "{\"state\":\"done\"}" },
+      ],
+      null,
+      2,
+    ),
+  );
+  const [proxyScenarioRepeat, setProxyScenarioRepeat] = useState<
+    "hold-last" | "loop"
+  >("hold-last");
+  const [proxyScenarioError, setProxyScenarioError] = useState<string>();
   const [editingProxyRuleId, setEditingProxyRuleId] = useState<string>();
   const [proxyDraftDirty, setProxyDraftDirty] = useState(false);
   const [savingProxyRule, setSavingProxyRule] = useState(false);
@@ -172,6 +188,12 @@ export function NetworkRulesPanel({
     setProxyStatusCode(rule.statusCode ?? 200);
     setProxyContentType(rule.contentType ?? "application/json; charset=utf-8");
     setProxyBody(rule.responseBody ?? "");
+    setProxyScenarioEnabled(Boolean(rule.scenarioSteps?.length));
+    setProxyScenarioText(
+      JSON.stringify(rule.scenarioSteps ?? [], null, 2),
+    );
+    setProxyScenarioRepeat(rule.scenarioRepeat ?? "hold-last");
+    setProxyScenarioError(undefined);
     setProxyMockEnabled(
       rule.responseBody !== undefined ||
         rule.responseBodyBase64 !== undefined ||
@@ -194,6 +216,10 @@ export function NetworkRulesPanel({
     setProxyStatusCode(200);
     setProxyContentType("application/json; charset=utf-8");
     setProxyBody("{\"ok\":true}");
+    setProxyScenarioEnabled(false);
+    setProxyScenarioText("[]");
+    setProxyScenarioRepeat("hold-last");
+    setProxyScenarioError(undefined);
   };
 
   const toggleRuleHits = (ruleId: string) => {
@@ -211,6 +237,22 @@ export function NetworkRulesPanel({
 
     setSavingProxyRule(true);
     try {
+      let scenarioSteps: DebuggerProxyScenarioStep[] | undefined;
+      if (proxyScenarioEnabled) {
+        try {
+          const parsed = JSON.parse(proxyScenarioText) as unknown;
+          if (!Array.isArray(parsed) || parsed.length === 0) {
+            throw new Error("场景至少需要一个步骤");
+          }
+          scenarioSteps = parsed as DebuggerProxyScenarioStep[];
+          setProxyScenarioError(undefined);
+        } catch (error) {
+          setProxyScenarioError(
+            error instanceof Error ? error.message : "场景 JSON 无效",
+          );
+          return;
+        }
+      }
       const saved = await onUpsertProxyRule({
         id: editingProxyRuleId,
         enabled: true,
@@ -224,6 +266,11 @@ export function NetworkRulesPanel({
         responseBodyBase64: undefined,
         responsePhrase: undefined,
         mockStage: proxyMockEnabled ? proxyMockStage : undefined,
+        scenarioSteps,
+        scenarioRepeat: proxyScenarioEnabled
+          ? proxyScenarioRepeat
+          : undefined,
+        resetScenario: proxyScenarioEnabled,
       });
       if (saved) {
         clearProxyEdit();
@@ -433,6 +480,61 @@ export function NetworkRulesPanel({
                   placeholder='{"ok":true}'
                   className="rules-body-editor"
                 />
+                <div className="rules-subtitle-row">
+                  <div>
+                    <Typography.Text strong>状态场景</Typography.Text>
+                    <Typography.Text type="secondary">
+                      按命中顺序返回多步响应；保存后从第一步开始。
+                    </Typography.Text>
+                  </div>
+                  <Switch
+                    checked={proxyScenarioEnabled}
+                    checkedChildren="已开启"
+                    unCheckedChildren="已关闭"
+                    onChange={(checked) => {
+                      setProxyScenarioEnabled(checked);
+                      setProxyScenarioError(undefined);
+                      markProxyDraftDirty();
+                    }}
+                    aria-label="开启或关闭状态场景"
+                  />
+                </div>
+                {proxyScenarioEnabled ? (
+                  <>
+                    <label className="rules-field">
+                      <span>最后一步行为</span>
+                      <Select<"hold-last" | "loop">
+                        value={proxyScenarioRepeat}
+                        onChange={(value) => {
+                          setProxyScenarioRepeat(value);
+                          markProxyDraftDirty();
+                        }}
+                        options={[
+                          { value: "hold-last", label: "保持最后一步" },
+                          { value: "loop", label: "循环到第一步" },
+                        ]}
+                      />
+                    </label>
+                    <Input.TextArea
+                      value={proxyScenarioText}
+                      status={proxyScenarioError ? "error" : undefined}
+                      onChange={(event) => {
+                        setProxyScenarioText(event.target.value);
+                        setProxyScenarioError(undefined);
+                        markProxyDraftDirty();
+                      }}
+                      autoSize={{ minRows: 6, maxRows: 14 }}
+                      placeholder='[{"name":"首次","statusCode":202,"responseBody":"{\"state\":\"pending\"}"}]'
+                      className="rules-body-editor"
+                      aria-label="状态场景 JSON"
+                    />
+                    {proxyScenarioError ? (
+                      <Typography.Text type="danger">
+                        {proxyScenarioError}
+                      </Typography.Text>
+                    ) : null}
+                  </>
+                ) : null}
               </Space>
             ) : (
               <div className="rules-muted-surface">当前规则只处理请求头/响应头，不替换响应体。</div>

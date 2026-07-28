@@ -3,10 +3,13 @@ import { SUPPORTED_COMPUTED_STYLE_PROPERTIES } from "./dom";
 export const MCP_TOOL_NAMES = {
   BROWSER_STATUS: "browser_status",
   BROWSER_WORKFLOW: "browser_workflow",
+  BROWSER_CAPTURE_ISSUE_EVIDENCE: "browser_capture_issue_evidence",
   BROWSER_OBSERVE: "browser_observe",
   BROWSER_ACT: "browser_act",
   BROWSER_VERIFY: "browser_verify",
   BROWSER_DEBUG_ACTIVITY: "browser_debug_activity",
+  BROWSER_ACTIVITY_START: "browser_activity_start",
+  BROWSER_ACTIVITY_STOP: "browser_activity_stop",
   BROWSER_GET_SELECTED_ELEMENT: "browser_get_selected_element",
   BROWSER_GET_CONTEXT_DIGEST: "browser_get_context_digest",
   BROWSER_GET_PLUGIN_CONVERSATION: "browser_get_plugin_conversation",
@@ -15,6 +18,12 @@ export const MCP_TOOL_NAMES = {
   BROWSER_GET_PAGE_CONTEXT: "browser_get_page_context",
   BROWSER_SNAPSHOT: "browser_snapshot",
   BROWSER_QUERY_DOM: "browser_query_dom",
+  BROWSER_LOCATE_SOURCE: "browser_locate_source",
+  BROWSER_EXPLAIN_CSS: "browser_explain_css",
+  BROWSER_CREATE_REPRODUCTION_RECIPE: "browser_create_reproduction_recipe",
+  BROWSER_RUN_REPRODUCTION_RECIPE: "browser_run_reproduction_recipe",
+  BROWSER_PERFORMANCE_DIAGNOSTICS: "browser_performance_diagnostics",
+  BROWSER_REALTIME_ACTIVITY: "browser_realtime_activity",
   BROWSER_START_ELEMENT_PICKER: "browser_start_element_picker",
   BROWSER_CANCEL_ELEMENT_PICKER: "browser_cancel_element_picker",
   BROWSER_HIGHLIGHT_ELEMENT: "browser_highlight_element",
@@ -160,7 +169,7 @@ const DOM_QUERY_ITEM_PROPERTIES = {
   },
 } as const;
 
-export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
+const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   {
     name: MCP_TOOL_NAMES.BROWSER_STATUS,
     title: "Browser connection status",
@@ -169,10 +178,38 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     parameters: NO_ARG_PARAMETERS,
   },
   {
+    name: MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
+    title: "Start browser activity stream",
+    description:
+      "Start bounded incremental DOM, Network, and Console observation for the exact selected target. Subscribe to the listed activity-stream resource to receive MCP resource-updated notifications without polling.",
+    parameters: {
+      type: "object",
+      properties: {
+        includeDom: { type: "boolean" },
+        includeNetwork: { type: "boolean" },
+        includeConsole: { type: "boolean" },
+        preserveLog: { type: "boolean" },
+        maxNetworkEntries: {
+          type: "number",
+          minimum: 10,
+          maximum: 2000,
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
+    title: "Stop browser activity stream",
+    description:
+      "Stop the activity monitor owned by this extension. Retained bounded events remain readable from the activity-stream resource.",
+    parameters: NO_ARG_PARAMETERS,
+  },
+  {
     name: MCP_TOOL_NAMES.BROWSER_WORKFLOW,
     title: "Run browser workflow with evidence",
     description:
-      "Observe the current page, execute a bounded action stage, verify outcomes, and return correlated DOM, URL, Network, and Console evidence in one model-visible call. Mutations retain the same approval and stale-document barriers as browser_act.",
+      "Observe the current page, optionally evaluate preconditions, execute a bounded action stage plus best-effort cleanup, verify outcomes, and return correlated DOM, URL, Network, and Console evidence in one model-visible call. wait actions, conditions and cleanup stay bounded; mutations retain the same approval and stale-document barriers as browser_act.",
     parameters: {
       type: "object",
       properties: {
@@ -290,6 +327,33 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
             required: ["id", "type"],
             additionalProperties: false,
           },
+        },
+        preconditions: {
+          type: "object",
+          description:
+            "Bounded if/check gate evaluated against fresh page state before actions.",
+          properties: {
+            checks: {
+              type: "array",
+              minItems: 1,
+              maxItems: 20,
+              items: { type: "object" },
+            },
+            onFailure: {
+              type: "string",
+              enum: ["abort", "skip_actions"],
+            },
+          },
+          required: ["checks"],
+          additionalProperties: false,
+        },
+        cleanupActions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          description:
+            "Bounded cleanup actions executed after the main stage without replaying failed or unknown writes.",
+          items: { type: "object" },
         },
         checks: {
           type: "array",
@@ -410,6 +474,117 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
           description:
             "Optional model-visible semantic field projection. targetRef remains included for actionable selected-frame nodes.",
         },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+    title: "Locate element component source",
+    description:
+      "Map one element from the latest snapshot targetRef or an exact selector to bounded React/Vue component metadata and available source hints. The extension runs only a fixed MAIN-world inspector; caller-supplied JavaScript is never evaluated.",
+    parameters: {
+      type: "object",
+      properties: {
+        ref: {
+          type: "string",
+          pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+        },
+        selector: { type: "string" },
+        frameRef: {
+          type: "string",
+          pattern: "^fr1_[a-f0-9]{8}$",
+        },
+        documentId: { type: "string" },
+        maxDepth: { type: "number", minimum: 1, maximum: 20 },
+        includeSourceExcerpt: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS,
+    title: "Explain element CSS",
+    description:
+      "Read bounded matched rules, inline declarations, computed values, inherited custom properties, box-model evidence, and stylesheet source hints for one exact element. This executes only a fixed inspector.",
+    parameters: {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        frameRef: { type: "string", pattern: "^fr1_[a-f0-9]{8}$" },
+        documentId: { type: "string" },
+        properties: {
+          type: "array",
+          maxItems: 64,
+          uniqueItems: true,
+          items: { type: "string" },
+        },
+        maxRules: { type: "number", minimum: 1, maximum: 200 },
+        includeVariables: { type: "boolean" },
+      },
+      required: ["selector"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE,
+    title: "Create reproduction recipe",
+    description:
+      "Persist one bounded browser_workflow input as a session-bound replay recipe artifact. Creating the recipe does not execute page actions.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        description: { type: "string" },
+        targetUrlPattern: { type: "string" },
+        workflow: { type: "object", additionalProperties: true },
+      },
+      required: ["name", "workflow"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE,
+    title: "Run reproduction recipe",
+    description:
+      "Load one session-bound reproduction recipe artifact and execute its browser_workflow through the normal approval, stale-target, action, and verification barriers.",
+    parameters: {
+      type: "object",
+      properties: {
+        artifactId: { type: "string" },
+        requireUrlMatch: { type: "boolean" },
+      },
+      required: ["artifactId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS,
+    title: "Diagnose page performance",
+    description:
+      "Read bounded Navigation Timing, paint, LCP, CLS, INP interaction, long-task, slow-resource, and trace-summary evidence from the selected document without running caller JavaScript.",
+    parameters: {
+      type: "object",
+      properties: {
+        frameRef: { type: "string", pattern: "^fr1_[a-f0-9]{8}$" },
+        documentId: { type: "string" },
+        resourceLimit: { type: "number", minimum: 1, maximum: 100 },
+        longTaskLimit: { type: "number", minimum: 1, maximum: 100 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
+    title: "Inspect realtime browser activity",
+    description:
+      "Summarize retained WebSocket and EventSource counters plus Service Worker and IndexedDB metadata. Message bodies and database values are never returned.",
+    parameters: {
+      type: "object",
+      properties: {
+        frameRef: { type: "string", pattern: "^fr1_[a-f0-9]{8}$" },
+        documentId: { type: "string" },
+        limit: { type: "number", minimum: 1, maximum: 100 },
       },
       additionalProperties: false,
     },
@@ -981,6 +1156,12 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
             "Set true only when retrying after DECISION_BARRIER_REQUIRED. This requests a separate user approval; it does not bypass authorization.",
         },
       },
+      anyOf: [
+        { required: ["ref"] },
+        { required: ["selector"] },
+        { required: ["target"] },
+        { required: ["element"] },
+      ],
       additionalProperties: false,
     },
   },
@@ -1001,6 +1182,12 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         target: { type: "string", description: "Alias for selector." },
         element: { type: "string", description: "Alias for selector." },
       },
+      anyOf: [
+        { required: ["ref"] },
+        { required: ["selector"] },
+        { required: ["target"] },
+        { required: ["element"] },
+      ],
       additionalProperties: false,
     },
   },
@@ -1184,6 +1371,12 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         },
       },
       required: ["text"],
+      anyOf: [
+        { required: ["ref"] },
+        { required: ["selector"] },
+        { required: ["target"] },
+        { required: ["element"] },
+      ],
       additionalProperties: false,
     },
   },
@@ -1870,6 +2063,52 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
           description:
             "request fulfills before the origin request is sent; response replaces the body after origin response headers arrive. Defaults to response.",
         },
+        scenarioSteps: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          description:
+            "Ordered stateful response steps. Each successful fulfilled request advances one step.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              responseHeaders: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    header: { type: "string" },
+                    operation: {
+                      type: "string",
+                      enum: ["set", "append", "remove"],
+                    },
+                    value: { type: "string" },
+                  },
+                  required: ["header", "operation"],
+                  additionalProperties: false,
+                },
+              },
+              responseBody: { type: "string" },
+              responseBodyBase64: { type: "string" },
+              statusCode: { type: "number" },
+              responsePhrase: { type: "string" },
+              contentType: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+        scenarioRepeat: {
+          type: "string",
+          enum: ["hold-last", "loop"],
+          description:
+            "After the last response, keep returning the last step or loop to the first.",
+        },
+        resetScenario: {
+          type: "boolean",
+          description:
+            "Reset the persisted scenario cursor and hit counter while upserting this rule.",
+        },
       },
       anyOf: [
         { required: ["urlPattern"] },
@@ -2079,11 +2318,49 @@ export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   },
 ] as const;
 
+const BROWSER_WORKFLOW_DEFINITION = MCP_BASE_TOOL_DEFINITIONS.find(
+  (tool) => tool.name === MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+);
+if (!BROWSER_WORKFLOW_DEFINITION) {
+  throw new Error("Missing browser_workflow definition.");
+}
+
+export const MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
+  ...MCP_BASE_TOOL_DEFINITIONS,
+  {
+    name: MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
+    title: "Capture issue evidence bundle",
+    description:
+      "Capture before/after screenshots, run one bounded browser workflow, correlate DOM, URL, Network, Console, component/source evidence, and save a session-scoped JSON evidence artifact. Screenshot bytes stay in separate artifact references.",
+    parameters: {
+      ...BROWSER_WORKFLOW_DEFINITION.parameters,
+      properties: {
+        title: {
+          type: "string",
+          description: "Short issue title included in the evidence manifest.",
+        },
+        description: {
+          type: "string",
+          description: "Optional reproduction context or expected behavior.",
+        },
+        captureScreenshots: {
+          type: "boolean",
+          description:
+            "Capture visual before/after evidence and a pixel diff. Defaults to true.",
+        },
+        ...BROWSER_WORKFLOW_DEFINITION.parameters.properties,
+      },
+      required: ["title"],
+    },
+  },
+];
+
 const MCP_TOOL_NAME_SET = new Set<string>(
   MCP_TOOL_DEFINITIONS.map((tool) => tool.name),
 );
 
 const MCP_TOOL_NAME_ALIASES: Record<string, McpToolName> = {
+  capture_issue_evidence: MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
   read_page_info: MCP_TOOL_NAMES.BROWSER_GET_PAGE_CONTEXT,
   browser_snapshot: MCP_TOOL_NAMES.BROWSER_SNAPSHOT,
   take_snapshot: MCP_TOOL_NAMES.BROWSER_SNAPSHOT,
@@ -2181,8 +2458,17 @@ const MCP_TOOL_NAME_ALIASES: Record<string, McpToolName> = {
 
 const MCP_EXPOSED_TOOL_ORDER: readonly McpToolName[] = [
   MCP_TOOL_NAMES.BROWSER_STATUS,
+  MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
+  MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
   MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+  MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
   MCP_TOOL_NAMES.BROWSER_OBSERVE,
+  MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+  MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS,
+  MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS,
+  MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
+  MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE,
+  MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE,
   MCP_TOOL_NAMES.BROWSER_ACT,
   MCP_TOOL_NAMES.BROWSER_VERIFY,
   MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,

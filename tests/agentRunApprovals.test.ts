@@ -48,7 +48,7 @@ test("three execution approval modes preserve the risk boundary", () => {
   assert.equal(executionApprovalModeAllows("full", "unknown"), false);
 });
 
-test("execution approval is bound to the active chat, origin, and profile", () => {
+test("agent approval is bound to the active chat, origin, and profile", () => {
   const approval = createConversationExecutionApproval("agent", {
     conversationId: "conversation-1",
     pageUrl: "https://example.test/form",
@@ -90,6 +90,43 @@ test("execution approval is bound to the active chat, origin, and profile", () =
   );
 });
 
+test("full approval follows one selected tab across cross-origin login redirects", () => {
+  const approval = createConversationExecutionApproval("full", {
+    conversationId: "conversation-1",
+    pageUrl: "https://app.example.test/form",
+    tabId: 10,
+    targetId: "target-10",
+    sessionId: "profile-session-1",
+    egressDestinations: ["AI Provider: https://provider.example"],
+  });
+  assert.ok(approval);
+  assert.deepEqual(approval.scope, {
+    kind: "tab",
+    tabId: 10,
+    targetId: "target-10",
+  });
+  assert.equal(
+    matchesConversationExecutionApproval(approval, {
+      conversationId: "conversation-1",
+      targetUrl: "https://login.example.test/oauth",
+      targetTabId: 10,
+      targetId: "target-10",
+      sessionId: "profile-session-1",
+    }),
+    true,
+  );
+  assert.equal(
+    matchesConversationExecutionApproval(approval, {
+      conversationId: "conversation-1",
+      targetUrl: "https://app.example.test/returned",
+      targetTabId: 11,
+      targetId: "target-11",
+      sessionId: "profile-session-1",
+    }),
+    false,
+  );
+});
+
 test("ask mode and incomplete page context cannot create persistent execution approval", () => {
   const current = {
     conversationId: "conversation-1",
@@ -101,9 +138,15 @@ test("ask mode and incomplete page context cannot create persistent execution ap
   assert.equal(
     createConversationExecutionApproval("full", {
       ...current,
-      pageUrl: undefined,
+      tabId: undefined,
     }),
     null,
+  );
+  assert.ok(
+    createConversationExecutionApproval("full", {
+      ...current,
+      tabId: 10,
+    }),
   );
   assert.equal(
     createConversationExecutionApproval("full", {
@@ -298,7 +341,40 @@ test("active conversation-origin approval reports every automatic invalidation b
       ...current,
       hubConnected: false,
     }),
-    "hub_disconnected",
+    null,
+  );
+});
+
+test("full approval invalidates on target tab but not origin or transient Hub disconnect", () => {
+  const approval = createConversationExecutionApproval("full", {
+    conversationId: "conversation-1",
+    pageUrl: "https://app.example.test/",
+    tabId: 10,
+    targetId: "target-10",
+    sessionId: "profile-session-1",
+    egressDestinations: [...baseScope.egressDestinations],
+  });
+  assert.ok(approval);
+  const current = {
+    conversationId: "conversation-1",
+    pageUrl: "https://login.example.test/oauth",
+    tabId: 10,
+    targetId: "target-10",
+    sessionId: "profile-session-1",
+    hubConnected: false,
+    egressDestinations: [...baseScope.egressDestinations],
+  };
+  assert.equal(
+    getAgentConversationOriginInvalidationReason(approval, current),
+    null,
+  );
+  assert.equal(
+    getAgentConversationOriginInvalidationReason(approval, {
+      ...current,
+      tabId: 11,
+      targetId: "target-11",
+    }),
+    "target_changed",
   );
 });
 

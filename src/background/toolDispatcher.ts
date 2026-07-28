@@ -22,6 +22,7 @@ import {
   selectTargetTab,
   selectTargetFrame,
   setCookie,
+  waitForRegisteredContentFrames,
   type ContentFrameAddress,
 } from "./chromeApi";
 import { getTargetNavigationState } from "./targetNavigation";
@@ -35,6 +36,7 @@ import {
   clearNetworkDebugger,
   clearProxyRules,
   captureDebuggerScreenshot,
+  collectRealtimeDebuggerActivity,
   detachDebugger,
   disableProxyDebugger,
   dispatchTrustedMouseClick,
@@ -46,6 +48,7 @@ import {
   dispatchTrustedKeyPress,
   dispatchTrustedTextInput,
   enableProxyDebugger,
+  emitDebuggerActivityLifecycle,
   getNetworkRequest,
   getNetworkResponseBody,
   handleCurrentJavaScriptDialog,
@@ -55,11 +58,17 @@ import {
   listNetworkRequests,
   prepareFetchDebugger,
   removeProxyRule,
+  resolveGeneratedSourceLocation,
   startNetworkDebugger,
   stopNetworkDebugger,
   upsertProxyRule,
   type TrustedInputTargetAddress,
 } from "./debuggerAdapter";
+import {
+  collectPageRealtimeMetadata,
+  collectPerformanceDiagnostics,
+  explainElementCss,
+} from "./pageDiagnostics";
 import {
   requireTrustedElementFocus,
   requireTrustedElementPoint,
@@ -108,9 +117,11 @@ import type {
   PageSnapshotTarget,
   ScreenshotCaptureInput,
 } from "../shared/dom";
+import { locateElementSource } from "./sourceLocator";
 
 type ContentRequestType =
   | typeof MESSAGE_TYPES.CONTENT_GET_PAGE_INFO
+  | typeof MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR
   | typeof MESSAGE_TYPES.CONTENT_QUERY_DOM
   | typeof MESSAGE_TYPES.CONTENT_START_ELEMENT_PICK
   | typeof MESSAGE_TYPES.CONTENT_CANCEL_ELEMENT_PICK
@@ -141,6 +152,12 @@ const screenshotBaselines = new Map<
   string,
   { dataUrl: string; capturedAt: string }
 >();
+let activityStatus = {
+  active: false,
+  includeDom: false,
+  includeNetwork: false,
+  includeConsole: false,
+} as import("../shared/browserActivity").BrowserActivityStatus;
 
 export interface ToolExecutionAuthorization {
   approvalRequired: boolean;
@@ -185,6 +202,40 @@ export async function executeToolCall(
           normalizedCall.args,
         ),
       };
+    case TOOL_NAMES.DOM_LOCATE_SOURCE:
+      return {
+        toolName: normalizedCall.toolName,
+        data: await locateElementSource(normalizedCall.args),
+      };
+    case TOOL_NAMES.DOM_EXPLAIN_CSS:
+      return {
+        toolName: normalizedCall.toolName,
+        data: await explainElementCss(normalizedCall.args),
+      };
+    case TOOL_NAMES.PAGE_PERFORMANCE_DIAGNOSTICS:
+      return {
+        toolName: normalizedCall.toolName,
+        data: await collectPerformanceDiagnostics(normalizedCall.args),
+      };
+    case TOOL_NAMES.PAGE_REALTIME_ACTIVITY: {
+      const [page, debuggerActivity] = await Promise.all([
+        collectPageRealtimeMetadata(normalizedCall.args),
+        collectRealtimeDebuggerActivity(normalizedCall.args.limit),
+      ]);
+      return {
+        toolName: normalizedCall.toolName,
+        data: {
+          version: "browser-realtime-activity-v1",
+          capturedAt: new Date().toISOString(),
+          target: page.target,
+          websocket: debuggerActivity.websocket,
+          eventSource: debuggerActivity.eventSource,
+          serviceWorkers: page.serviceWorkers,
+          indexedDb: page.indexedDb,
+          warnings: page.warnings,
+        },
+      };
+    }
     case TOOL_NAMES.DOM_START_ELEMENT_PICK:
       return {
         toolName: normalizedCall.toolName,
@@ -509,6 +560,16 @@ export async function executeToolCall(
         toolName: normalizedCall.toolName,
         data: await listConsoleMessages(normalizedCall.args),
       };
+    case TOOL_NAMES.BROWSER_ACTIVITY_START:
+      return {
+        toolName: normalizedCall.toolName,
+        data: await startBrowserActivity(normalizedCall.args),
+      };
+    case TOOL_NAMES.BROWSER_ACTIVITY_STOP:
+      return {
+        toolName: normalizedCall.toolName,
+        data: await stopBrowserActivity(),
+      };
     case TOOL_NAMES.DNR_LIST_RULES:
       return {
         toolName: normalizedCall.toolName,
@@ -594,6 +655,16 @@ export async function executeToolCall(
         toolName: normalizedCall.toolName,
         data: listNetworkRequests(normalizedCall.args),
       };
+    case TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE: {
+      const { includeSourceExcerpt, ...generated } = normalizedCall.args;
+      return {
+        toolName: normalizedCall.toolName,
+        data: await resolveGeneratedSourceLocation(
+          generated,
+          includeSourceExcerpt === true,
+        ),
+      };
+    }
     case TOOL_NAMES.DEBUGGER_NETWORK_GET:
       return {
         toolName: normalizedCall.toolName,
@@ -614,6 +685,68 @@ export async function executeToolCall(
   }
 }
 
+async function startBrowserActivity(
+  input: import("../shared/browserActivity").BrowserActivityStartInput,
+): Promise<import("../shared/browserActivity").BrowserActivityStatus> {
+  const includeDom = input.includeDom !== false;
+  const includeNetwork = input.includeNetwork !== false;
+  const includeConsole = input.includeConsole !== false;
+  const tab = await queryActiveTab();
+  if (!tab?.id) {
+    throw new Error("No active tab is available.");
+  }
+  const frame = getSelectedContentFrameSnapshot(tab.id);
+  let networkObservationSessionId: string | undefined;
+  if (includeNetwork) {
+    const network = await startNetworkDebugger({
+      preserveLog: input.preserveLog === true,
+      maxEntries: input.maxNetworkEntries ?? 300,
+    });
+    networkObservationSessionId = network.observationSessionId;
+  }
+  if (includeConsole) {
+    await listConsoleMessages({ limit: 1 });
+  }
+  if (includeDom) {
+    await forwardContentRequest(
+      MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR,
+      { enabled: true },
+    );
+  }
+  activityStatus = {
+    active: true,
+    includeDom,
+    includeNetwork,
+    includeConsole,
+    tabId: tab.id,
+    frameId: frame?.frameId ?? getSelectedContentFrame(tab.id).frameId,
+    documentId: frame?.documentId,
+    networkObservationSessionId,
+  };
+  emitDebuggerActivityLifecycle(true);
+  return { ...activityStatus };
+}
+
+async function stopBrowserActivity(): Promise<
+  import("../shared/browserActivity").BrowserActivityStatus
+> {
+  if (activityStatus.includeDom) {
+    await forwardContentRequest(
+      MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR,
+      { enabled: false },
+    ).catch(() => undefined);
+  }
+  if (activityStatus.includeNetwork) {
+    await stopNetworkDebugger().catch(() => undefined);
+  }
+  activityStatus = {
+    ...activityStatus,
+    active: false,
+  };
+  emitDebuggerActivityLifecycle(false);
+  return { ...activityStatus };
+}
+
 async function readMultiFramePageSnapshot(
   input: PageSnapshotInput,
 ): Promise<MultiFramePageSnapshot> {
@@ -628,10 +761,29 @@ async function readMultiFramePageSnapshot(
 
   const frameScope =
     input.frameScope === "all-accessible" ? "all-accessible" : "auto";
-  const registeredFrames = listRegisteredContentFrames(tab.id);
+  let registeredFrames = listRegisteredContentFrames(tab.id);
+  if (registeredFrames.length === 0) {
+    registeredFrames = await waitForRegisteredContentFrames(tab.id, {
+      timeoutMs: 300,
+    });
+  }
+  if (registeredFrames.length === 0) {
+    try {
+      await injectContentScript(tab.id, { frameId: 0 });
+    } catch (error) {
+      throw new Error(
+        `FRAME_UNAVAILABLE: the selected tab did not register a content frame and automatic recovery failed: ${
+          error instanceof Error ? error.message : "unknown injection error"
+        }`,
+      );
+    }
+    registeredFrames = await waitForRegisteredContentFrames(tab.id, {
+      timeoutMs: 1_200,
+    });
+  }
   if (registeredFrames.length === 0) {
     throw new Error(
-      "FRAME_UNAVAILABLE: no accessible content frame has registered for the selected tab.",
+      "FRAME_UNAVAILABLE: no accessible content frame registered after a bounded readiness wait and one automatic content-script recovery attempt. Wait for the page to finish loading or refresh the tab, then call browser_observe again.",
     );
   }
 
@@ -1881,7 +2033,11 @@ async function forwardContentRequestWithTarget<T extends ContentRequestType>(
   const selectedFrameSnapshot = directFrame
     ? getContentFrameSnapshot(tab.id, directFrame)
     : getSelectedContentFrameSnapshot(tab.id);
-  if (directFrame && !selectedFrameSnapshot) {
+  if (
+    directFrame &&
+    !selectedFrameSnapshot &&
+    requiresRegisteredDirectFrame(directFrame)
+  ) {
     throw new Error(
       "STALE_FRAME: the referenced frame document is no longer registered; observe the page again.",
     );
@@ -1939,6 +2095,15 @@ function directFrameAddress(
     frameId: input.frameId,
     ...(input.documentId ? { documentId: input.documentId } : {}),
   };
+}
+
+export function requiresRegisteredDirectFrame(
+  frame: ContentFrameAddress,
+): boolean {
+  // Frame 0 without a documentId means "the current top-level document".
+  // It can safely use the existing inject-and-retry path after navigation.
+  // Child frames and exact document references must remain fail-closed.
+  return frame.frameId !== 0 || Boolean(frame.documentId);
 }
 
 export function assertToolCallMessage(message: ExtensionRequest): AnyToolCall {

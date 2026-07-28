@@ -13,7 +13,7 @@ responsible for writing only error codes and sanitized behavior.
 
 ## Environment
 
-- Date: 2026-07-13 to 2026-07-15
+- Date: 2026-07-13 to 2026-07-28
 - Tester: Codex with user-operated extension reloads
 - Chrome version: 149.0.7827.201
 - OS version: macOS 26.5.1
@@ -40,7 +40,7 @@ Allowed status values: `not-run`, `pass`, `fail`.
 | 4.1 | One-current-dialog CDP handling | not-run | |
 | 4.2 | Trusted typing/key input and fail-closed targets | pass | Replace/Unicode typing and key input used trusted CDP events; invalid key, readonly and oversized inputs failed before mutation. The 2026-07-24 direct-frame gate supersedes the earlier unsupported child result: a fresh bound reference wrote the OOPIF input and a follow-up observation verified its exact value. Same-process coordinate routing remains automated-only. |
 | 4.3 | Form preflight, CDP controls and scoped DOM select | pass | Preflight and fail-closed edge cases passed. A real five-field task used one broad read, one `browser_fill_form` and one verification; all requested values changed while excluded controls did not. The 2026-07-24 OOPIF direct fill also passed exact post-value verification; multi-field child-frame form fill was not separately exercised. |
-| 4.4 | Stale approval, active Stop, pending Stop and unavailable UI | not-run | Approval remained visible for 52 seconds; rejection removed it and preserved `not clicked`. Reload returned `STALE_CONTEXT`; caller abort removed its card. Closing the only Side Panel set `uiConnected: false`, and an approval-gated read failed before execution with `APPROVAL_REQUIRED` and an explicit unavailable-UI message. Reopening restored the UI without restoring a grant. Active Stop remains. |
+| 4.4 | Stale approval, active Stop, pending Stop and unavailable UI | pass | Approval remained visible for 52 seconds; rejection preserved `not clicked`. Reload returned `STALE_CONTEXT`; caller abort removed its card. With the Side Panel closed, an approval-gated read failed before execution with `APPROVAL_REQUIRED`; reopening restored the UI but not its grant. On 2026-07-28 an embedded Agent entered a 30-second `browser_wait_for`; Stop immediately rendered `Agent 已取消`, removed the Stop action and produced no delayed success result. |
 | 4.5 | Sensitive default omission, deny/approve, redaction and destination | not-run | |
 | 4.6 | Screenshot MCP image, artifact binding and bounded metadata | pass | Live MCP screenshot returned `image/png` content and a session artifact URI with MIME type, byte length, SHA-256 and expiry. `structuredContent` omitted `dataUrl`, Chrome Downloads was not used, and daemon audit separated 33,776 ms approval wait from 81 ms executor time. |
 | 4.7 | DNR upsert/remove deny/approve, one-time grant and exact cleanup | not-run | |
@@ -49,6 +49,20 @@ Allowed status values: `not-run`, `pass`, `fail`.
 | 7 | Two real Chrome Profiles and two adapter routing isolation | not-run | Deferred by product scope on 2026-07-14: current usage does not require two simultaneous Chrome Profiles. Automated multi-adapter/session routing coverage remains, but real Profile isolation must be tested before claiming support or completion. |
 
 ## Supplementary live evidence
+
+- P0-P2 closure (live passed on 2026-07-28): adapter, daemon and browser
+  negotiated `0.1.0+ws8 / b442dc4c`. The complete workflow verifier passed
+  four top-frame actions, direct OOPIF and same-process actions, exact values
+  and selected values, DOM/URL/Network/Console evidence, screenshot diff,
+  high-confidence request causality, recipe replay, interaction/INP plus trace
+  summary, realtime schema, stateful Mock and a bounded issue-evidence artifact.
+  A cache-busted fixture then proved the positive CSS chain
+  `mapped.css -> mapped.css.map -> src/fixtures/trusted-button.scss`.
+  Collaboration V2 proved idempotent progress, requirement and evidence events,
+  durable Codex cancellation, and waiter recovery to `cancelled`. The sidepanel
+  history drawer exposed full-text search and explicit Markdown/JSON export; a
+  live `重定向` query retained only the matching conversation. The active Stop
+  result is recorded in Section 4.4.
 
 - Workflow-evidence upgrade (live passed on 2026-07-24): adapter, daemon and
   browser negotiated `0.1.0+ws7 / f085f1dd`. One `browser_workflow` completed

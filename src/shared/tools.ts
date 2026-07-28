@@ -88,6 +88,24 @@ import type {
   RemoveDnrRuleInput,
 } from "./network";
 import { SANITIZE_LIMITS } from "./sanitize";
+import type {
+  BrowserActivityStartInput,
+  BrowserActivityStatus,
+} from "./browserActivity";
+import type {
+  BrowserLocateSourceInput,
+  BrowserLocateSourceResult,
+  GeneratedSourceLocation,
+  SourceMapResolution,
+} from "./sourceLocation";
+import type {
+  BrowserCssExplainInput,
+  BrowserCssExplainResult,
+  BrowserPerformanceDiagnosticsInput,
+  BrowserPerformanceDiagnosticsResult,
+  BrowserRealtimeActivityInput,
+  BrowserRealtimeActivityResult,
+} from "./pageDiagnostics";
 
 export const TOOL_NAMES = {
   DOM_GET_PAGE_INFO: "dom.getPageInfo",
@@ -97,6 +115,10 @@ export const TOOL_NAMES = {
   DOM_HIGHLIGHT_ELEMENT: "dom.highlightElement",
   DOM_CLEAR_HIGHLIGHTS: "dom.clearHighlights",
   DOM_SET_VALUE: "dom.setValue",
+  DOM_LOCATE_SOURCE: "dom.locateSource",
+  DOM_EXPLAIN_CSS: "dom.explainCss",
+  PAGE_PERFORMANCE_DIAGNOSTICS: "page.performanceDiagnostics",
+  PAGE_REALTIME_ACTIVITY: "page.realtimeActivity",
   CSS_APPLY_PATCH: "css.applyPatch",
   CSS_REMOVE_PATCH: "css.removePatch",
   BROWSER_TAKE_SCREENSHOT: "browser.takeScreenshot",
@@ -131,6 +153,8 @@ export const TOOL_NAMES = {
   BROWSER_COOKIE_SET: "browser.cookieSet",
   BROWSER_COOKIE_DELETE: "browser.cookieDelete",
   BROWSER_CONSOLE_MESSAGES: "browser.consoleMessages",
+  BROWSER_ACTIVITY_START: "browser.activity.start",
+  BROWSER_ACTIVITY_STOP: "browser.activity.stop",
   DNR_LIST_RULES: "dnr.listRules",
   DNR_UPSERT_HEADER_RULE: "dnr.upsertHeaderRule",
   DNR_REMOVE_RULE: "dnr.removeRule",
@@ -148,6 +172,7 @@ export const TOOL_NAMES = {
   DEBUGGER_NETWORK_STOP: "debugger.network.stop",
   DEBUGGER_NETWORK_CLEAR: "debugger.network.clear",
   DEBUGGER_NETWORK_LIST: "debugger.network.list",
+  DEBUGGER_RESOLVE_SOURCE: "debugger.resolveSource",
   DEBUGGER_NETWORK_GET: "debugger.network.get",
   DEBUGGER_NETWORK_GET_BODY: "debugger.network.getBody",
   DEBUGGER_DETACH: "debugger.detach",
@@ -163,6 +188,10 @@ export interface ToolArgumentMap {
   [TOOL_NAMES.DOM_HIGHLIGHT_ELEMENT]: HighlightElementInput;
   [TOOL_NAMES.DOM_CLEAR_HIGHLIGHTS]: Record<string, never>;
   [TOOL_NAMES.DOM_SET_VALUE]: DomSetValueInput;
+  [TOOL_NAMES.DOM_LOCATE_SOURCE]: BrowserLocateSourceInput;
+  [TOOL_NAMES.DOM_EXPLAIN_CSS]: BrowserCssExplainInput;
+  [TOOL_NAMES.PAGE_PERFORMANCE_DIAGNOSTICS]: BrowserPerformanceDiagnosticsInput;
+  [TOOL_NAMES.PAGE_REALTIME_ACTIVITY]: BrowserRealtimeActivityInput;
   [TOOL_NAMES.CSS_APPLY_PATCH]: CssPatchInput;
   [TOOL_NAMES.CSS_REMOVE_PATCH]: RemoveCssPatchInput;
   [TOOL_NAMES.BROWSER_TAKE_SCREENSHOT]: ScreenshotCaptureInput;
@@ -197,6 +226,8 @@ export interface ToolArgumentMap {
   [TOOL_NAMES.BROWSER_COOKIE_SET]: BrowserCookieSetInput;
   [TOOL_NAMES.BROWSER_COOKIE_DELETE]: BrowserCookieDeleteInput;
   [TOOL_NAMES.BROWSER_CONSOLE_MESSAGES]: BrowserConsoleMessagesInput;
+  [TOOL_NAMES.BROWSER_ACTIVITY_START]: BrowserActivityStartInput;
+  [TOOL_NAMES.BROWSER_ACTIVITY_STOP]: Record<string, never>;
   [TOOL_NAMES.DNR_LIST_RULES]: Record<string, never>;
   [TOOL_NAMES.DNR_UPSERT_HEADER_RULE]: HeaderRuleInput;
   [TOOL_NAMES.DNR_REMOVE_RULE]: RemoveDnrRuleInput;
@@ -214,6 +245,9 @@ export interface ToolArgumentMap {
   [TOOL_NAMES.DEBUGGER_NETWORK_STOP]: Record<string, never>;
   [TOOL_NAMES.DEBUGGER_NETWORK_CLEAR]: Record<string, never>;
   [TOOL_NAMES.DEBUGGER_NETWORK_LIST]: DebuggerNetworkListInput;
+  [TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE]: GeneratedSourceLocation & {
+    includeSourceExcerpt?: boolean;
+  };
   [TOOL_NAMES.DEBUGGER_NETWORK_GET]: DebuggerNetworkGetInput;
   [TOOL_NAMES.DEBUGGER_NETWORK_GET_BODY]: DebuggerNetworkBodyInput;
   [TOOL_NAMES.DEBUGGER_DETACH]: DebuggerDetachInput;
@@ -227,6 +261,10 @@ export interface ToolResultMap {
   [TOOL_NAMES.DOM_HIGHLIGHT_ELEMENT]: HighlightElementResult;
   [TOOL_NAMES.DOM_CLEAR_HIGHLIGHTS]: { cleared: boolean };
   [TOOL_NAMES.DOM_SET_VALUE]: DomSetValueResult;
+  [TOOL_NAMES.DOM_LOCATE_SOURCE]: BrowserLocateSourceResult;
+  [TOOL_NAMES.DOM_EXPLAIN_CSS]: BrowserCssExplainResult;
+  [TOOL_NAMES.PAGE_PERFORMANCE_DIAGNOSTICS]: BrowserPerformanceDiagnosticsResult;
+  [TOOL_NAMES.PAGE_REALTIME_ACTIVITY]: BrowserRealtimeActivityResult;
   [TOOL_NAMES.CSS_APPLY_PATCH]: CssPatchResult;
   [TOOL_NAMES.CSS_REMOVE_PATCH]: RemoveCssPatchResult;
   [TOOL_NAMES.BROWSER_TAKE_SCREENSHOT]: ScreenshotCaptureResult;
@@ -261,6 +299,8 @@ export interface ToolResultMap {
   [TOOL_NAMES.BROWSER_COOKIE_SET]: BrowserCookieSetResult;
   [TOOL_NAMES.BROWSER_COOKIE_DELETE]: BrowserCookieDeleteResult;
   [TOOL_NAMES.BROWSER_CONSOLE_MESSAGES]: BrowserConsoleMessagesResult;
+  [TOOL_NAMES.BROWSER_ACTIVITY_START]: BrowserActivityStatus;
+  [TOOL_NAMES.BROWSER_ACTIVITY_STOP]: BrowserActivityStatus;
   [TOOL_NAMES.DNR_LIST_RULES]: DnrRuleSummary[];
   [TOOL_NAMES.DNR_UPSERT_HEADER_RULE]: DnrRuleMutationResult;
   [TOOL_NAMES.DNR_REMOVE_RULE]: DnrRuleMutationResult;
@@ -278,6 +318,7 @@ export interface ToolResultMap {
   [TOOL_NAMES.DEBUGGER_NETWORK_STOP]: DebuggerNetworkStatus;
   [TOOL_NAMES.DEBUGGER_NETWORK_CLEAR]: DebuggerNetworkStatus;
   [TOOL_NAMES.DEBUGGER_NETWORK_LIST]: DebuggerNetworkListResult;
+  [TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE]: SourceMapResolution;
   [TOOL_NAMES.DEBUGGER_NETWORK_GET]: DebuggerNetworkRequestDetail;
   [TOOL_NAMES.DEBUGGER_NETWORK_GET_BODY]: DebuggerNetworkResponseBody;
   [TOOL_NAMES.DEBUGGER_DETACH]: DebuggerDetachResult;
@@ -353,6 +394,34 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     description:
       "Set an element value, textContent, innerText, or attribute by CSS selector.",
     writesPage: true,
+  },
+  {
+    name: TOOL_NAMES.DOM_LOCATE_SOURCE,
+    title: "定位组件源码",
+    description:
+      "Inspect fixed React/Vue runtime metadata for one exact element and return bounded component source hints.",
+    writesPage: false,
+  },
+  {
+    name: TOOL_NAMES.DOM_EXPLAIN_CSS,
+    title: "解释 CSS",
+    description:
+      "Read matched CSS rules, computed values, variables, and box-model evidence for one exact element.",
+    writesPage: false,
+  },
+  {
+    name: TOOL_NAMES.PAGE_PERFORMANCE_DIAGNOSTICS,
+    title: "页面性能诊断",
+    description:
+      "Read bounded Navigation Timing, paint, layout-shift, long-task, and slow-resource evidence.",
+    writesPage: false,
+  },
+  {
+    name: TOOL_NAMES.PAGE_REALTIME_ACTIVITY,
+    title: "实时通道诊断",
+    description:
+      "Summarize WebSocket, EventSource, Service Worker, and IndexedDB metadata without returning message or database values.",
+    writesPage: false,
   },
   {
     name: TOOL_NAMES.CSS_APPLY_PATCH,
@@ -569,6 +638,20 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     writesPage: false,
   },
   {
+    name: TOOL_NAMES.BROWSER_ACTIVITY_START,
+    title: "开始增量活动",
+    description:
+      "Start bounded DOM, Network, and Console activity notifications for the exact selected target.",
+    writesPage: false,
+  },
+  {
+    name: TOOL_NAMES.BROWSER_ACTIVITY_STOP,
+    title: "停止增量活动",
+    description:
+      "Stop the activity monitor owned by this extension without replaying browser actions.",
+    writesPage: false,
+  },
+  {
     name: TOOL_NAMES.DNR_LIST_RULES,
     title: "规则列表",
     description:
@@ -677,6 +760,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     writesPage: false,
   },
   {
+    name: TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE,
+    title: "定位请求源码",
+    description:
+      "Resolve one generated Network initiator frame through the captured script source map.",
+    writesPage: false,
+  },
+  {
     name: TOOL_NAMES.DEBUGGER_NETWORK_GET,
     title: "Network 详情",
     description:
@@ -708,6 +798,7 @@ const TOOL_NAME_ALIASES: Record<string, ToolName> = {
   clear_highlights: TOOL_NAMES.DOM_CLEAR_HIGHLIGHTS,
   set_dom_value: TOOL_NAMES.DOM_SET_VALUE,
   browser_set_dom_value: TOOL_NAMES.DOM_SET_VALUE,
+  browser_locate_source: TOOL_NAMES.DOM_LOCATE_SOURCE,
   take_screenshot: TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
   browser_take_screenshot: TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
   browser_list_tabs: TOOL_NAMES.BROWSER_LIST_TABS,
@@ -741,6 +832,8 @@ const TOOL_NAME_ALIASES: Record<string, ToolName> = {
   browser_cookie_set: TOOL_NAMES.BROWSER_COOKIE_SET,
   browser_cookie_delete: TOOL_NAMES.BROWSER_COOKIE_DELETE,
   browser_console_messages: TOOL_NAMES.BROWSER_CONSOLE_MESSAGES,
+  browser_activity_start: TOOL_NAMES.BROWSER_ACTIVITY_START,
+  browser_activity_stop: TOOL_NAMES.BROWSER_ACTIVITY_STOP,
   browser_network_requests: TOOL_NAMES.DEBUGGER_NETWORK_LIST,
   apply_css_patch: TOOL_NAMES.CSS_APPLY_PATCH,
   browser_apply_css_patch: TOOL_NAMES.CSS_APPLY_PATCH,
@@ -840,9 +933,19 @@ export function validateToolCall(call: unknown): string | null {
     case TOOL_NAMES.DEBUGGER_PROXY_CLEAR_RULES:
     case TOOL_NAMES.DEBUGGER_NETWORK_STOP:
     case TOOL_NAMES.DEBUGGER_NETWORK_CLEAR:
+    case TOOL_NAMES.BROWSER_ACTIVITY_STOP:
       return null;
     case TOOL_NAMES.DOM_QUERY:
       return validateDomQuery(args);
+    case TOOL_NAMES.DOM_LOCATE_SOURCE:
+      return validateLocateSource(args);
+    case TOOL_NAMES.DOM_EXPLAIN_CSS:
+      return typeof args.selector === "string" && args.selector.trim()
+        ? null
+        : "selector is required.";
+    case TOOL_NAMES.PAGE_PERFORMANCE_DIAGNOSTICS:
+    case TOOL_NAMES.PAGE_REALTIME_ACTIVITY:
+      return null;
     case TOOL_NAMES.BROWSER_TAKE_SCREENSHOT:
       return validateScreenshotCapture(args);
     case TOOL_NAMES.BROWSER_SET_TARGET_TAB:
@@ -903,6 +1006,8 @@ export function validateToolCall(call: unknown): string | null {
       return validateCookieDelete(args);
     case TOOL_NAMES.BROWSER_CONSOLE_MESSAGES:
       return validateBrowserConsoleMessages(args);
+    case TOOL_NAMES.BROWSER_ACTIVITY_START:
+      return validateBrowserActivityStart(args);
     case TOOL_NAMES.DOM_SET_VALUE:
       return validateDomSetValue(args);
     case TOOL_NAMES.DOM_HIGHLIGHT_ELEMENT:
@@ -950,6 +1055,17 @@ export function validateToolCall(call: unknown): string | null {
       return validateDebuggerNetworkStart(args);
     case TOOL_NAMES.DEBUGGER_NETWORK_LIST:
       return validateDebuggerNetworkList(args);
+    case TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE:
+      return typeof args.url === "string" &&
+        args.url.trim().length > 0 &&
+        typeof args.lineNumber === "number" &&
+        Number.isInteger(args.lineNumber) &&
+        args.lineNumber >= 0 &&
+        typeof args.columnNumber === "number" &&
+        Number.isInteger(args.columnNumber) &&
+        args.columnNumber >= 0
+        ? null
+        : "url, non-negative lineNumber, and non-negative columnNumber are required.";
     case TOOL_NAMES.DEBUGGER_NETWORK_GET:
       return validateDebuggerNetworkGet(args);
     case TOOL_NAMES.DEBUGGER_NETWORK_GET_BODY:
@@ -1126,15 +1242,86 @@ function validateDebuggerProxyRule(
   }
 
   if (
+    args.scenarioRepeat !== undefined &&
+    args.scenarioRepeat !== "hold-last" &&
+    args.scenarioRepeat !== "loop"
+  ) {
+    return "scenarioRepeat must be hold-last or loop.";
+  }
+  if (
+    args.resetScenario !== undefined &&
+    typeof args.resetScenario !== "boolean"
+  ) {
+    return "resetScenario must be a boolean.";
+  }
+  const scenarioError = validateProxyScenarioSteps(args.scenarioSteps);
+  if (scenarioError) {
+    return scenarioError;
+  }
+
+  if (
     !args.requestHeaders &&
     !args.responseHeaders &&
     args.responseBody === undefined &&
     args.responseBodyBase64 === undefined &&
-    args.statusCode === undefined
+    args.statusCode === undefined &&
+    args.responsePhrase === undefined &&
+    args.contentType === undefined &&
+    args.scenarioSteps === undefined
   ) {
     return "At least one proxy action is required.";
   }
 
+  return null;
+}
+
+function validateProxyScenarioSteps(value: unknown): string | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (!Array.isArray(value) || value.length < 1 || value.length > 50) {
+    return "scenarioSteps must contain between 1 and 50 steps.";
+  }
+  for (const [index, step] of value.entries()) {
+    if (!isPlainObject(step)) {
+      return `scenarioSteps[${index}] must be an object.`;
+    }
+    if (step.name !== undefined && typeof step.name !== "string") {
+      return `scenarioSteps[${index}].name must be a string.`;
+    }
+    if (
+      step.statusCode !== undefined &&
+      (!Number.isInteger(step.statusCode) ||
+        Number(step.statusCode) < 100 ||
+        Number(step.statusCode) > 599)
+    ) {
+      return `scenarioSteps[${index}].statusCode must be a valid HTTP status.`;
+    }
+    for (const key of [
+      "responseBody",
+      "responseBodyBase64",
+      "responsePhrase",
+      "contentType",
+    ] as const) {
+      if (step[key] !== undefined && typeof step[key] !== "string") {
+        return `scenarioSteps[${index}].${key} must be a string.`;
+      }
+    }
+    const headerError = validateProxyHeaderList(step.responseHeaders);
+    if (headerError) {
+      return `scenarioSteps[${index}].responseHeaders ${headerError}`;
+    }
+    if (
+      !step.responseHeaders &&
+      step.responseBody === undefined &&
+      step.responseBodyBase64 === undefined &&
+      step.statusCode === undefined &&
+      step.responsePhrase === undefined &&
+      step.contentType === undefined
+    ) {
+      return `scenarioSteps[${index}] must define at least one response action.`;
+    }
+  }
   return null;
 }
 
@@ -1707,6 +1894,47 @@ function validateBrowserConsoleMessages(
     return "limit must be an integer between 1 and 500.";
   }
   return null;
+}
+
+function validateBrowserActivityStart(
+  args: Record<string, unknown>,
+): string | null {
+  for (const key of ["includeDom", "includeNetwork", "includeConsole", "preserveLog"]) {
+    if (args[key] !== undefined && typeof args[key] !== "boolean") {
+      return `${key} must be a boolean.`;
+    }
+  }
+  if (
+    args.maxNetworkEntries !== undefined &&
+    (!Number.isInteger(args.maxNetworkEntries) ||
+      Number(args.maxNetworkEntries) < 10 ||
+      Number(args.maxNetworkEntries) > 2_000)
+  ) {
+    return "maxNetworkEntries must be an integer between 10 and 2000.";
+  }
+  return null;
+}
+
+function validateLocateSource(args: Record<string, unknown>): string | null {
+  if (typeof args.selector !== "string" || !args.selector.trim()) {
+    return "selector is required.";
+  }
+  const frameError = validateDirectFrameAddress(args);
+  if (frameError) {
+    return frameError;
+  }
+  if (
+    args.maxDepth !== undefined &&
+    (!Number.isInteger(args.maxDepth) ||
+      Number(args.maxDepth) < 1 ||
+      Number(args.maxDepth) > 20)
+  ) {
+    return "maxDepth must be an integer between 1 and 20.";
+  }
+  return args.includeSourceExcerpt === undefined ||
+    typeof args.includeSourceExcerpt === "boolean"
+    ? null
+    : "includeSourceExcerpt must be a boolean.";
 }
 
 function validateProxyHeaderList(value: unknown): string | null {

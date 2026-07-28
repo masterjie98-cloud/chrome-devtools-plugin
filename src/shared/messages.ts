@@ -24,6 +24,7 @@ import type {
   BrowserSelectOptionApplyInput,
   BrowserStorageStateInput,
   BrowserStorageStateResult,
+  BrowserTargetTab,
   BrowserWaitForInput,
   BrowserWaitForResult,
   DomQueryInput,
@@ -45,6 +46,7 @@ import type {
 } from "./debugger";
 import type { DnrRuleMutationResult, DnrRuleSummary } from "./network";
 import type { AnyToolCall, ToolExecutionResult } from "./tools";
+import type { BrowserActivityEventInput } from "./browserActivity";
 
 export const MESSAGE_TYPES = {
   TOOL_CALL: "tool:call",
@@ -55,6 +57,8 @@ export const MESSAGE_TYPES = {
   CONTENT_ELEMENT_PICKED: "content:elementPicked",
   CONTENT_SELECTION_CANCELLED: "content:selectionCancelled",
   CONTENT_TARGET_AVAILABLE: "content:targetAvailable",
+  CONTENT_SET_ACTIVITY_MONITOR: "content:setActivityMonitor",
+  CONTENT_DOM_ACTIVITY: "content:domActivity",
   CONTENT_HIGHLIGHT_ELEMENT: "content:highlightElement",
   CONTENT_CLEAR_HIGHLIGHTS: "content:clearHighlights",
   CONTENT_SET_DOM_VALUE: "content:setDomValue",
@@ -80,7 +84,9 @@ export const MESSAGE_TYPES = {
   DNR_LIST_RULES: "dnr:listRules",
   DNR_REMOVE_RULE: "dnr:removeRule",
   SIDE_PANEL_READY: "sidepanel:ready",
+  SIDE_PANEL_FOCUS_TARGET_TAB: "sidepanel:focusTargetTab",
   AGENT_POINTER_CLEAR: "agent:pointerClear",
+  FOREGROUND_TAB_UPDATED: "browser:foregroundTabUpdated",
   DEBUGGER_PROXY_STATE_CHANGED: "debugger:proxyStateChanged",
 } as const;
 
@@ -99,6 +105,12 @@ export type ExtensionRequest =
       source: "background";
       type: typeof MESSAGE_TYPES.CONTENT_GET_PAGE_INFO;
       payload: PageSnapshotInput;
+    }
+  | {
+      id: string;
+      source: "background";
+      type: typeof MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR;
+      payload: { enabled: boolean };
     }
   | {
       id: string;
@@ -271,6 +283,12 @@ export type ExtensionRequest =
   | {
       id: string;
       source: "sidepanel";
+      type: typeof MESSAGE_TYPES.SIDE_PANEL_FOCUS_TARGET_TAB;
+      payload: { tabId: number };
+    }
+  | {
+      id: string;
+      source: "sidepanel";
       type: typeof MESSAGE_TYPES.AGENT_POINTER_CLEAR;
       payload: Record<string, never>;
     };
@@ -296,6 +314,18 @@ export type ExtensionEvent =
     }
   | {
       id: string;
+      source: "content";
+      type: typeof MESSAGE_TYPES.CONTENT_DOM_ACTIVITY;
+      payload: BrowserActivityEventInput;
+    }
+  | {
+      id: string;
+      source: "background";
+      type: typeof MESSAGE_TYPES.FOREGROUND_TAB_UPDATED;
+      payload: { tab: BrowserTargetTab };
+    }
+  | {
+      id: string;
       source: "background";
       type: typeof MESSAGE_TYPES.DEBUGGER_PROXY_STATE_CHANGED;
       payload: {
@@ -312,6 +342,7 @@ export type EventOf<T extends ExtensionEvent["type"]> = Extract<ExtensionEvent, 
 export interface ResponsePayloadMap {
   [MESSAGE_TYPES.TOOL_CALL]: ToolExecutionResult;
   [MESSAGE_TYPES.CONTENT_GET_PAGE_INFO]: PageSnapshot;
+  [MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR]: { enabled: boolean };
   [MESSAGE_TYPES.CONTENT_QUERY_DOM]: DomQueryResult;
   [MESSAGE_TYPES.CONTENT_START_ELEMENT_PICK]: { started: boolean };
   [MESSAGE_TYPES.CONTENT_CANCEL_ELEMENT_PICK]: { cancelled: boolean };
@@ -340,6 +371,7 @@ export interface ResponsePayloadMap {
   [MESSAGE_TYPES.DNR_LIST_RULES]: DnrRuleSummary[];
   [MESSAGE_TYPES.DNR_REMOVE_RULE]: DnrRuleMutationResult;
   [MESSAGE_TYPES.SIDE_PANEL_READY]: { ready: true };
+  [MESSAGE_TYPES.SIDE_PANEL_FOCUS_TARGET_TAB]: { focused: true };
   [MESSAGE_TYPES.AGENT_POINTER_CLEAR]: { cleared: true };
 }
 

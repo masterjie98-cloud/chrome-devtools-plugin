@@ -192,6 +192,14 @@ const mcpToolCallSchema = z.object({
 const taskContextSchema = z
   .object({
     taskId: z.string().min(1).max(200),
+    conversationId: z.string().min(1).max(200).optional(),
+    target: z
+      .object({
+        tabId: z.number().int().nonnegative(),
+        targetId: z.string().max(200).optional(),
+      })
+      .strict()
+      .optional(),
     egressDestinations: z.array(z.string().min(1).max(500)).max(10),
   })
   .strict();
@@ -267,6 +275,22 @@ const agentSessionSchema = z.object({
   updatedAt: z.string(),
   completedAt: z.string().optional(),
   finalContent: z.string().optional(),
+  executionBinding: z
+    .object({
+      taskId: z.string().min(1).max(200),
+      conversationId: z.string().min(1).max(200),
+      target: z
+        .object({
+          tabId: z.number().int().nonnegative(),
+          windowId: z.number().int().nonnegative().optional(),
+          targetId: z.string().max(200).optional(),
+          title: z.string().max(500).optional(),
+          url: z.string().max(1200).optional(),
+        })
+        .strict(),
+    })
+    .strict()
+    .optional(),
   taskState: agentTaskStateSchema,
   events: z.array(agentSessionEventSchema),
 });
@@ -441,6 +465,49 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
       .object({
         workspace: collaborationWorkspaceSchema,
         item: collaborationItemSchema.optional(),
+      })
+      .strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.BROWSER_ACTIVITY_EVENT),
+    payload: z
+      .object({
+        event: z
+          .object({
+            kind: z.enum(["dom", "network", "console", "navigation"]),
+            observedAt: z.string().max(64).optional(),
+            target: activeTabSchema.optional(),
+            summary: z
+              .object({
+                message: z.string().max(2_000).optional(),
+                level: z.string().max(40).optional(),
+                method: z.string().max(20).optional(),
+                url: z.string().max(4_000).optional(),
+                resourceType: z.string().max(80).optional(),
+                status: z.number().int().min(0).max(999).optional(),
+                failed: z.boolean().optional(),
+                requestId: z.string().max(200).optional(),
+                initiatorType: z.string().max(80).optional(),
+                source: z
+                  .object({
+                    url: z.string().max(4_000).optional(),
+                    functionName: z.string().max(160).optional(),
+                    lineNumber: z.number().int().nonnegative().optional(),
+                    columnNumber: z.number().int().nonnegative().optional(),
+                  })
+                  .strict()
+                  .optional(),
+                fromRevision: z.number().int().nonnegative().optional(),
+                toRevision: z.number().int().nonnegative().optional(),
+                added: z.number().int().nonnegative().optional(),
+                removed: z.number().int().nonnegative().optional(),
+                attributes: z.number().int().nonnegative().optional(),
+                characterData: z.number().int().nonnegative().optional(),
+                reason: z.string().max(240).optional(),
+              })
+              .strict(),
+          })
+          .strict(),
       })
       .strict(),
   }),

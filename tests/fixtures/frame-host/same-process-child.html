@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Same-process child</title>
+  </head>
+  <body>
+    <h2>Same-process child frame</h2>
+    <label for="same-process-input">Same-process input</label>
+    <input
+      id="same-process-input"
+      aria-label="Same-process input"
+      value="same-process-before"
+    />
+    <output id="same-process-result">not typed</output>
+    <script>
+      document
+        .querySelector("#same-process-input")
+        .addEventListener("input", (event) => {
+          document.querySelector("#same-process-result").textContent =
+            event.isTrusted
+              ? `trusted input: ${event.target.value}`
+              : `synthetic input: ${event.target.value}`;
+        });
+    </script>
+  </body>
+</html>

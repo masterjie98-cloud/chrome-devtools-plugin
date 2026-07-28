@@ -44,6 +44,7 @@ export interface ExecutionGrantExpectation {
   toolName: string;
   args: unknown;
   target: ActiveTabSnapshot;
+  targetBinding?: "exact" | "none";
   now?: Date;
 }
 
@@ -125,15 +126,17 @@ export async function verifyExecutionGrant(
   ) {
     return { ok: false, reason: "execution grant arguments do not match" };
   }
-  const targetMismatchFields = executionTargetMismatchFields(
-    grant.claims.target,
-    expected.target,
-  );
-  if (targetMismatchFields.length > 0) {
-    return {
-      ok: false,
-      reason: `execution grant target is stale or does not match (fields=${targetMismatchFields.join(",")})`,
-    };
+  if (expected.targetBinding !== "none") {
+    const targetMismatchFields = executionTargetMismatchFields(
+      grant.claims.target,
+      expected.target,
+    );
+    if (targetMismatchFields.length > 0) {
+      return {
+        ok: false,
+        reason: `execution grant target is stale or does not match (fields=${targetMismatchFields.join(",")})`,
+      };
+    }
   }
   if (grant.claims.approvalRequired && !grant.claims.approvalId) {
     return { ok: false, reason: "approval-bound grant is missing approvalId" };

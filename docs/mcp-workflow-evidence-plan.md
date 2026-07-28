@@ -355,3 +355,22 @@ top-frame/OOPIF fixture:
   observation verified `value: "direct-frame-value"`;
 - the second identical element screenshot reported `changed: false`,
   `changedPixelRatio: 0` and returned no image bytes.
+
+## 11. 2026-07-27 incremental diagnostics extension
+
+The workflow evidence surface now also supports:
+
+- explicit subscription-based DOM/Network/Console activity through the
+  session-scoped `activity-stream` MCP resource;
+- React/Vue owner-chain lookup and bounded source-map resolution for exact
+  document-bound elements;
+- Network initiator correlation to workflow actions, components, and source
+  locations with an explicit confidence reason;
+- `browser_capture_issue_evidence`, which stores one bounded JSON manifest and
+  separate screenshot artifacts;
+- a same-process iframe fixture in the live workflow verifier in addition to
+  the existing OOPIF path.
+
+These additions do not change the workflow's write authority. Subscription is
+not monitoring activation, source inspection is a sensitive read, and an issue
+bundle's nested actions retain their normal policy and no-replay rules.

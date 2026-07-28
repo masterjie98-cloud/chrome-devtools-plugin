@@ -1,5 +1,98 @@
 # Chrome DevTools Plugin Threat Model
 
+## 2026-07-27 diagnostic automation V3 update
+
+V3 adds five browser diagnostics, one adapter-local workspace lookup, and
+stateful proxy scenarios. `browser_explain_css`,
+`browser_performance_diagnostics`, and `browser_realtime_activity` run fixed
+build-owned functions against the selected tab/frame/document and retain the
+existing sensitive-read policy. They do not expose arbitrary JavaScript.
+Realtime output contains WebSocket/EventSource URLs, counters, byte lengths,
+Service Worker metadata, and IndexedDB names/versions/store names only; it
+excludes frame payloads, database values, credentials, headers, and bodies.
+
+Reproduction recipes are bounded JSON artifacts tied to the creating Profile
+session, artifact TTL, and runtime schema identity. Creation grants no browser
+authority. Execution reloads and validates the artifact, checks the current URL
+precondition by default, obtains a fresh approval/execution grant, and delegates
+only to the typed workflow executor. Unknown write outcomes remain terminal and
+are never replayed automatically.
+
+`browser_find_workspace_source` exists only in the stdio adapter. Roots come
+from `AI_DEVTOOLS_WORKSPACE_ROOTS` or the adapter working directory, are
+realpath-resolved, and are never accepted from the tool caller. Traversal,
+symlink files, ignored build/dependency trees, files above 512 KiB, scans above
+5,000 files, and more than 50 results are excluded. Optional excerpts are
+explicit and capped. This bridge can disclose local path/symbol/source snippets
+to the requesting MCP client, so it remains a local-workspace read boundary and
+must not be routed from page or extension-originated messages.
+
+Stateful Mock steps persist only rule cursor/hit metadata and advance after a
+successful fulfilled response. Rule creation, reset, and removal remain
+approval-gated network writes. Each step is schema-validated, bounded to 50
+entries, and uses the existing response body/header limits. The cursor is saved
+once per fulfilled request even when multiple response rules match.
+
+Residual risks:
+
+- CSS output identifies generated stylesheet origins but does not yet resolve
+  original CSS source-map lines; callers must not infer an original source.
+- PerformanceObserver availability and retained buffered entries vary by page
+  and Chrome version; missing metrics are reported as warnings.
+- Workspace roots intentionally trust the local adapter configuration. A
+  compromised same-user MCP process is already inside the accepted local-only
+  trust boundary.
+- Replaying a logically destructive recipe can repeat a user-approved effect;
+  this is why every replay remains a decision barrier rather than inheriting
+  capture-time consent.
+
+## 2026-07-27 activity, source mapping, and issue-evidence update
+
+MCP clients may now subscribe to one stable, session-scoped activity resource.
+Monitoring remains explicit: listing or subscribing to the resource does not
+attach the debugger. `browser_activity_start` enables the selected target's
+bounded DOM/Network/Console observers, while `browser_activity_stop` releases
+only domains owned by that monitor. The daemon retains at most 200 sanitized
+events in memory, does not persist the stream, and sends resource updates only
+to subscribed MCP sockets bound to the same Profile session. DOM events omit
+text, URL fragments are removed, query values and sensitive console patterns
+are redacted, and dropped sequence ranges are reported.
+
+`browser_locate_source` adds a sensitive read but no arbitrary-evaluation
+surface. The background injects a fixed build-owned MAIN-world function into
+the exact tab/frame/document to inspect bounded React Fiber or Vue instance
+metadata. Source-map resolution is limited to flat Source Map v3 data referenced
+by scripts already loaded in that debugger session; fetches omit credentials,
+enforce timeout/byte/mapping ceilings, and fail closed for indexed or malformed
+maps. Source excerpts are returned only when explicitly requested and present
+in `sourcesContent`.
+
+Network initiator frames and action timestamps can be associated with the
+workflow's exact target, component, and original source. The API labels each
+association with `stack`, `action-window`, or `navigation` reasoning and a
+bounded confidence value. Consumers must not treat temporal proximity as proof
+that a button caused a request.
+
+`browser_capture_issue_evidence` is an approval-gated sensitive composite. It
+stores a bounded JSON manifest in the existing session artifact store and keeps
+before/after screenshot bytes as separate image artifacts. The manifest never
+embeds data URLs or raw response bodies and inherits artifact TTL, per-object,
+per-session, and global quotas. It creates no Chrome download and performs no
+external upload. Its nested actions retain the workflow approval, exact-target,
+decision-barrier, single-use grant, and unknown-write no-replay rules.
+
+Residual risks:
+
+- Framework production builds may expose neither debug owners nor source maps;
+  absence is reported rather than inferred.
+- Source paths and source excerpts can reveal proprietary code and therefore
+  remain sensitive output controlled by the requesting MCP client's egress
+  destination.
+- A high-rate page can overrun the 200-event window; sequence gaps are visible,
+  but the system intentionally does not persist an unbounded forensic log.
+- Initiator/action correlation can produce false positives when concurrent page
+  work falls inside the same action window.
+
 ## 2026-07-23 workflow evidence and direct-frame update
 
 This update makes previously read-only child-frame observations directly
@@ -328,6 +421,9 @@ flowchart LR
 | Chrome debugger/DNR/cookies APIs | Tool dispatcher invokes Chrome APIs | Extension → browser-wide capabilities | Broad permissions and all-URL host access | `public/manifest.json`, `src/background/toolDispatcher.ts` |
 | Configurable AI endpoint | User saves API URL/key | Sidepanel → remote endpoint | Remote URLs require HTTPS; loopback HTTP is allowed; credentials in URLs and active schemes are rejected | `src/sidepanel/services/aiEndpointPolicy.ts`, `src/sidepanel/services/aiClient.ts:requestChatCompletion` |
 | Screenshot/full DOM payload | Tool captures large binary/text data | Browser → WS/MCP/model | Screenshot/oversized results use bounded session artifacts; semantic snapshots are capped and cursor-paginated; explicit full DOM remains sensitive | `src/daemon/artifacts/store.ts`, `src/shared/semanticSnapshot.ts`, `src/content/domInspector.ts` |
+| Incremental activity subscription | MCP subscribes and extension emits DOM/Network/Console changes | Browser → daemon memory → subscribed MCP task | Explicit start; exact Profile routing; 200-event in-memory ring; sanitized summaries; no raw DOM text, bodies, or durable event history | `src/shared/browserActivity.ts`, `src/mcp/browserStateHub.ts`, `src/mcp/server.ts` |
+| Framework/source locator | MCP asks where an exact DOM target came from | Page MAIN world/CDP script metadata → MCP | Fixed injected function only; exact document binding; bounded React/Vue owners; credential-free, size-limited flat source maps; sensitive-read policy | `src/background/sourceLocator.ts`, `src/background/sourceMapResolver.ts`, `src/background/debuggerAdapter.ts` |
+| Issue evidence bundle | MCP captures workflow and diagnostic evidence | Browser/daemon artifacts → requesting MCP task | Approval-gated composite; action policy remains nested; manifest and images separated; no Downloads side effect; TTL and quotas inherited | `src/mcp/toolRuntime.ts`, `src/daemon/artifacts/store.ts` |
 | Collaboration publication/resource | Extension AI or MCP AI publishes/reads a typed item | AI participant → Profile state → other AI/model | Same-Profile only; strict kinds/schema, owner and revision controls, redaction, private/sensitive filtering, aggregate limits, relevance selection | `src/shared/collaborationWorkspace.ts`, `src/mcp/collaborationTools.ts`, `src/mcp/browserStateHub.ts`, `src/sidepanel/services/aiClient.ts` |
 | Durable collaboration delegation | Codex creates a task; user accepts it in the sidepanel | MCP text → Profile inbox → conversation-bound user decision → embedded Agent input | Stable task ID/fingerprint, Profile/target/conversation binding, explicit claim, immutable result, cancelable wait, no cross-conversation or reload replay; accept is not a browser approval | `src/shared/collaborationTasks.ts`, `src/mcp/collaborationTaskRuntime.ts`, `src/sidepanel/App.tsx`, `src/sidepanel/components/ChatPanel.tsx` |
 
@@ -370,13 +466,25 @@ The current implementation replaces the earlier embedded-Agent-only remembered
 grant with an always-visible, memory-only three-mode selector. `ask` is the
 default lifecycle state; `agent` automatically answers only `task_grant`
 policies; `full` automatically answers all approval modes exposed by this
-extension. Both automatic modes bind the active conversation, normalized HTTP(S)
-origin, Chrome Profile session, and Provider destination, and reset on any of
-those boundaries or a Hub disconnect. They apply to embedded and MCP requesters,
-but do not reuse execution grants: the daemon still binds the concrete requester,
-late-validates the target, records the decision, and signs a new single-use grant
-per operation. `full` does not create operating-system file/process authority
-that the extension does not expose.
+extension. Both automatic modes bind the active conversation, Chrome Profile
+session, and Provider destination. `agent` additionally binds normalized
+HTTP(S) origin and fails closed on a cross-origin redirect. `full` instead binds
+the exact user-selected Tab/target, so an authentication redirect may cross
+origins and return only inside that Tab. A different chat, Profile, Provider, or
+Tab/target resets or stops matching the decision. A transient authenticated Hub
+disconnect pauses execution but does not silently erase it. Both modes apply to
+embedded and MCP requesters, but do not reuse execution grants: the daemon still
+binds the concrete requester, late-validates the current document/navigation,
+records the decision, and signs a new single-use grant per operation. `full`
+does not create operating-system file/process authority that the extension does
+not expose.
+
+For a high-level action workflow, an already-dispatched page or browser effect
+may be followed by read-only post-action evidence from the replacement document
+only while the Chrome Profile session, `tabId`, `targetId`, and window still
+match. This continuation cannot authorize another effectful internal call and
+cannot cross to a different Tab; it prevents successful navigation from being
+misreported and replayed while preserving the target trust boundary.
 
 Fast Agent execution now defaults on as an orchestration strategy. It remains
 DOM-first and does not capture a screenshot merely because the user sends a
@@ -394,7 +502,7 @@ embedded-only.
 | TM-002 | Malicious page or remote model output | Auto page context and Agent tools are enabled | Inject instructions or pseudo tool markup that executes despite user/tool policy, exploit a remembered approval outside its intended scope, or use automatic segment continuation to extend malicious execution | Browser mutation, sensitive read, external action, loss of user trust | Browser integrity, approval decision, sensitive data | Page context is an untrusted user message; tools-off is hard-gated; pseudo calls default off; formal/pseudo calls are intersected with the exact advertised tools; strict known-tool parsing precedes approval; conversation-origin approval is memory-only and binds chat, normalized HTTP(S) origin, owning sidepanel instance, Profile session, and Provider destination; destructive, arbitrary, open-world, unknown, unbound, non-HTTP(S), and external MCP requests remain one-time; pending approval has no UI expiry or pre-issued grant; after allow, target/revision and a single-use HMAC grant are revalidated; reaching a run budget creates a separate no-timeout user checkpoint that extends only the exhausted dimension or stops for a tools-off summary and never grants a concrete tool (`src/sidepanel/services/aiClient.ts`, `src/sidepanel/services/autonomousAgent.ts`, `src/sidepanel/agentRunApprovals.ts`, `src/shared/agentRunBudget.ts`, `src/mcp/wsServer.ts`, `src/daemon/executionBroker.ts`, `src/shared/executionGrant.ts`) | Real Chrome budget-card behavior and active-grant chat switching remain manual evidence | Complete browser regression; never treat a budget continuation as tool approval or broaden remembered decisions across chats, origins, Profiles, sidepanel instances, Providers, destructive/open-world tools, or external MCP callers | Audit model-requested, UI-prompted, auto-answered, budget-extended, and executed tools; alert on scope/grant/schema/stale-target mismatches | low | high | medium |
 | TM-003 | Normal concurrency or malicious session messages | Multiple profiles/tasks/tabs or crafted session heartbeat/resource URI/cursor | Route state or commands through global active session/latest socket, reuse a resource URI after navigation, switch another adapter's Profile, reuse a collection cursor with another Profile/filter, or make stale cached data look fresh by sending heartbeats | Read or mutate the wrong profile/tab/document; model acts on stale state; cross-Profile audit metadata disclosure | Target identity, page data, audit metadata, browser integrity | Stable Profile installation IDs; per-connection runtime Profile list/select tools restricted to MCP adapter roles; adapter-local heartbeat/state/artifact binding; safe MCP resources require an explicit matching session and opaque tab/frame/document/navigation/revision target key; audit rows are filtered by the bound Profile before filtering/paging; collection cursors bind kind/source/filter/snapshot; matching browser-socket routing; explicit tab/frame/document targets; background-attached page provenance; stale provenance/resource/cursor rejection; navigation invalidation; socket-bound result checks; HMAC execution grants; separate clocks; and protocol/runtime-switch tests (`src/mcp/stateResourceRegistry.ts`, `src/mcp/resourceRouting.ts`, `src/shared/collectionPagination.ts`, `src/mcp/toolRuntime.ts`, `src/mcp/wsServer.ts`) | Tab-close invalidation and all observer broadcasts still need real-Chrome multi-Profile evidence | Complete real-Chrome routing/tab-close/resource/audit regression and keep all state/resource broadcasts session-scoped | Log route selection and stale provenance/resource/cursor/grant rejections using redacted target IDs; alert when liveness is current but state age exceeds policy | low | high | medium |
 | TM-004 | Model, MCP client, or page-induced tool request | Sensitive tool is available and returns data | Read raw cookie/storage/header/body/screenshot/full DOM and send it across WS or remote AI | Credential theft, private data disclosure | Cookies, tokens, application data, screenshots | Cookie/storage values default omitted; credential headers use structural redaction; ordinary sensitive reads require approval with egress preview and concrete destination; sending a chat message never captures a page image; optional fast Agent mode defaults off and confirms the displayed Provider origin before first enable and after origin change; the Agent must explicitly call the approval-gated `browser_take_screenshot` tool before visual observation is active; only then may later page-state barriers produce at most 8 adaptive capture attempts and 8 MiB per task, coalesced per tool batch, latest-only, sampled-fingerprint deduplicated, and degraded to fresh DOM without replay; Safe Retry disables the path; tool-produced screenshots and large payloads use session artifacts; persisted Agent/audit state omits raw arguments/results; completed sensitive tool/artifact responses record only class, exact serialized bytes, and authenticated destination (`src/shared/sensitiveData.ts`, `src/shared/agentSession.ts`, `src/shared/egressMetrics.ts`, `src/sidepanel/App.tsx`, `src/sidepanel/services/aiClient.ts`, `src/sidepanel/services/autonomousAgent.ts`, `src/sidepanel/services/fastAgentVisualCheckpoints.ts`, `src/sidepanel/components/AiSettingsDrawer.tsx`, `src/mcp/wsServer.ts`, `src/daemon/artifacts/`) | Fast-mode consent is Profile-persistent rather than chat/origin-scoped, so after one explicitly approved screenshot a user who leaves it enabled can send later page-state checkpoints to the configured Provider without another prompt; the daemon does not meter these direct Provider image requests, and repeated adaptive captures can disclose more of a task than the first explicit screenshot alone; response bodies and explicitly requested cookie/storage values remain intentionally available after approval; the daemon cannot observe how a downstream MCP client or Provider repackages bytes after its authenticated boundary | Keep the active mode visible in context labels, default it off, require confirmation on enable/destination change, preserve the explicit first screenshot approval and the 8-attempt/8-MiB/latest-only boundaries, and tell users to disable it before entering pages they do not want captured; if broader deployments are added, replace persistent consent with chat-and-origin-scoped consent; retain origin-only destination rendering and keep raw values out of logs/state | Metrics for sensitive reads and bytes egressed by class/destination; audit fast-mode enable/disable, Provider-origin changes, explicit screenshot approvals, checkpoint attempts/acceptance/deduplication, and cap exhaustion without image or prompt content | medium | high | medium |
-| TM-005 | MCP/Agent tool caller | Caller invokes screenshot, input, network, evaluate, dialog, or another mislabeled tool | Read tool is wired to a mutation executor; screenshot naming is interpreted as download permission; selector geometry becomes stale/occluded or child-frame coordinates are sent to the wrong renderer; focus clicks a control before typing; batch form execution changes an early field before a later dynamic failure; select labels resolve ambiguously; evaluate hangs; dialog handling persists | Page breakage, unexpected local file write, wrong-target interaction, renderer hang, unintended state change | Page integrity, local Downloads, and availability | Canonical policy/executor registries and bound grants; MCP screenshot schemas expose no filename/download arguments and return image content plus Artifact only; internal download requires explicit `saveToDownloads: true`; selector mouse actions revalidate target and require center hit tests; keyboard targets confirm bounded focus without click and use CDP; form fill performs all-field preflight, element-token/type rechecks, CDP text/toggle input, radio-uncheck denial, bounded field counts, and partial-failure reporting; select is an explicit scoped DOM exception with exact unique option matching, disabled-option denial, token binding, post-event verification, `inputMode: dom`, and no returned field values; Chrome 125+ recursively auto-attaches flat OOPIF sessions and maps CDP/webNavigation trees only on exact or unique active URL matches bound to the exact document; same-process child coordinates are translated from the frame content box before CDP mouse dispatch; ambiguous, duplicate-URL, missing, and stale routes fail closed; dialog handling is one CDP command; arbitrary evaluate is not exposed; invariant tests (`src/shared/mcpExecutionPolicy.ts`, `src/shared/executionGrant.ts`, `src/shared/trustedKeyboard.ts`, `src/shared/formControls.ts`, `src/background/debuggerFrameRouting.ts`, `src/background/debuggerAdapter.ts`, `src/background/toolDispatcher.ts`, `src/background/dialogHandling.ts`) | Dynamic multi-field pages can partially change after successful preflight if a later post-check fails; live OOPIF direct fill has exact value evidence, but same-process coordinate routing and multi-field child forms remain automated-only; no isolated evaluator exists, so arbitrary evaluate remains intentionally hidden | Keep ambiguous and duplicate-URL child routes fail closed; add a real same-process iframe pointer/input regression; preserve select's non-trusted semantics; keep legacy evaluate unreachable unless a separately isolated design is approved | Count policy, stale-context/control, focus, route-ambiguity, option-resolution, partial-fill, unsupported-frame/radio/key, download attempts, and no-dialog rejections; review every new mutation mapping | low | high | low to medium |
+| TM-005 | MCP/Agent tool caller | Caller invokes screenshot, input, network, evaluate, dialog, or another mislabeled tool | Read tool is wired to a mutation executor; screenshot naming is interpreted as download permission; selector geometry becomes stale/occluded or child-frame coordinates are sent to the wrong renderer; focus clicks a control before typing; batch form execution changes an early field before a later dynamic failure; select labels resolve ambiguously; evaluate hangs; dialog handling persists | Page breakage, unexpected local file write, wrong-target interaction, renderer hang, unintended state change | Page integrity, local Downloads, and availability | Canonical policy/executor registries and bound grants; MCP screenshot schemas expose no filename/download arguments and return image content plus Artifact only; internal download requires explicit `saveToDownloads: true`; selector mouse actions revalidate target and require center hit tests; keyboard targets confirm bounded focus without click and use CDP; form fill performs all-field preflight, element-token/type rechecks, CDP text/toggle input, radio-uncheck denial, bounded field counts, and partial-failure reporting; select is an explicit scoped DOM exception with exact unique option matching, disabled-option denial, token binding, post-event verification, `inputMode: dom`, and no returned field values; Chrome 125+ recursively auto-attaches flat OOPIF sessions and maps CDP/webNavigation trees only on exact or unique active URL matches bound to the exact document; same-process child coordinates are translated from the frame content box before CDP mouse dispatch; ambiguous, duplicate-URL, missing, and stale routes fail closed; dialog handling is one CDP command; arbitrary evaluate is not exposed; real Chrome now verifies exact-value direct fill in both OOPIF and same-process child frames; invariant tests (`src/shared/mcpExecutionPolicy.ts`, `src/shared/executionGrant.ts`, `src/shared/trustedKeyboard.ts`, `src/shared/formControls.ts`, `src/background/debuggerFrameRouting.ts`, `src/background/debuggerAdapter.ts`, `src/background/toolDispatcher.ts`, `src/background/dialogHandling.ts`) | Dynamic multi-field pages can partially change after successful preflight if a later post-check fails; dedicated same-process pointer-click and multi-field child-form paths remain automated-only; no isolated evaluator exists, so arbitrary evaluate remains intentionally hidden | Keep ambiguous and duplicate-URL child routes fail closed; add real same-process iframe pointer-click and multi-field regressions; preserve select's non-trusted semantics; keep legacy evaluate unreachable unless a separately isolated design is approved | Count policy, stale-context/control, focus, route-ambiguity, option-resolution, partial-fill, unsupported-frame/radio/key, download attempts, and no-dialog rejections; review every new mutation mapping | low | high | low to medium |
 | TM-006 | Malicious/large page or protocol client | Client can send or produce large DOM/image/events | Exhaust memory/context/disk or keep Agent/tool loop running | Daemon, extension, renderer, or model-cost denial of service | Availability and cost budget | 8 MiB frame cap; advertised command-specific UTF-8 byte ceilings with a 4 KiB unknown-command default; hello/idle timeouts; per-connection rate limit; pending/active execution caps; Agent cancellation across AI/MCP/browser/standalone search; aligned deadlines; bounded inline MCP output; semantic and Network/conversation/audit cursor pagination; Agent-run-bound SHA-256 idempotency keys; 256,000-character sidepanel tool-result retention with explicit truncation metadata and line virtualization above 240 lines; per-object/session/global artifact budgets; per-Agent duration/model/tool/effectful/sensitive ceilings with atomic batch reservation; and fast-mode visual checkpoints coalesced to one per tool batch, sampled-fingerprint deduplicated, latest-only, and capped at 8 adaptive capture attempts and 8 MiB per task (`src/mcp/wsServer.ts`, `src/mcp/protocolPolicy.ts`, `src/sidepanel/services/webSearch.ts`, `src/sidepanel/agentRunApprovals.ts`, `src/sidepanel/toolResultPresentation.ts`, `src/sidepanel/services/fastAgentVisualCheckpoints.ts`, `src/shared/agentRunBudget.ts`, `src/shared/semanticSnapshot.ts`, `src/shared/collectionPagination.ts`, `src/daemon/executionBroker.ts`, `src/daemon/artifacts/store.ts`) | Limits are statically calibrated; real high-complexity pages may reveal a command or visual-checkpoint budget that is too loose or too strict | Keep fail-closed ceilings and tune only from redacted rejection/size telemetry; do not raise the global frame or visual-checkpoint ceiling to mask one workflow | Monitor connection/message bytes, pending counts, idle closes, cursor rejection, artifact bytes, run duration, visual-checkpoint cap exhaustion, and budget/limit rejections | low | medium | low |
 | TM-007 | Normal multi-client use | Local daemon is stopped, crashes, or is not started before adapters | Adapters cannot reach the single local daemon | Browser integration unavailable; active requests are lost | Availability, bounded Agent state | One daemon plus many stdio adapters, atomic bounded state/artifact persistence, status command, separate packaged entrypoints, graceful adapter shutdown on stdio EOF, multi-client/restart tests, and a real-dist two-adapter lifecycle verifier (`src/daemon/server.ts`, `src/daemon/status.ts`, `src/daemon/store/stateStore.ts`, `src/mcp/daemonClient.ts`, `src/mcp/server.ts`, `scripts/verify-packaged-processes.mjs`) | No OS-level packaged supervisor/autostart; active requests and approvals intentionally do not survive restart | Add an optional launchd/system service installer and clear startup diagnostics without coupling daemon lifetime to one adapter | Daemon health, adapter negotiation failures, restart counters | low | medium | low |
 | TM-008 | Misconfiguration or malicious endpoint | User or modified persisted config supplies an unsafe provider URL | Send API key, prompts, page context, and results to an unintended endpoint | AI credential and page-data disclosure | API key, page data, chat, screenshots | Settings/fetch-time policy require remote HTTPS and verified loopback HTTP; URL credentials/non-HTTP schemes are rejected; keys migrate to Profile-scoped `chrome.storage.local`; metadata serialization strips keys; Provider-origin changes require explicit confirmation when either an API key or fast-mode screenshot egress is active; sending a message never creates an image; the first Agent-requested screenshot keeps its sensitive-read approval and displays the current Provider origin; only a successful explicit screenshot activates bounded runtime checkpoints to that same origin; embedded-Agent approvals render the current Provider origin only, while MCP approvals identify client-managed downstream egress (`src/sidepanel/services/aiConfig.ts`, `src/sidepanel/services/aiEndpointPolicy.ts`, `src/sidepanel/services/approvalPresentation.ts`, `src/sidepanel/services/aiClient.ts`, `src/sidepanel/components/AiSettingsDrawer.tsx`, `src/sidepanel/components/ChatPanel.tsx`) | Extension storage is not an OS keychain and remains readable by compromised extension code; persistent fast-mode consent does not prompt separately for each later route, drawer, or visual-state checkpoint after the explicit visual chain has started | Keep extension code/CSP narrow, retain origin-only destination rendering on every model-egress approval or persistent-mode confirmation, keep adaptive checkpoints bounded and latest-only, and consider chat/origin-scoped consent or OS keychain integration only if the local threat model expands | Audit Provider origin/TLS policy, fast-mode consent changes, explicit screenshot approvals, checkpoint counters, and migration failures without logging keys, prompts, or screenshots | low | high | medium |

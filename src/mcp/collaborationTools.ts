@@ -5,6 +5,7 @@ import {
 } from "../shared/collaborationWorkspace";
 import {
   COLLABORATION_TOOL_NAMES,
+  DELEGATED_TASK_EVENT_TYPES,
   DELEGATED_TASK_ID_PATTERN,
   DELEGATED_TASK_PHASES,
   DELEGATED_TASK_REQUEST_TYPES,
@@ -21,6 +22,8 @@ export type CollaborationToolName =
 export type PublicCollaborationToolName =
   | typeof COLLABORATION_TOOL_NAMES.PUBLISH_ITEM
   | typeof COLLABORATION_TOOL_NAMES.DELEGATE_TASK
+  | typeof COLLABORATION_TOOL_NAMES.UPDATE_TASK
+  | typeof COLLABORATION_TOOL_NAMES.CANCEL_TASK
   | typeof COLLABORATION_TOOL_NAMES.WAIT_FOR_TASK_RESULT;
 
 const collaborationItemOutputSchema = z
@@ -108,6 +111,61 @@ export const waitForCollaborationResultOutputSchema = z
   })
   .strict();
 
+export const updateCollaborationTaskInputSchema = z
+  .object({
+    taskId: z.string().regex(DELEGATED_TASK_ID_PATTERN),
+    eventId: z.string().regex(/^evt_[A-Za-z0-9_-]{8,80}$/),
+    eventType: z.enum(DELEGATED_TASK_EVENT_TYPES),
+    message: z.string().trim().min(1).max(2000),
+    progress: z.number().min(0).max(100).optional(),
+    requirements: z
+      .array(z.string().trim().min(1).max(800))
+      .max(12)
+      .optional(),
+    artifactUris: z
+      .array(z.string().trim().min(1).max(2000))
+      .max(12)
+      .optional(),
+    conversationId: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.eventType === "progress" && value.progress === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["progress"],
+        message: "progress events require progress",
+      });
+    }
+    if (
+      value.eventType === "evidence" &&
+      (!value.artifactUris || value.artifactUris.length === 0)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifactUris"],
+        message: "evidence events require at least one artifact URI",
+      });
+    }
+  });
+
+export const updateCollaborationTaskOutputSchema = z
+  .object({
+    taskId: z.string().regex(DELEGATED_TASK_ID_PATTERN),
+    eventId: z.string(),
+    deduplicated: z.boolean(),
+    workspaceRevision: z.number().int().nonnegative(),
+    eventItem: collaborationItemOutputSchema,
+  })
+  .strict();
+
+export const cancelCollaborationTaskInputSchema = z
+  .object({
+    taskId: z.string().regex(DELEGATED_TASK_ID_PATTERN),
+    reason: z.string().trim().min(1).max(2000),
+  })
+  .strict();
+
 const delegatedTaskConversationIdSchema = z
   .string()
   .trim()
@@ -155,6 +213,9 @@ export const completeCollaborationTaskOutputSchema = z
   })
   .strict();
 
+export const cancelCollaborationTaskOutputSchema =
+  completeCollaborationTaskOutputSchema;
+
 const publishTool: McpAvailableTool = {
   name: COLLABORATION_TOOL_NAMES.PUBLISH_ITEM,
   title: "Publish AI collaboration context",
@@ -194,12 +255,32 @@ const waitForTaskTool: McpAvailableTool = {
   ),
 };
 
+const updateTaskTool: McpAvailableTool = {
+  name: COLLABORATION_TOOL_NAMES.UPDATE_TASK,
+  title: "Update a delegated collaboration task",
+  description:
+    "Append an idempotent progress, clarification, requirement, or evidence event to a durable delegated task. eventId is immutable and must not be reused for different content.",
+  inputSchema: toJsonSchema(updateCollaborationTaskInputSchema, "inputSchema"),
+  outputSchema: toJsonSchema(updateCollaborationTaskOutputSchema, "outputSchema"),
+};
+
+const cancelTaskTool: McpAvailableTool = {
+  name: COLLABORATION_TOOL_NAMES.CANCEL_TASK,
+  title: "Cancel a delegated collaboration task",
+  description:
+    "Cancel one non-terminal delegated task. This stops future acceptance/completion but does not replay or undo browser writes that may already have happened.",
+  inputSchema: toJsonSchema(cancelCollaborationTaskInputSchema, "inputSchema"),
+  outputSchema: toJsonSchema(cancelCollaborationTaskOutputSchema, "outputSchema"),
+};
+
 export const SIDEPANEL_COLLABORATION_AVAILABLE_TOOLS: readonly McpAvailableTool[] =
-  [publishTool] as const;
+  [publishTool, updateTaskTool] as const;
 
 export const MCP_COLLABORATION_AVAILABLE_TOOLS: readonly McpAvailableTool[] = [
   publishTool,
   delegateTaskTool,
+  updateTaskTool,
+  cancelTaskTool,
   waitForTaskTool,
 ] as const;
 
@@ -248,6 +329,26 @@ export function parseWaitForCollaborationResultArgs(
   return parseToolArgs(
     COLLABORATION_TOOL_NAMES.WAIT_FOR_TASK_RESULT,
     waitForCollaborationResultInputSchema,
+    args,
+  );
+}
+
+export function parseUpdateCollaborationTaskArgs(
+  args: Record<string, unknown>,
+): z.infer<typeof updateCollaborationTaskInputSchema> {
+  return parseToolArgs(
+    COLLABORATION_TOOL_NAMES.UPDATE_TASK,
+    updateCollaborationTaskInputSchema,
+    args,
+  );
+}
+
+export function parseCancelCollaborationTaskArgs(
+  args: Record<string, unknown>,
+): z.infer<typeof cancelCollaborationTaskInputSchema> {
+  return parseToolArgs(
+    COLLABORATION_TOOL_NAMES.CANCEL_TASK,
+    cancelCollaborationTaskInputSchema,
     args,
   );
 }

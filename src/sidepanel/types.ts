@@ -49,6 +49,7 @@ export interface QueuedChatSubmission {
   attachments: ChatImageAttachment[];
   createdAt: string;
   executionMode?: "standard" | "safe_retry";
+  executionBinding?: ExecutionTaskBinding;
   delegatedTask?: {
     taskId: string;
     conversationId: string;
@@ -61,6 +62,18 @@ export interface QueuedChatSubmission {
   };
 }
 
+export interface ExecutionTaskBinding {
+  taskId: string;
+  conversationId: string;
+  target: {
+    tabId: number;
+    windowId?: number;
+    targetId?: string;
+    title?: string;
+    url?: string;
+  };
+}
+
 export type ChatSendMode = "normal" | "queue" | "interrupt";
 
 export interface ChatConversationSummary {
@@ -70,6 +83,9 @@ export interface ChatConversationSummary {
   messageCount: number;
   hasDraft: boolean;
   forked: boolean;
+  searchText: string;
+  exportMarkdown: string;
+  exportJson: string;
 }
 
 export interface PendingToolApproval {

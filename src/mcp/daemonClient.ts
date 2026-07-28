@@ -13,14 +13,18 @@ import {
   type McpToolResultPayload,
   type PluginToMcpMessage,
   type StateGetResultPayload,
+  type BrowserActivityUpdatedPayload,
 } from "../shared/wsProtocol";
 import { WS_CLIENT_IDENTITIES } from "../shared/wsClientIdentity";
+import { getReconnectDelayMs } from "../shared/reconnectBackoff";
+import { getToolPolicy } from "../shared/toolPolicy";
 import {
   RUNTIME_BUILD_ID,
   RUNTIME_SCHEMA_HASH,
   runtimeIdentityMismatch,
 } from "../shared/runtimeIdentity";
 import { ADAPTER_ROUTING_TOOL_NAMES } from "./adapterRoutingTools";
+import { COLLABORATION_TOOL_NAMES } from "../shared/collaborationTasks";
 
 interface PendingRequest {
   expectedCommand:
@@ -40,12 +44,28 @@ export interface DaemonCallOptions {
   idempotencyKey?: string;
 }
 
+export class DaemonRecoveryError extends Error {
+  constructor(
+    readonly code:
+      | "DAEMON_RECONNECT_FAILED"
+      | "UNKNOWN_WRITE_OUTCOME",
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(`${code}: ${message}`);
+    this.name = "DaemonRecoveryError";
+  }
+}
+
 export class DaemonClient {
   private socket: WebSocket | null = null;
   private connecting: Promise<void> | null = null;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly adapterInstanceId = createMessageId();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly activityListeners = new Set<
+    (payload: BrowserActivityUpdatedPayload) => void
+  >();
 
   constructor(
     private readonly url = process.env.AI_DEVTOOLS_DAEMON_URL ?? MCP_WS_URL,
@@ -55,11 +75,14 @@ export class DaemonClient {
   ) {}
 
   async listTools(): Promise<unknown[]> {
-    const payload = await this.request<McpListToolsResultPayload>(
-      WS_COMMANDS.MCP_LIST_TOOLS,
-      { includeExternal: true },
-      WS_COMMANDS.MCP_LIST_TOOLS_RESULT,
-      15_000,
+    const payload = await this.requestSafeRead(
+      () =>
+        this.request<McpListToolsResultPayload>(
+          WS_COMMANDS.MCP_LIST_TOOLS,
+          { includeExternal: true },
+          WS_COMMANDS.MCP_LIST_TOOLS_RESULT,
+          15_000,
+        ),
     );
     if (!payload.ok) {
       throw new Error(payload.error);
@@ -71,10 +94,61 @@ export class DaemonClient {
     return this.sessionId;
   }
 
+  subscribeActivityUpdates(
+    listener: (payload: BrowserActivityUpdatedPayload) => void,
+  ): () => void {
+    this.activityListeners.add(listener);
+    return () => this.activityListeners.delete(listener);
+  }
+
   async callTool(
     toolName: string,
     args: Record<string, unknown>,
     options: DaemonCallOptions = {},
+  ): Promise<unknown> {
+    try {
+      return await this.callToolOnce(toolName, args, options);
+    } catch (error) {
+      const normalized = normalizeError(error);
+      if (!isDaemonConnectionError(normalized)) {
+        throw normalized;
+      }
+
+      const policy = getToolPolicy(toolName, args);
+      const beforeDispatch = isBeforeDispatchDaemonError(normalized);
+      const safeRead =
+        (policy.known &&
+          policy.policyClass === "safe_read" &&
+          policy.idempotent &&
+          !policy.requiresApproval) ||
+        toolName === COLLABORATION_TOOL_NAMES.WAIT_FOR_TASK_RESULT;
+
+      try {
+        await this.waitForReconnect(options.signal);
+      } catch (reconnectError) {
+        throw new DaemonRecoveryError(
+          "DAEMON_RECONNECT_FAILED",
+          `local daemon did not recover: ${normalizeError(reconnectError).message}`,
+          true,
+        );
+      }
+
+      if (beforeDispatch || safeRead) {
+        return this.callToolOnce(toolName, args, options);
+      }
+
+      throw new DaemonRecoveryError(
+        "UNKNOWN_WRITE_OUTCOME",
+        `the daemon disconnected after ${toolName} may have been dispatched. Re-observe the current browser state before deciding whether to continue; the adapter did not replay this call.`,
+        false,
+      );
+    }
+  }
+
+  private async callToolOnce(
+    toolName: string,
+    args: Record<string, unknown>,
+    options: DaemonCallOptions,
   ): Promise<unknown> {
     const deadlineAt = options.deadlineAt;
     const payload = await this.request<McpToolResultPayload>(
@@ -102,15 +176,42 @@ export class DaemonClient {
     return payload.data;
   }
 
+  private async waitForReconnect(signal?: AbortSignal): Promise<void> {
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      throwIfAborted(signal);
+      if (attempt > 0) {
+        await waitWithAbort(
+          getReconnectDelayMs(attempt - 1, {
+            baseDelayMs: 100,
+            maxDelayMs: 2_000,
+            jitterRatio: 0,
+          }),
+          signal,
+        );
+      }
+      try {
+        await this.ensureConnected();
+        return;
+      } catch (error) {
+        lastError = normalizeError(error);
+      }
+    }
+    throw lastError ?? new Error("Local daemon reconnect failed.");
+  }
+
   async readState(
     key: DaemonStateResourceKey,
     sessionId = this.sessionId,
   ): Promise<unknown> {
-    const payload = await this.request<StateGetResultPayload>(
-      WS_COMMANDS.STATE_GET,
-      { key, ...(sessionId ? { sessionId } : {}) },
-      WS_COMMANDS.STATE_GET_RESULT,
-      10_000,
+    const payload = await this.requestSafeRead(
+      () =>
+        this.request<StateGetResultPayload>(
+          WS_COMMANDS.STATE_GET,
+          { key, ...(sessionId ? { sessionId } : {}) },
+          WS_COMMANDS.STATE_GET_RESULT,
+          10_000,
+        ),
     );
     if (!payload.ok) {
       throw new Error(payload.error);
@@ -119,12 +220,31 @@ export class DaemonClient {
   }
 
   async readArtifact(artifactId: string): Promise<ArtifactGetResultPayload> {
-    return this.request<ArtifactGetResultPayload>(
-      WS_COMMANDS.ARTIFACT_GET,
-      { artifactId },
-      WS_COMMANDS.ARTIFACT_GET_RESULT,
-      15_000,
+    return this.requestSafeRead(
+      () =>
+        this.request<ArtifactGetResultPayload>(
+          WS_COMMANDS.ARTIFACT_GET,
+          { artifactId },
+          WS_COMMANDS.ARTIFACT_GET_RESULT,
+          15_000,
+        ),
     );
+  }
+
+  private async requestSafeRead<T>(
+    execute: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    try {
+      return await execute();
+    } catch (error) {
+      const normalized = normalizeError(error);
+      if (!isDaemonConnectionError(normalized)) {
+        throw normalized;
+      }
+      await this.waitForReconnect(signal);
+      return execute();
+    }
   }
 
   close(): void {
@@ -399,6 +519,13 @@ export class DaemonClient {
       return;
     }
 
+    if (message.command === WS_COMMANDS.BROWSER_ACTIVITY_UPDATED) {
+      for (const listener of this.activityListeners) {
+        listener(message.payload);
+      }
+      return;
+    }
+
     if (
       message.command !== WS_COMMANDS.MCP_LIST_TOOLS_RESULT &&
       message.command !== WS_COMMANDS.MCP_TOOL_RESULT &&
@@ -487,4 +614,36 @@ function createAbortError(): Error {
   const error = new Error("REQUEST_CANCELLED: MCP client cancelled the request.");
   error.name = "AbortError";
   return error;
+}
+
+function normalizeError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function isDaemonConnectionError(error: Error): boolean {
+  return /(?:Local daemon|daemon client|ECONNREFUSED|WebSocket|socket|connection).*(?:closed|disconnected|connect|response|refused)|ECONNREFUSED/i.test(
+    error.message,
+  );
+}
+
+function isBeforeDispatchDaemonError(error: Error): boolean {
+  return /(?:ECONNREFUSED|not connected|protocol negotiation|did not send SERVER_WELCOME|Failed to load local daemon credentials)/i.test(
+    error.message,
+  );
+}
+
+function waitWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      reject(createAbortError());
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }

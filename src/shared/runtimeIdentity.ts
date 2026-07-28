@@ -6,7 +6,7 @@ import { WS_PROTOCOL_VERSION } from "./wsProtocol";
  * Increment when an MCP output shape changes without a corresponding input
  * definition change. Input definitions are hashed directly below.
  */
-export const MCP_OUTPUT_SCHEMA_REVISION = 2;
+export const MCP_OUTPUT_SCHEMA_REVISION = 4;
 
 export const RUNTIME_BUILD_ID =
   `${packageJson.version}+ws${WS_PROTOCOL_VERSION}`;

@@ -14,6 +14,7 @@ mock
 dist
 dist-ssr
 builds
+release
 *.local
 .codegraph/
 .playwright-cli/*

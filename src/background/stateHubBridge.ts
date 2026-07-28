@@ -41,6 +41,7 @@ import {
   type ScreenshotSnapshot,
   type ServerWelcomePayload,
 } from "../shared/wsProtocol";
+import type { BrowserActivityEventInput } from "../shared/browserActivity";
 import { WS_CLIENT_IDENTITIES } from "../shared/wsClientIdentity";
 import {
   RUNTIME_BUILD_ID,
@@ -209,6 +210,20 @@ class BackgroundStateHubBridge {
     });
   }
 
+  sendBrowserActivity(event: BrowserActivityEventInput): void {
+    this.send({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.BROWSER_ACTIVITY_EVENT,
+      sentAt: new Date().toISOString(),
+      payload: {
+        event: {
+          ...event,
+          target: event.target ?? this.latestActiveTab,
+        },
+      },
+    });
+  }
+
   private async handleMessage(raw: unknown, socket: WebSocket): Promise<void> {
     const message = this.parseMessage(raw);
     if (!message) {
@@ -338,37 +353,47 @@ class BackgroundStateHubBridge {
     call: AnyToolCall,
     grant: SignedExecutionGrant,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const targetRoutingControl = isTargetRoutingControlTool(call.toolName);
     const [installationId, bridgeToken, activeTarget] = await Promise.all([
       getInstallationId(),
       getBridgeToken(),
       readActiveTargetSnapshot(),
     ]);
-    if (!activeTarget) {
+    if (!activeTarget && !targetRoutingControl) {
       return { ok: false, reason: "no executable browser target is available" };
     }
     // The daemon can restart with persisted target state while this background
     // worker keeps an unchanged local cache. Republish the browser-authoritative
     // target before every grant check; local equality cannot prove daemon sync.
-    this.sendActiveTab(activeTarget);
+    if (activeTarget) {
+      this.sendActiveTab(activeTarget);
+    }
     const verification = await verifyExecutionGrant(bridgeToken, grant, {
       browserRequestId,
       sessionId: installationId,
       toolName: call.toolName,
       args: call.args,
-      target: activeTarget,
+      target: activeTarget ?? executionGrantTargetSnapshot(grant),
+      // Tab discovery and target selection are the recovery control plane.
+      // They must remain callable when the daemon's last target is stale or no
+      // scriptable target is currently selected. Signature, session, request,
+      // tool, argument, expiry, policy, and replay checks still apply.
+      targetBinding: targetRoutingControl ? "none" : "exact",
     });
     if (!verification.ok) {
       return verification;
     }
-    const targetAfterVerification = await readActiveTargetSnapshot();
-    if (!sameActiveTarget(activeTarget, targetAfterVerification)) {
-      if (targetAfterVerification) {
-        this.sendActiveTab(targetAfterVerification);
+    if (!targetRoutingControl) {
+      const targetAfterVerification = await readActiveTargetSnapshot();
+      if (!sameActiveTarget(activeTarget, targetAfterVerification)) {
+        if (targetAfterVerification) {
+          this.sendActiveTab(targetAfterVerification);
+        }
+        return {
+          ok: false,
+          reason: "browser target changed while the execution grant was being verified",
+        };
       }
-      return {
-        ok: false,
-        reason: "browser target changed while the execution grant was being verified",
-      };
     }
     try {
       assertMcpExecutorBoundary(
@@ -547,6 +572,23 @@ class BackgroundStateHubBridge {
       return null;
     }
   }
+}
+
+function isTargetRoutingControlTool(toolName: string): boolean {
+  return (
+    toolName === TOOL_NAMES.BROWSER_LIST_TABS ||
+    toolName === TOOL_NAMES.BROWSER_SET_TARGET_TAB
+  );
+}
+
+function executionGrantTargetSnapshot(
+  grant: SignedExecutionGrant,
+): ActiveTabSnapshot {
+  return {
+    url: "",
+    title: "",
+    ...grant.claims.target,
+  };
 }
 
 async function readActiveTargetSnapshot(): Promise<ActiveTabSnapshot | undefined> {

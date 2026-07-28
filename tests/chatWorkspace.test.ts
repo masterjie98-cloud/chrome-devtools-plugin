@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MAX_STORED_CONVERSATIONS,
+  conversationSearchText,
   createStoredConversation,
+  exportStoredConversation,
   normalizeChatWorkspace,
   upsertStoredConversation,
 } from "../src/sidepanel/services/chatWorkspace";
@@ -139,4 +141,39 @@ test("tool-heavy runs do not evict the bounded user and assistant history", () =
   assert.deepEqual(stored.messages.map((message) => message.id), [
     "user-before-tools",
   ]);
+});
+
+test("conversation history supports full-text search and explicit Markdown/JSON export", () => {
+  const conversation = createStoredConversation({
+    id: "search-export",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:01:00.000Z",
+    messages: [
+      {
+        id: "user-search",
+        role: "user",
+        content: "Find the checkout regression",
+        createdAt: "2026-07-14T00:00:00.000Z",
+      },
+      {
+        id: "assistant-search",
+        role: "assistant",
+        content: "The submit button is disabled by validation.",
+        createdAt: "2026-07-14T00:01:00.000Z",
+        source: "extension_ai",
+      },
+    ],
+    draft: "Follow up with Network evidence",
+  });
+
+  assert.match(conversationSearchText(conversation), /validation/);
+  assert.match(conversationSearchText(conversation), /network evidence/);
+  assert.match(
+    exportStoredConversation(conversation, "markdown"),
+    /## 插件 AI/,
+  );
+  assert.equal(
+    JSON.parse(exportStoredConversation(conversation, "json")).version,
+    "ai-devtools-conversation-export-v1",
+  );
 });

@@ -29,6 +29,7 @@ import {
   type McpAvailableTool,
   type McpListToolsResultPayload,
   type McpToolResultPayload,
+  type McpToolCallPayload,
   type McpToPluginMessage,
   type PluginChatMessageSnapshot,
   type PluginToMcpMessage,
@@ -68,9 +69,8 @@ class McpBridge {
   private heartbeatTimer: number | null = null;
   private approvalHandler: ApprovalHandler | null = null;
   private approvalCancellationHandler: ApprovalCancellationHandler | null = null;
-  private approvalQueue: Promise<void> = Promise.resolve();
   private cancelledApprovalIds = new Set<string>();
-  private taskContext: { taskId: string; egressDestinations: string[] } | null = null;
+  private taskContext: McpToolCallPayload["taskContext"] | null = null;
   private pendingMcpToolCalls = new Map<
     string,
     {
@@ -195,10 +195,23 @@ class McpBridge {
       : null;
   }
 
-  setTaskContext(taskId: string, egressDestinations: string[]): void {
+  setTaskContext(
+    taskId: string,
+    egressDestinations: string[],
+    binding?: {
+      conversationId: string;
+      target: { tabId: number; targetId?: string };
+    },
+  ): void {
     this.taskContext = taskId.trim()
       ? {
           taskId: taskId.trim(),
+          ...(binding
+            ? {
+                conversationId: binding.conversationId,
+                target: binding.target,
+              }
+            : {}),
           egressDestinations: [...new Set(egressDestinations)].sort(),
         }
       : null;
@@ -536,34 +549,37 @@ class McpBridge {
   }
 
   private enqueueApproval(request: ApprovalRequestPayload): void {
-    this.approvalQueue = this.approvalQueue
-      .then(async () => {
-        if (this.cancelledApprovalIds.delete(request.approvalId)) {
-          return;
-        }
-        let decision: ApprovalHandlerResult = { approved: false };
-        try {
-          decision = this.approvalHandler
-            ? await this.approvalHandler(request)
-            : { approved: false };
-        } catch {
-          decision = { approved: false };
-        }
-        if (this.cancelledApprovalIds.delete(request.approvalId)) {
-          return;
-        }
-        this.send({
-          requestId: request.approvalId,
-          command: WS_COMMANDS.APPROVAL_RESPONSE,
-          sentAt: new Date().toISOString(),
-          payload: {
-            approvalId: request.approvalId,
-            ...decision,
-            respondedAt: new Date().toISOString(),
-          },
-        });
-      })
+    void this.resolveApprovalRequest(request)
       .catch(() => undefined);
+  }
+
+  private async resolveApprovalRequest(
+    request: ApprovalRequestPayload,
+  ): Promise<void> {
+    if (this.cancelledApprovalIds.delete(request.approvalId)) {
+      return;
+    }
+    let decision: ApprovalHandlerResult = { approved: false };
+    try {
+      decision = this.approvalHandler
+        ? await this.approvalHandler(request)
+        : { approved: false };
+    } catch {
+      decision = { approved: false };
+    }
+    if (this.cancelledApprovalIds.delete(request.approvalId)) {
+      return;
+    }
+    this.send({
+      requestId: request.approvalId,
+      command: WS_COMMANDS.APPROVAL_RESPONSE,
+      sentAt: new Date().toISOString(),
+      payload: {
+        approvalId: request.approvalId,
+        ...decision,
+        respondedAt: new Date().toISOString(),
+      },
+    });
   }
 
   private resolveMcpToolListRequest(

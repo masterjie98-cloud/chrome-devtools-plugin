@@ -53,7 +53,8 @@ test("direct MCP resources contain only the shared safe-state allowlist", () => 
     MCP_DIRECT_STATE_RESOURCES.filter(
       (resource) =>
         resource.stateKey === "currentConversationId" ||
-        resource.stateKey === "collaborationWorkspace",
+        resource.stateKey === "collaborationWorkspace" ||
+        resource.stateKey === "activityStream",
     ).every((resource) => resource.scope === "session"),
     true,
   );
@@ -61,7 +62,8 @@ test("direct MCP resources contain only the shared safe-state allowlist", () => 
     MCP_DIRECT_STATE_RESOURCES.filter(
       (resource) =>
         resource.stateKey !== "currentConversationId" &&
-        resource.stateKey !== "collaborationWorkspace",
+        resource.stateKey !== "collaborationWorkspace" &&
+        resource.stateKey !== "activityStream",
     ).every((resource) => resource.scope === "target"),
     true,
   );
@@ -253,7 +255,7 @@ test("MCP state templates list and read only the selected exact target", async (
 
   try {
     const templates = await client.listResourceTemplates();
-    assert.equal(templates.resourceTemplates.length, 6);
+    assert.equal(templates.resourceTemplates.length, 7);
     assert.equal(
       templates.resourceTemplates.every((template) =>
         template.uriTemplate.startsWith("ai-devtools://session/{sessionId}/"),
@@ -269,7 +271,7 @@ test("MCP state templates list and read only the selected exact target", async (
 
     const listed = await client.listResources();
     assert.equal(sessionListCalls, 1);
-    assert.equal(listed.resources.length, 6);
+    assert.equal(listed.resources.length, 7);
     assert.equal(
       listed.resources.filter((resource) => resource.uri.includes("/target/"))
         .length,

@@ -38,6 +38,14 @@ import {
 import { sanitizeText } from "../shared/sanitize";
 import { createMessageId } from "../shared/messaging";
 import { createResourceTargetKey } from "./resourceRouting";
+import {
+  BROWSER_ACTIVITY_EVENT_LIMIT,
+  BROWSER_ACTIVITY_STREAM_VERSION,
+  sanitizeBrowserActivityEventInput,
+  type BrowserActivityEvent,
+  type BrowserActivityEventInput,
+  type BrowserActivityStreamSnapshot,
+} from "../shared/browserActivity";
 
 export interface BrowserSession {
   sessionId: string;
@@ -51,6 +59,10 @@ export interface BrowserSession {
   pageContext?: PageSnapshot;
   consoleLogs: unknown[];
   networkRequests: unknown[];
+  activityActive: boolean;
+  activitySequence: number;
+  activityDroppedEvents: number;
+  activityEvents: BrowserActivityEvent[];
   screenshots: ScreenshotSnapshot[];
   lastScreenshot?: ScreenshotSnapshot;
   pluginConversation: PluginChatMessageSnapshot[];
@@ -86,6 +98,7 @@ export interface BrowserStateSnapshot {
   pageContext?: PageSnapshot;
   consoleLogs: unknown[];
   networkRequests: unknown[];
+  activityStream: BrowserActivityStreamSnapshot;
   screenshots: ScreenshotSnapshot[];
   lastScreenshot?: ScreenshotSnapshot;
   pluginConversation: PluginChatMessageSnapshot[];
@@ -357,6 +370,33 @@ export class BrowserStateHub {
     ).accepted;
   }
 
+  setActivityActive(active: boolean, sessionId?: string): void {
+    const session = this.markStateUpdated(sessionId);
+    session.activityActive = active;
+  }
+
+  addBrowserActivityEvent(
+    input: BrowserActivityEventInput,
+    sessionId?: string,
+  ): BrowserActivityEvent {
+    const session = this.markStateUpdated(sessionId);
+    const sanitized = sanitizeBrowserActivityEventInput(input);
+    session.activitySequence += 1;
+    const event: BrowserActivityEvent = {
+      ...sanitized,
+      observedAt: sanitized.observedAt ?? new Date(this.clock()).toISOString(),
+      sequence: session.activitySequence,
+    };
+    session.activityEvents.push(event);
+    if (session.activityEvents.length > BROWSER_ACTIVITY_EVENT_LIMIT) {
+      const overflow =
+        session.activityEvents.length - BROWSER_ACTIVITY_EVENT_LIMIT;
+      session.activityEvents.splice(0, overflow);
+      session.activityDroppedEvents += overflow;
+    }
+    return structuredClone(event);
+  }
+
   setPageContextWithResult(
     activeTab: ActiveTabSnapshot,
     pageContext: PageSnapshot,
@@ -494,6 +534,10 @@ export class BrowserStateHub {
         pageContext,
         consoleLogs: [],
         networkRequests: [],
+        activityActive: false,
+        activitySequence: 0,
+        activityDroppedEvents: 0,
+        activityEvents: [],
         screenshots,
         lastScreenshot: screenshots.at(-1),
         pluginConversation,
@@ -547,6 +591,7 @@ export class BrowserStateHub {
       pageContext: session.pageContext,
       consoleLogs: session.consoleLogs,
       networkRequests: session.networkRequests,
+      activityStream: this.activityStreamSnapshot(session),
       screenshots: session.screenshots,
       lastScreenshot: session.lastScreenshot,
       pluginConversation: session.pluginConversation,
@@ -590,6 +635,10 @@ export class BrowserStateHub {
       workspace: collaborationWorkspaceForMcp(snapshot.collaborationWorkspace),
       ...stateTimeMetadata(snapshot),
     };
+  }
+
+  activityStreamPayload(sessionId?: string): BrowserActivityStreamSnapshot {
+    return this.activityStreamSnapshot(this.ensureSession(sessionId));
   }
 
   selectedElementPayload(sessionId?: string): unknown {
@@ -665,6 +714,10 @@ export class BrowserStateHub {
       uiConnected: false,
       consoleLogs: [],
       networkRequests: [],
+      activityActive: false,
+      activitySequence: 0,
+      activityDroppedEvents: 0,
+      activityEvents: [],
       screenshots: [],
       pluginConversation: [],
       currentConversationId: createConversationId(),
@@ -683,6 +736,25 @@ export class BrowserStateHub {
     const session = this.touch(sessionId);
     session.stateUpdatedAt = session.lastSeenAt;
     return session;
+  }
+
+  private activityStreamSnapshot(
+    session: BrowserSession,
+  ): BrowserActivityStreamSnapshot {
+    const first = session.activityEvents[0];
+    const last = session.activityEvents.at(-1);
+    return {
+      version: BROWSER_ACTIVITY_STREAM_VERSION,
+      sessionId: session.sessionId,
+      active: session.activityActive,
+      target: session.currentTab ?? null,
+      latestSequence: session.activitySequence,
+      retainedFromSequence: first?.sequence ?? null,
+      retainedToSequence: last?.sequence ?? null,
+      droppedEvents: session.activityDroppedEvents,
+      events: structuredClone(session.activityEvents),
+      updatedAt: new Date(session.stateUpdatedAt).toISOString(),
+    };
   }
 
   private notifyPersistence(): void {

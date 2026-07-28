@@ -25,7 +25,11 @@ import {
   EXECUTION_GRANT_VERSION,
   type ExecutionGrantClaims,
 } from "../shared/executionGrant";
-import { assertMcpExecutorBoundary } from "../shared/mcpExecutionPolicy";
+import {
+  assertMcpExecutorBoundary,
+  getInternalToolEffect,
+  type InternalMutationScope,
+} from "../shared/mcpExecutionPolicy";
 import { redactApprovalArguments } from "../shared/sensitiveData";
 import {
   classifySensitiveEgress,
@@ -98,15 +102,19 @@ import {
   SIDEPANEL_COLLABORATION_AVAILABLE_TOOLS,
   isCollaborationToolName,
   parseClaimCollaborationTaskArgs,
+  parseCancelCollaborationTaskArgs,
   parseCompleteCollaborationTaskArgs,
   parseDelegateCollaborationTaskArgs,
   parsePublishCollaborationItemArgs,
+  parseUpdateCollaborationTaskArgs,
   parseWaitForCollaborationResultArgs,
 } from "./collaborationTools";
 import {
   claimCollaborationTask,
+  cancelCollaborationTask,
   completeCollaborationTask,
   delegateCollaborationTask,
+  updateCollaborationTask,
   waitForCollaborationTaskResult,
 } from "./collaborationTaskRuntime";
 import { resolveWsClientIdentity } from "../shared/wsClientIdentity";
@@ -121,6 +129,7 @@ import {
   normalizeStrings,
   type TaskCapabilityGrant,
 } from "../shared/taskCapabilityGrant";
+import { getTaskExecutionBindingMismatch } from "../shared/taskExecutionBinding";
 
 export interface PluginWebSocketServer {
   close: () => Promise<void>;
@@ -142,6 +151,11 @@ export interface BrowserToolCallOptions {
 
 interface ToolTaskContext {
   taskId: string;
+  conversationId?: string;
+  target?: {
+    tabId: number;
+    targetId?: string;
+  };
   egressDestinations: string[];
 }
 
@@ -157,6 +171,7 @@ interface AuthorizationReceipt {
   approvalRequired: boolean;
   approvalId?: string;
   expiresAt: string;
+  pageEffectDispatchAttempted?: boolean;
   timing: {
     transportMs: number;
   };
@@ -576,12 +591,20 @@ export function startPluginWebSocketServer(
       normalizedCall.toolName,
       authorization.mutatesBrowser,
     );
+    const internalEffect = getInternalToolEffect(normalizedCall.toolName);
     const currentSession = browserStateHub.snapshot(resolvedSessionId);
     const targetMismatchFields = authorizationTargetMismatchFields(
       authorization.target,
       currentSession.currentTab,
     );
-    if (targetMismatchFields.length > 0) {
+    const followsAuthorizedPageEffect =
+      canFollowAuthorizedPageEffectForRead(
+        authorization.pageEffectDispatchAttempted === true,
+        internalEffect?.mutationScope,
+        authorization.target,
+        currentSession.currentTab,
+      );
+    if (targetMismatchFields.length > 0 && !followsAuthorizedPageEffect) {
       throw new ExecutionBrokerError(
         "STALE_CONTEXT",
         `Browser target changed after authorization and before executor dispatch (fields=${targetMismatchFields.join(",")}).`,
@@ -685,6 +708,12 @@ export function startPluginWebSocketServer(
           : undefined,
       });
       client.send(JSON.stringify(message));
+      if (
+        internalEffect?.mutationScope === "page" ||
+        internalEffect?.mutationScope === "browser"
+      ) {
+        authorization.pageEffectDispatchAttempted = true;
+      }
     });
   }
 
@@ -723,6 +752,17 @@ export function startPluginWebSocketServer(
       taskId: requestedSnapshot.currentConversationId,
       egressDestinations: defaultTaskEgressDestinations(role, clientName),
     };
+    const taskBindingMismatch = getTaskExecutionBindingMismatch(
+      taskContext,
+      requestedSnapshot.currentConversationId,
+      requestedTarget,
+    );
+    if (taskBindingMismatch) {
+      throw new ExecutionBrokerError(
+        "STALE_CONTEXT",
+        `Tool task binding no longer matches the active browser context (field=${taskBindingMismatch}).`,
+      );
+    }
     const hasMatchingTaskGrant = Array.from(taskCapabilityGrants.values()).some(
       (grant) =>
         matchesTaskCapabilityGrant(grant, {
@@ -1142,8 +1182,32 @@ export function startPluginWebSocketServer(
     sourceSocket: WebSocket,
     message: ValidPluginToMcpMessage,
   ): void {
-    const payload = JSON.stringify(message);
     const sourceSessionId = clientSessionIds.get(sourceSocket);
+    if (message.command === WS_COMMANDS.BROWSER_ACTIVITY_EVENT) {
+      const latestSequence =
+        browserStateHub.activityStreamPayload(sourceSessionId).latestSequence;
+      const update: McpToPluginMessage = {
+        requestId: createMessageId(),
+        command: WS_COMMANDS.BROWSER_ACTIVITY_UPDATED,
+        sentAt: new Date().toISOString(),
+        payload: {
+          sessionId: sourceSessionId ?? "default",
+          latestSequence,
+        },
+      };
+      const payload = JSON.stringify(update);
+      for (const socket of clients) {
+        if (
+          clientRoles.get(socket) === "mcp" &&
+          clientSessionIds.get(socket) === sourceSessionId &&
+          socket.readyState === socket.OPEN
+        ) {
+          socket.send(payload);
+        }
+      }
+      return;
+    }
+    const payload = JSON.stringify(message);
 
     for (const socket of clients) {
       if (socket === sourceSocket) {
@@ -1746,6 +1810,17 @@ async function handlePublishedStateMessage(
       browserStateHub.setAgentSession(message.payload.session, sessionId);
       broadcastToObservers(message);
       return true;
+    case WS_COMMANDS.BROWSER_ACTIVITY_EVENT:
+      if (message.payload.event.summary.reason === "monitoring-started") {
+        browserStateHub.setActivityActive(true, sessionId);
+      } else if (
+        message.payload.event.summary.reason === "monitoring-stopped"
+      ) {
+        browserStateHub.setActivityActive(false, sessionId);
+      }
+      browserStateHub.addBrowserActivityEvent(message.payload.event, sessionId);
+      broadcastToObservers(message);
+      return true;
     case WS_COMMANDS.COLLABORATION_ITEM_UPSERT: {
       const result = browserStateHub.upsertCollaborationItem(
         message.payload.item,
@@ -2139,6 +2214,24 @@ async function handleCollaborationTool(
             signal,
           ),
       });
+    } else if (toolName === COLLABORATION_TOOL_NAMES.UPDATE_TASK) {
+      const result = updateCollaborationTask(
+        parseUpdateCollaborationTaskArgs(args),
+        boundSessionId,
+        context.clientId,
+        context.actor,
+      );
+      data = result.data;
+      mutation = result.mutation;
+    } else if (toolName === COLLABORATION_TOOL_NAMES.CANCEL_TASK) {
+      assertCollaborationActor(context.actor, "mcp_agent", toolName);
+      const result = cancelCollaborationTask(
+        parseCancelCollaborationTaskArgs(args),
+        boundSessionId,
+        context.clientId,
+      );
+      data = result.data;
+      mutation = result.mutation;
     } else if (toolName === COLLABORATION_TOOL_NAMES.CLAIM_TASK) {
       assertCollaborationActor(context.actor, "extension_agent", toolName);
       const result = claimCollaborationTask(
@@ -2379,6 +2472,30 @@ async function handlePluginRequestedMcpTool(
             },
             {
               sessionId,
+              storeJsonArtifact: (value) =>
+                artifactStore.putBytes(
+                  sessionId,
+                  "payload",
+                  "application/json",
+                  Buffer.from(JSON.stringify(value), "utf8"),
+                ),
+              readJsonArtifact: async (artifactId) => {
+                const artifact = await artifactStore.read(
+                  artifactId,
+                  sessionId,
+                );
+                if (!artifact) {
+                  throw new Error(
+                    "RECIPE_NOT_FOUND: artifact was not found, expired, or belongs to another browser session.",
+                  );
+                }
+                if (artifact.metadata.mimeType !== "application/json") {
+                  throw new Error(
+                    "RECIPE_INVALID: artifact MIME type is not application/json.",
+                  );
+                }
+                return JSON.parse(Buffer.from(artifact.bytes).toString("utf8"));
+              },
               ...(stateStore
                 ? { listAuditEvents: () => stateStore.listAuditEvents() }
                 : {}),
@@ -2995,6 +3112,37 @@ function authorizationTargetMismatchFields(
     }
   }
   return mismatches;
+}
+
+export function sameAuthorizedTopLevelTarget(
+  expected: ActiveTabSnapshot | undefined,
+  current: ActiveTabSnapshot | undefined,
+): boolean {
+  if (
+    expected?.tabId === undefined ||
+    current?.tabId === undefined ||
+    expected.tabId !== current.tabId
+  ) {
+    return false;
+  }
+  const stableFields = ["targetId", "windowId"] as const;
+  return stableFields.every(
+    (field) =>
+      expected[field] === undefined || expected[field] === current[field],
+  );
+}
+
+export function canFollowAuthorizedPageEffectForRead(
+  pageEffectDispatchAttempted: boolean,
+  mutationScope: InternalMutationScope | undefined,
+  expected: ActiveTabSnapshot | undefined,
+  current: ActiveTabSnapshot | undefined,
+): boolean {
+  return (
+    pageEffectDispatchAttempted &&
+    mutationScope === "none" &&
+    sameAuthorizedTopLevelTarget(expected, current)
+  );
 }
 
 function requesterRole(

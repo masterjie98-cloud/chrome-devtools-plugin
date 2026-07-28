@@ -6,6 +6,9 @@ const supportedProfiles = new Set(["smart", "inspect", "read", "full"]);
 const requestedProfile =
   process.argv.find((argument) => argument.startsWith("--profile="))?.slice(10) ??
   "smart";
+const serverPathFlag = process.argv.indexOf("--server-path");
+const serverPathValue =
+  serverPathFlag >= 0 ? process.argv[serverPathFlag + 1]?.trim() : undefined;
 
 if (!supportedProfiles.has(requestedProfile)) {
   process.stderr.write(
@@ -14,7 +17,7 @@ if (!supportedProfiles.has(requestedProfile)) {
   process.exitCode = 1;
 } else {
   const nodePath = process.execPath;
-  const serverPath = resolve("dist/mcp/server.js");
+  const serverPath = resolve(serverPathValue || "dist/mcp/server.js");
   const env = { AI_DEVTOOLS_MCP_TOOL_PROFILE: requestedProfile };
   const serverConfig = {
     command: nodePath,

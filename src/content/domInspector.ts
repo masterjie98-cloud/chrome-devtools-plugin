@@ -59,9 +59,34 @@ interface DomMutationJournalEntry {
 }
 
 const DOM_MUTATION_JOURNAL_LIMIT = 100;
+const DOM_ACTIVITY_BATCH_MS = 120;
 let domRevision = 1;
 let domMutationObserver: MutationObserver | null = null;
 const domMutationJournal: DomMutationJournalEntry[] = [];
+let domActivityEnabled = false;
+let domActivityTimer: ReturnType<typeof setTimeout> | null = null;
+let domActivityPending: Omit<DomMutationJournalEntry, "revision"> | null = null;
+let domActivityEmitter:
+  | ((entry: DomMutationJournalEntry) => void)
+  | null = null;
+
+export function configureDomActivityEmitter(
+  emitter: (entry: DomMutationJournalEntry) => void,
+): void {
+  domActivityEmitter = emitter;
+}
+
+export function setDomActivityMonitoring(
+  enabled: boolean,
+): { enabled: boolean } {
+  domActivityEnabled = enabled;
+  if (enabled) {
+    ensureDomMutationObserver();
+  } else {
+    flushDomActivity();
+  }
+  return { enabled };
+}
 
 export function getPageSnapshot(input: PageSnapshotInput = {}): PageSnapshot {
   const totalStartedAt = performance.now();
@@ -244,12 +269,40 @@ function ensureDomMutationObserver(): void {
         domMutationJournal.length - DOM_MUTATION_JOURNAL_LIMIT,
       );
     }
+    if (domActivityEnabled) {
+      domActivityPending = {
+        added: (domActivityPending?.added ?? 0) + added,
+        removed: (domActivityPending?.removed ?? 0) + removed,
+        attributes: (domActivityPending?.attributes ?? 0) + attributes,
+        characterData:
+          (domActivityPending?.characterData ?? 0) + characterData,
+      };
+      if (!domActivityTimer) {
+        domActivityTimer = setTimeout(flushDomActivity, DOM_ACTIVITY_BATCH_MS);
+      }
+    }
   });
   domMutationObserver.observe(document.documentElement, {
     subtree: true,
     childList: true,
     attributes: true,
     characterData: true,
+  });
+}
+
+function flushDomActivity(): void {
+  if (domActivityTimer) {
+    clearTimeout(domActivityTimer);
+    domActivityTimer = null;
+  }
+  const pending = domActivityPending;
+  domActivityPending = null;
+  if (!pending || !domActivityEmitter) {
+    return;
+  }
+  domActivityEmitter({
+    revision: domRevision,
+    ...pending,
   });
 }
 

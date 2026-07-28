@@ -46,6 +46,18 @@ export interface AgentSessionEventSnapshot {
   };
 }
 
+export interface AgentSessionExecutionBinding {
+  taskId: string;
+  conversationId: string;
+  target: {
+    tabId: number;
+    windowId?: number;
+    targetId?: string;
+    title?: string;
+    url?: string;
+  };
+}
+
 export interface AgentSessionSnapshot {
   id: string;
   status: AgentSessionStatus;
@@ -54,6 +66,7 @@ export interface AgentSessionSnapshot {
   updatedAt: string;
   completedAt?: string;
   finalContent?: string;
+  executionBinding?: AgentSessionExecutionBinding;
   taskState: AgentTaskState;
   events: AgentSessionEventSnapshot[];
 }
@@ -112,6 +125,7 @@ export function createAgentSessionSnapshot(
   id: string,
   input: string,
   startedAt = new Date().toISOString(),
+  executionBinding?: AgentSessionExecutionBinding,
 ): AgentSessionSnapshot {
   return {
     id,
@@ -119,6 +133,7 @@ export function createAgentSessionSnapshot(
     input,
     startedAt,
     updatedAt: startedAt,
+    executionBinding,
     taskState: createAgentTaskState(input, startedAt),
     events: [],
   };

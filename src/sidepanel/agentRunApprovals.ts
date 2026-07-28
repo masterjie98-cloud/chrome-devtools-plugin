@@ -10,7 +10,16 @@ export type ExecutionApprovalMode = "ask" | "agent" | "full";
 export interface ConversationExecutionApproval {
   mode: Exclude<ExecutionApprovalMode, "ask">;
   conversationId: string;
-  origin: string;
+  scope:
+    | {
+        kind: "origin";
+        origin: string;
+      }
+    | {
+        kind: "tab";
+        tabId: number;
+        targetId?: string;
+      };
   sessionId: string;
   egressDestinations: string[];
 }
@@ -37,9 +46,9 @@ export interface AgentConversationOriginApprovalGrant {
 export type AgentConversationOriginInvalidationReason =
   | "conversation_changed"
   | "origin_changed"
+  | "target_changed"
   | "profile_changed"
-  | "provider_changed"
-  | "hub_disconnected";
+  | "provider_changed";
 
 const CONVERSATION_ORIGIN_POLICY_CLASSES = new Set([
   "sensitive_read",
@@ -52,6 +61,8 @@ export function createConversationExecutionApproval(
   current: {
     conversationId: string;
     pageUrl?: string;
+    tabId?: number;
+    targetId?: string;
     sessionId?: string;
     egressDestinations: string[];
   },
@@ -60,15 +71,29 @@ export function createConversationExecutionApproval(
   if (
     mode === "ask" ||
     !current.conversationId ||
-    !current.sessionId ||
-    !origin
+    !current.sessionId
   ) {
+    return null;
+  }
+  const scope =
+    mode === "agent"
+      ? origin
+        ? ({ kind: "origin", origin } as const)
+        : null
+      : Number.isSafeInteger(current.tabId)
+        ? ({
+            kind: "tab",
+            tabId: current.tabId as number,
+            ...(current.targetId ? { targetId: current.targetId } : {}),
+          } as const)
+        : null;
+  if (!scope) {
     return null;
   }
   return {
     mode,
     conversationId: current.conversationId,
-    origin,
+    scope,
     sessionId: current.sessionId,
     egressDestinations: normalizeDestinations(current.egressDestinations),
   };
@@ -93,12 +118,14 @@ export function matchesConversationExecutionApproval(
   current: {
     conversationId: string;
     targetUrl?: string;
+    targetTabId?: number;
+    targetId?: string;
     sessionId?: string;
   },
 ): boolean {
   return (
     approval.conversationId === current.conversationId &&
-    approval.origin === getApprovalTargetOrigin(current.targetUrl) &&
+    matchesExecutionApprovalScope(approval.scope, current) &&
     approval.sessionId === current.sessionId
   );
 }
@@ -169,6 +196,8 @@ export function getAgentConversationOriginInvalidationReason(
   current: {
     conversationId: string;
     pageUrl?: string;
+    tabId?: number;
+    targetId?: string;
     sessionId?: string;
     hubConnected: boolean;
     egressDestinations: string[];
@@ -177,7 +206,24 @@ export function getAgentConversationOriginInvalidationReason(
   if (grant.conversationId !== current.conversationId) {
     return "conversation_changed";
   }
-  if (
+  if ("scope" in grant) {
+    if (
+      grant.scope.kind === "origin" &&
+      current.pageUrl &&
+      getApprovalTargetOrigin(current.pageUrl) !== grant.scope.origin
+    ) {
+      return "origin_changed";
+    }
+    if (
+      grant.scope.kind === "tab" &&
+      ((current.tabId !== undefined && current.tabId !== grant.scope.tabId) ||
+        (grant.scope.targetId !== undefined &&
+          current.targetId !== undefined &&
+          current.targetId !== grant.scope.targetId))
+    ) {
+      return "target_changed";
+    }
+  } else if (
     current.pageUrl &&
     getApprovalTargetOrigin(current.pageUrl) !== grant.origin
   ) {
@@ -194,7 +240,26 @@ export function getAgentConversationOriginInvalidationReason(
   ) {
     return "provider_changed";
   }
-  return current.hubConnected ? null : "hub_disconnected";
+  return null;
+}
+
+function matchesExecutionApprovalScope(
+  scope: ConversationExecutionApproval["scope"],
+  current: {
+    targetUrl?: string;
+    targetTabId?: number;
+    targetId?: string;
+  },
+): boolean {
+  if (scope.kind === "origin") {
+    return scope.origin === getApprovalTargetOrigin(current.targetUrl);
+  }
+  return (
+    scope.tabId === current.targetTabId &&
+    (!scope.targetId ||
+      !current.targetId ||
+      scope.targetId === current.targetId)
+  );
 }
 
 export async function createAgentToolIdempotencyKey(

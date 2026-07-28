@@ -4,13 +4,20 @@ import {
 } from "./toolDispatcher";
 import {
   clearContentFrames,
+  focusBrowserTab,
   getSelectedContentFrame,
   getSelectedContentFrameSnapshot,
   queryActiveTab,
+  queryForegroundTab,
   registerContentFrame,
   rememberTargetTab,
+  toBrowserTargetTab,
+  updateContentFrameLocation,
 } from "./chromeApi";
-import { requestProxyRestore } from "./debuggerAdapter";
+import {
+  requestProxyRestore,
+  subscribeDebuggerActivity,
+} from "./debuggerAdapter";
 import { stateHubBridge } from "./stateHubBridge";
 import {
   clearTargetNavigationState,
@@ -21,11 +28,16 @@ import { TOOL_NAMES } from "../shared/tools";
 import {
   errorResponse,
   isExtensionMessage,
+  makeEvent,
   okResponse,
+  sendRuntimeEvent,
 } from "../shared/messaging";
 
 const keepAlivePorts = new Set<chrome.runtime.Port>();
 stateHubBridge.connect();
+subscribeDebuggerActivity((event) => {
+  stateHubBridge.sendBrowserActivity(event);
+});
 
 chrome.runtime.onInstalled.addListener(() => {
   if (chrome.sidePanel?.setPanelBehavior) {
@@ -49,6 +61,7 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
     if (chrome.runtime.lastError) {
       return;
     }
+    publishForegroundTab(tab);
     void rememberAndSyncTargetTab(tab);
   });
 });
@@ -69,7 +82,26 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         requestProxyRestore(tabId, `navigation.${changeInfo.status ?? "unknown"}`);
       }
     });
+    return;
   }
+  if (changeInfo.status === "loading" || changeInfo.status === "complete") {
+    void syncSelectedTargetTabLifecycle(
+      tabId,
+      changeInfo.status === "loading",
+    ).then((target) => {
+      if (target?.id === tabId) {
+        requestProxyRestore(tabId, `navigation.${changeInfo.status}`);
+      }
+    });
+  }
+});
+
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  handleSameDocumentNavigation(details);
+});
+
+chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
+  handleSameDocumentNavigation(details);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -148,7 +180,11 @@ async function handleMessage(
       return okResponse(message, result);
     }
     case MESSAGE_TYPES.SIDE_PANEL_READY:
+      void queryForegroundTab().then(publishForegroundTab);
       return okResponse(message, { ready: true });
+    case MESSAGE_TYPES.SIDE_PANEL_FOCUS_TARGET_TAB:
+      await focusBrowserTab(message.payload.tabId);
+      return okResponse(message, { focused: true });
     case MESSAGE_TYPES.AGENT_POINTER_CLEAR:
       await clearAgentPointerForCurrentTargetBestEffort();
       return okResponse(message, { cleared: true });
@@ -159,6 +195,17 @@ async function handleMessage(
         `Unsupported background message: ${message.type}`
       );
   }
+}
+
+function publishForegroundTab(tab: chrome.tabs.Tab | undefined): void {
+  if (!tab?.id) {
+    return;
+  }
+  sendRuntimeEvent(
+    makeEvent("background", MESSAGE_TYPES.FOREGROUND_TAB_UPDATED, {
+      tab: toBrowserTargetTab(tab),
+    }),
+  );
 }
 
 function syncTabToStateHub(tab: chrome.tabs.Tab | undefined): void {
@@ -197,6 +244,39 @@ async function rememberAndSyncTargetTab(
   return target;
 }
 
+async function syncSelectedTargetTabLifecycle(
+  tabId: number,
+  navigationChanged: boolean,
+): Promise<chrome.tabs.Tab | undefined> {
+  const target = await queryActiveTab();
+  if (target?.id !== tabId) {
+    return target;
+  }
+  getTargetNavigationState(tabId, navigationChanged);
+  syncTabToStateHub(target);
+  return target;
+}
+
+function handleSameDocumentNavigation(
+  details: chrome.webNavigation.WebNavigationTransitionCallbackDetails,
+): void {
+  if (details.frameId !== 0) {
+    return;
+  }
+  void queryActiveTab().then((target) => {
+    if (target?.id !== details.tabId) {
+      return;
+    }
+    updateContentFrameLocation(details.tabId, 0, {
+      url: details.url,
+      documentId: details.documentId,
+      title: target.title,
+    });
+    getTargetNavigationState(details.tabId, true);
+    syncTabToStateHub({ ...target, url: details.url });
+  });
+}
+
 async function syncContentEventToStateHub(
   message: ExtensionMessage,
   sender: chrome.runtime.MessageSender,
@@ -230,6 +310,32 @@ async function syncContentEventToStateHub(
         },
         selectedElement: message.payload.element,
       });
+      break;
+    case MESSAGE_TYPES.CONTENT_DOM_ACTIVITY:
+      if (!target?.id || senderTab?.id !== target.id) {
+        return;
+      }
+      {
+        const navigation = getTargetNavigationState(target.id, false);
+        stateHubBridge.sendBrowserActivity({
+          ...message.payload,
+          target: {
+            url: message.payload.target?.url ??
+              sender.url ??
+              target.url ??
+              target.pendingUrl ??
+              "",
+            title: message.payload.target?.title ?? target.title ?? "",
+            targetId: String(target.id),
+            tabId: target.id,
+            windowId: target.windowId,
+            frameId: sender.frameId ?? 0,
+            documentId: sender.documentId,
+            navigationId: navigation.navigationId,
+            revision: navigation.revision,
+          },
+        });
+      }
       break;
     default:
       break;

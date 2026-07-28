@@ -8,7 +8,10 @@ export type BrowserStateResourceKey = DaemonStateResourceKey;
 
 type SnapshotResourceKey = Exclude<
   BrowserStateResourceKey,
-  "collaborationWorkspace" | "contextDigest" | "selectedElement"
+  | "collaborationWorkspace"
+  | "contextDigest"
+  | "selectedElement"
+  | "activityStream"
 >;
 
 export function getBrowserStateSnapshot(
@@ -31,6 +34,10 @@ export function readBrowserStateResource(
 
   if (key === "collaborationWorkspace") {
     return browserStateHub.collaborationWorkspacePayload(sessionId);
+  }
+
+  if (key === "activityStream") {
+    return browserStateHub.activityStreamPayload(sessionId);
   }
 
   return browserStateHub.resourcePayload(key as SnapshotResourceKey, sessionId);

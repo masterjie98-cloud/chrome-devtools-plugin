@@ -18,9 +18,11 @@ import {
 } from "./browserAutomation";
 import {
   clearHighlights,
+  configureDomActivityEmitter,
   getPageSnapshot,
   highlightElement,
   queryDom,
+  setDomActivityMonitoring,
   setDomValue
 } from "./domInspector";
 import { cancelElementPicker, startElementPicker } from "./elementPicker";
@@ -35,41 +37,75 @@ import {
   sendRuntimeEvent,
 } from "../shared/messaging";
 
-announceTargetPage("load");
+type ContentRuntimeGlobal = typeof globalThis & {
+  __AI_DEVTOOLS_CONTENT_SCRIPT_READY__?: boolean;
+};
 
-window.addEventListener("focus", () => announceTargetPage("focus"));
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") {
-    announceTargetPage("visible");
-  }
-});
+const contentRuntime = globalThis as ContentRuntimeGlobal;
+if (!contentRuntime.__AI_DEVTOOLS_CONTENT_SCRIPT_READY__) {
+  contentRuntime.__AI_DEVTOOLS_CONTENT_SCRIPT_READY__ = true;
+  initializeContentScript();
+}
 
-chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
-  if (!isBackgroundContentRequest(message)) {
-    return false;
-  }
+function initializeContentScript(): void {
+  announceTargetPage("load");
+  configureDomActivityEmitter((entry) => {
+    sendRuntimeEvent(
+      makeEvent("content", MESSAGE_TYPES.CONTENT_DOM_ACTIVITY, {
+        kind: "dom",
+        observedAt: new Date().toISOString(),
+        summary: {
+          toRevision: entry.revision,
+          added: entry.added,
+          removed: entry.removed,
+          attributes: entry.attributes,
+          characterData: entry.characterData,
+        },
+      }),
+    );
+  });
 
-  void Promise.resolve()
-    .then(() => handleContentRequest(message))
-    .then(sendResponse)
-    .catch((error) => {
-      sendResponse(
-        errorResponse(
-          message as ExtensionRequest,
-          "CONTENT_REQUEST_FAILED",
-          error instanceof Error ? error.message : "Content request failed.",
-          error
-        )
-      );
-    });
+  window.addEventListener("focus", () => announceTargetPage("focus"));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      announceTargetPage("visible");
+    }
+  });
 
-  return true;
-});
+  chrome.runtime.onMessage.addListener(
+    (message: unknown, _sender, sendResponse) => {
+      if (!isBackgroundContentRequest(message)) {
+        return false;
+      }
+
+      void Promise.resolve()
+        .then(() => handleContentRequest(message))
+        .then(sendResponse)
+        .catch((error) => {
+          sendResponse(
+            errorResponse(
+              message as ExtensionRequest,
+              "CONTENT_REQUEST_FAILED",
+              error instanceof Error ? error.message : "Content request failed.",
+              error,
+            ),
+          );
+        });
+
+      return true;
+    },
+  );
+}
 
 function handleContentRequest(request: ExtensionRequest) {
   switch (request.type) {
     case MESSAGE_TYPES.CONTENT_GET_PAGE_INFO:
       return okResponse(request, getPageSnapshot(request.payload));
+    case MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR:
+      return okResponse(
+        request,
+        setDomActivityMonitoring(request.payload.enabled),
+      );
     case MESSAGE_TYPES.CONTENT_QUERY_DOM:
       return okResponse(request, queryDom(request.payload));
     case MESSAGE_TYPES.CONTENT_START_ELEMENT_PICK:

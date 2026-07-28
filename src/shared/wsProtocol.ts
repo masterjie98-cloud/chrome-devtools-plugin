@@ -31,11 +31,12 @@ import type {
   ToolApprovalMode,
   ToolCapability,
 } from "./toolPolicy";
+import type { BrowserActivityEventInput } from "./browserActivity";
 
 export const MCP_WS_URL = "ws://127.0.0.1:17321";
 // Bump whenever an extension-visible tool/resource schema changes so a newly
 // loaded extension cannot silently keep using an older daemon process.
-export const WS_PROTOCOL_VERSION = 7;
+export const WS_PROTOCOL_VERSION = 8;
 export const WS_HEARTBEAT_INTERVAL_MS = 15_000;
 
 export const WS_COMMANDS = {
@@ -51,6 +52,8 @@ export const WS_COMMANDS = {
   AGENT_SESSION_SYNC: "AGENT_SESSION_SYNC",
   COLLABORATION_ITEM_UPSERT: "COLLABORATION_ITEM_UPSERT",
   COLLABORATION_WORKSPACE_UPDATED: "COLLABORATION_WORKSPACE_UPDATED",
+  BROWSER_ACTIVITY_EVENT: "BROWSER_ACTIVITY_EVENT",
+  BROWSER_ACTIVITY_UPDATED: "BROWSER_ACTIVITY_UPDATED",
   MCP_LIST_TOOLS: "MCP_LIST_TOOLS",
   MCP_LIST_TOOLS_RESULT: "MCP_LIST_TOOLS_RESULT",
   MCP_TOOL_CALL: "MCP_TOOL_CALL",
@@ -173,6 +176,15 @@ export interface CollaborationWorkspaceUpdatedPayload {
   item?: CollaborationItem;
 }
 
+export interface BrowserActivityEventPayload {
+  event: BrowserActivityEventInput;
+}
+
+export interface BrowserActivityUpdatedPayload {
+  sessionId: string;
+  latestSequence: number;
+}
+
 export interface BrowserToolCallPayload {
   call: AnyToolCall;
   executionGrant: SignedExecutionGrant;
@@ -209,6 +221,11 @@ export interface McpToolCallPayload {
   };
   taskContext?: {
     taskId: string;
+    conversationId?: string;
+    target?: {
+      tabId: number;
+      targetId?: string;
+    };
     egressDestinations: string[];
   };
 }
@@ -226,6 +243,7 @@ export const DAEMON_STATE_RESOURCE_KEYS = [
   "agentSessions",
   "activeAgentSession",
   "lastAgentConclusion",
+  "activityStream",
 ] as const;
 
 export type DaemonStateResourceKey =
@@ -435,6 +453,12 @@ export type PluginToMcpMessage =
     }
   | {
       requestId: string;
+      command: typeof WS_COMMANDS.BROWSER_ACTIVITY_EVENT;
+      sentAt: string;
+      payload: BrowserActivityEventPayload;
+    }
+  | {
+      requestId: string;
       command: typeof WS_COMMANDS.MCP_LIST_TOOLS;
       sentAt: string;
       payload: McpListToolsPayload;
@@ -546,6 +570,12 @@ export type McpToPluginMessage =
       command: typeof WS_COMMANDS.COLLABORATION_WORKSPACE_UPDATED;
       sentAt: string;
       payload: CollaborationWorkspaceUpdatedPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.BROWSER_ACTIVITY_UPDATED;
+      sentAt: string;
+      payload: BrowserActivityUpdatedPayload;
     }
   | {
       requestId: string;

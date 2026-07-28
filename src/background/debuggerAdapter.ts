@@ -1,5 +1,4 @@
 import {
-  activateTabForDebugging,
   debuggerAttach,
   debuggerDetach,
   debuggerGetTargets,
@@ -53,6 +52,18 @@ import type {
   DebuggerProxyStage,
   DebuggerProxyStatus,
 } from "../shared/debugger";
+import type { BrowserActivityEventInput } from "../shared/browserActivity";
+import type {
+  BrowserRealtimeActivityResult,
+} from "../shared/pageDiagnostics";
+import type {
+  GeneratedSourceLocation,
+  SourceMapResolution,
+} from "../shared/sourceLocation";
+import {
+  resolveSourceMapLocation,
+  type LoadedScriptMetadata,
+} from "./sourceMapResolver";
 import {
   buildNetworkActivityDigest,
   normalizeNetworkResultPagination,
@@ -204,15 +215,37 @@ interface NetworkRequestRecord {
   fromServiceWorker?: boolean;
   encodedDataLength?: number;
   startedAt: number;
+  startedWallTimeMs?: number;
   finishedAt?: number;
   failed?: boolean;
   errorText?: string;
   initiatorType?: string;
+  initiatorStack?: import("../shared/debugger").DebuggerInitiatorCallFrame[];
   remoteAddress?: string;
 }
 
 interface ConsoleMessageRecord extends BrowserConsoleMessage {
   timestampMs: number;
+}
+
+interface RealtimeWebSocketRecord {
+  requestId: string;
+  url?: string;
+  openedAt?: number;
+  closedAt?: number;
+  sentFrames: number;
+  receivedFrames: number;
+  sentBytes: number;
+  receivedBytes: number;
+  lastError?: string;
+}
+
+interface RealtimeEventSourceRecord {
+  requestId: string;
+  url?: string;
+  messageCount: number;
+  lastEventName?: string;
+  lastEventAt?: number;
 }
 
 interface NetworkSession {
@@ -224,6 +257,7 @@ interface NetworkSession {
   fetchEnabled: boolean;
   runtimeEnabled: boolean;
   logEnabled: boolean;
+  debuggerEnabled: boolean;
   oopifAutoAttachEnabled: boolean;
   pageStartedAt: number;
   maxEntries: number;
@@ -233,6 +267,9 @@ interface NetworkSession {
   requests: Map<string, NetworkRequestRecord>;
   requestOrder: string[];
   consoleMessages: ConsoleMessageRecord[];
+  scripts: Map<string, LoadedScriptMetadata>;
+  webSockets: Map<string, RealtimeWebSocketRecord>;
+  eventSources: Map<string, RealtimeEventSourceRecord>;
 }
 
 interface ChildDebuggerSession {
@@ -276,6 +313,41 @@ let proxyRestoreLoopGeneration = 0;
 let proxyStateBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 let ensureSessionPromise: Promise<NetworkSession> | null = null;
 const manualDebuggerDetachTabIds = new Set<number>();
+const debuggerActivityListeners = new Set<
+  (event: BrowserActivityEventInput) => void
+>();
+let debuggerActivityMonitoringActive = false;
+
+export function subscribeDebuggerActivity(
+  listener: (event: BrowserActivityEventInput) => void,
+): () => void {
+  debuggerActivityListeners.add(listener);
+  return () => debuggerActivityListeners.delete(listener);
+}
+
+export function emitDebuggerActivityLifecycle(active: boolean): void {
+  debuggerActivityMonitoringActive = active;
+  const event: BrowserActivityEventInput = {
+    kind: "navigation",
+    observedAt: new Date().toISOString(),
+    summary: {
+      reason: active ? "monitoring-started" : "monitoring-stopped",
+    },
+  };
+  for (const listener of debuggerActivityListeners) {
+    listener(event);
+  }
+}
+
+export async function resolveGeneratedSourceLocation(
+  generated: GeneratedSourceLocation,
+  includeExcerpt = false,
+): Promise<SourceMapResolution> {
+  const session = await ensureDebuggerSession();
+  await ensureDebuggerEnabled(session);
+  const script = session.scripts.get(generated.url);
+  return resolveSourceMapLocation(script, generated, includeExcerpt);
+}
 
 interface StoredProxyState {
   enabled?: boolean;
@@ -386,7 +458,9 @@ export async function dispatchTrustedMouseMove(
   expectedTarget?: TrustedInputTargetAddress,
 ): Promise<BrowserMouseResult> {
   const session = await ensureTrustedInputSession(expectedTarget);
-  await dispatchTrustedMouseEvents(session, [trustedMouseMoveEvent(input)]);
+  await withTrustedInputFocus(session, () =>
+    dispatchTrustedMouseEvents(session, [trustedMouseMoveEvent(input)]),
+  );
   return { action: "move", x: input.x, y: input.y };
 }
 
@@ -396,7 +470,9 @@ export async function dispatchTrustedMouseClick(
 ): Promise<BrowserMouseResult> {
   const session = await ensureTrustedInputSession(expectedTarget);
   const button = input.button ?? "left";
-  await dispatchTrustedMouseEvents(session, trustedMouseClickEvents(input));
+  await withTrustedInputFocus(session, () =>
+    dispatchTrustedMouseEvents(session, trustedMouseClickEvents(input)),
+  );
   return { action: "click", x: input.x, y: input.y, button };
 }
 
@@ -406,7 +482,9 @@ export async function dispatchTrustedMouseDown(
 ): Promise<BrowserMouseResult> {
   const session = await ensureTrustedInputSession(expectedTarget);
   const button = input.button ?? "left";
-  await dispatchTrustedMouseEvents(session, [trustedMouseDownEvent(input)]);
+  await withTrustedInputFocus(session, () =>
+    dispatchTrustedMouseEvents(session, [trustedMouseDownEvent(input)]),
+  );
   return { action: "down", x: input.x, y: input.y, button };
 }
 
@@ -416,7 +494,9 @@ export async function dispatchTrustedMouseUp(
 ): Promise<BrowserMouseResult> {
   const session = await ensureTrustedInputSession(expectedTarget);
   const button = input.button ?? "left";
-  await dispatchTrustedMouseEvents(session, [trustedMouseUpEvent(input)]);
+  await withTrustedInputFocus(session, () =>
+    dispatchTrustedMouseEvents(session, [trustedMouseUpEvent(input)]),
+  );
   return { action: "up", x: input.x, y: input.y, button };
 }
 
@@ -425,10 +505,12 @@ export async function dispatchTrustedMouseDrag(
   expectedTarget?: TrustedInputTargetAddress,
 ): Promise<BrowserMouseResult> {
   const session = await ensureTrustedInputSession(expectedTarget);
-  await dispatchTrustedMouseEvents(
-    session,
-    trustedMouseDragEvents(input),
-    true,
+  await withTrustedInputFocus(session, () =>
+    dispatchTrustedMouseEvents(
+      session,
+      trustedMouseDragEvents(input),
+      true,
+    ),
   );
   return { action: "drag", x: input.endX, y: input.endY, button: "left" };
 }
@@ -439,7 +521,11 @@ export async function dispatchTrustedMouseWheel(
 ): Promise<BrowserMouseResult> {
   const session = await ensureTrustedInputSession(expectedTarget);
   const point = await resolveTrustedWheelPoint(session, input);
-  await dispatchTrustedMouseEvents(session, [trustedMouseWheelEvent(input, point)]);
+  await withTrustedInputFocus(session, () =>
+    dispatchTrustedMouseEvents(session, [
+      trustedMouseWheelEvent(input, point),
+    ]),
+  );
   return { action: "wheel", x: point.x, y: point.y };
 }
 
@@ -447,7 +533,7 @@ export async function handleCurrentJavaScriptDialog(
   input: BrowserDialogInput,
   expectedTabId: number,
 ): Promise<BrowserDialogResult> {
-  const session = await ensureDebuggerSessionForTab(expectedTabId, true);
+  const session = await ensureDebuggerSessionForTab(expectedTabId);
   try {
     await debuggerSendCommand(
       session.target,
@@ -473,26 +559,28 @@ export async function dispatchTrustedTextInput(
   expectedTarget: TrustedInputTargetAddress,
 ): Promise<void> {
   const session = await ensureTrustedInputSession(expectedTarget);
-  if (input.replace) {
-    await dispatchTrustedKeyboardEvents(
-      session,
-      trustedReplaceSelectionEvents(),
-    );
-  }
-
-  const chunks = input.slowly ? Array.from(input.text) : [input.text];
-  for (const text of chunks) {
-    if (text) {
-      await debuggerSendCommand(session.target, "Input.insertText", { text });
+  await withTrustedInputFocus(session, async () => {
+    if (input.replace) {
+      await dispatchTrustedKeyboardEvents(
+        session,
+        trustedReplaceSelectionEvents(),
+      );
     }
-    if (input.slowly && text) {
-      await delayMs(35);
-    }
-  }
 
-  if (input.submit) {
-    await dispatchTrustedKeyboardEvents(session, trustedKeyEvents("Enter"));
-  }
+    const chunks = input.slowly ? Array.from(input.text) : [input.text];
+    for (const text of chunks) {
+      if (text) {
+        await debuggerSendCommand(session.target, "Input.insertText", { text });
+      }
+      if (input.slowly && text) {
+        await delayMs(35);
+      }
+    }
+
+    if (input.submit) {
+      await dispatchTrustedKeyboardEvents(session, trustedKeyEvents("Enter"));
+    }
+  });
 }
 
 export async function dispatchTrustedKeyPress(
@@ -500,14 +588,36 @@ export async function dispatchTrustedKeyPress(
   expectedTarget: TrustedInputTargetAddress,
 ): Promise<void> {
   const session = await ensureTrustedInputSession(expectedTarget);
-  await dispatchTrustedKeyboardEvents(session, trustedKeyEvents(input.key));
+  await withTrustedInputFocus(session, () =>
+    dispatchTrustedKeyboardEvents(session, trustedKeyEvents(input.key)),
+  );
+}
+
+async function withTrustedInputFocus<T>(
+  session: TrustedInputSession,
+  execute: () => Promise<T>,
+): Promise<T> {
+  await debuggerSendCommand(
+    session.target,
+    "Emulation.setFocusEmulationEnabled",
+    { enabled: true },
+  );
+  try {
+    return await execute();
+  } finally {
+    await debuggerSendCommand(
+      session.target,
+      "Emulation.setFocusEmulationEnabled",
+      { enabled: false },
+    ).catch(() => undefined);
+  }
 }
 
 async function ensureTrustedInputSession(
   expectedTarget: TrustedInputTargetAddress | undefined,
 ): Promise<TrustedInputSession> {
   const session = expectedTarget
-    ? await ensureDebuggerSessionForTab(expectedTarget.tabId, true)
+    ? await ensureDebuggerSessionForTab(expectedTarget.tabId)
     : await ensureDebuggerSession();
   if (!expectedTarget || expectedTarget.frameId === 0) {
     return { tabId: session.tabId, target: session.target };
@@ -646,9 +756,10 @@ export async function upsertProxyRule(
   const existing = input.id ? proxyRules.get(input.id) : undefined;
   const id = input.id?.trim() || `proxy-${Date.now().toString(36)}`;
   const matcher = normalizeProxyMatcherFields({ ...existing, ...input });
+  const { resetScenario: _resetScenario, ...storedInput } = input;
   const rule: DebuggerProxyRule = {
     ...existing,
-    ...input,
+    ...storedInput,
     urlPattern: matcher.urlPattern,
     urlContains: matcher.urlContains,
     regexFilter: matcher.regexFilter,
@@ -659,6 +770,14 @@ export async function upsertProxyRule(
     updatedAt: now,
     hitCount: existing?.hitCount ?? 0,
     lastHitAt: existing?.lastHitAt,
+    scenarioStepIndex:
+      input.resetScenario === true
+        ? 0
+        : (existing?.scenarioStepIndex ?? 0),
+    scenarioHitCount:
+      input.resetScenario === true
+        ? 0
+        : (existing?.scenarioHitCount ?? 0),
   };
 
   clearExplicitProxyFields(rule, input);
@@ -711,6 +830,16 @@ function clearExplicitProxyFields(
   }
   if (Object.prototype.hasOwnProperty.call(input, "mockStage")) {
     rule.mockStage = input.mockStage;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "scenarioSteps")) {
+    rule.scenarioSteps = input.scenarioSteps;
+    if (!input.scenarioSteps?.length) {
+      rule.scenarioStepIndex = 0;
+      rule.scenarioHitCount = 0;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "scenarioRepeat")) {
+    rule.scenarioRepeat = input.scenarioRepeat;
   }
 }
 
@@ -769,7 +898,7 @@ export async function restoreProxyDebuggerForTab(
   }
 
   try {
-    const session = await ensureDebuggerSessionForTab(tabId, false);
+    const session = await ensureDebuggerSessionForTab(tabId);
     await ensureNetworkEnabled(session);
     await applyFetchInterception(session);
     const status = proxyStatus();
@@ -852,6 +981,27 @@ export async function startNetworkDebugger(
   session.networkEnabled = true;
 
   return networkStatus();
+}
+
+export async function collectRealtimeDebuggerActivity(
+  limit = 30,
+): Promise<Pick<BrowserRealtimeActivityResult, "websocket" | "eventSource">> {
+  const session = await ensureDebuggerSession();
+  if (!session.networkEnabled) {
+    await debuggerSendCommand(session.target, "Network.enable", {});
+    session.networkEnabled = true;
+  }
+  const boundedLimit = Math.min(100, Math.max(1, limit));
+  return {
+    websocket: Array.from(session.webSockets.values())
+      .slice(-boundedLimit)
+      .reverse()
+      .map((entry) => ({ ...entry })),
+    eventSource: Array.from(session.eventSources.values())
+      .slice(-boundedLimit)
+      .reverse()
+      .map((entry) => ({ ...entry })),
+  };
 }
 
 export async function stopNetworkDebugger(): Promise<DebuggerNetworkStatus> {
@@ -942,6 +1092,7 @@ export async function getNetworkRequest(
     responseHeaders: record.responseHeaders,
     requestPostData: record.requestPostData,
     initiatorType: record.initiatorType,
+    initiatorStack: record.initiatorStack,
     remoteAddress: record.remoteAddress,
   };
 
@@ -1075,7 +1226,7 @@ async function tryImmediateProxyReattach(
     if (activeSession && activeSession.tabId === tabId && !activeSession.attached) {
       clearChildDebuggerSessions();
     }
-    const session = await ensureDebuggerSessionForTab(tabId, false);
+    const session = await ensureDebuggerSessionForTab(tabId);
     await ensureNetworkEnabled(session);
     await applyFetchInterception(session);
     proxyLog("proxy.reattach.immediate.done", {
@@ -1130,7 +1281,7 @@ async function runProxyRestoreLoop(
         clearChildDebuggerSessions();
       }
 
-      const session = await ensureDebuggerSessionForTab(tabId, false);
+      const session = await ensureDebuggerSessionForTab(tabId);
       await ensureNetworkEnabled(session);
       await applyFetchInterception(session);
 
@@ -1243,11 +1394,35 @@ function handleDebuggerEvent(
     case "Network.loadingFailed":
       handleLoadingFailed(params as NetworkLoadingFailedEvent);
       break;
+    case "Network.webSocketCreated":
+      handleWebSocketCreated(params as NetworkWebSocketCreatedEvent);
+      break;
+    case "Network.webSocketWillSendHandshakeRequest":
+      handleWebSocketHandshake(params as NetworkWebSocketHandshakeEvent);
+      break;
+    case "Network.webSocketFrameSent":
+      handleWebSocketFrame(params as NetworkWebSocketFrameEvent, "sent");
+      break;
+    case "Network.webSocketFrameReceived":
+      handleWebSocketFrame(params as NetworkWebSocketFrameEvent, "received");
+      break;
+    case "Network.webSocketClosed":
+      handleWebSocketClosed(params as NetworkWebSocketClosedEvent);
+      break;
+    case "Network.webSocketFrameError":
+      handleWebSocketError(params as NetworkWebSocketErrorEvent);
+      break;
+    case "Network.eventSourceMessageReceived":
+      handleEventSourceMessage(params as NetworkEventSourceMessageEvent);
+      break;
     case "Runtime.consoleAPICalled":
       handleRuntimeConsoleAPICalled(params as RuntimeConsoleApiCalledEvent);
       break;
     case "Log.entryAdded":
       handleLogEntryAdded(params as LogEntryAddedEvent);
+      break;
+    case "Debugger.scriptParsed":
+      handleScriptParsed(params as DebuggerScriptParsedEvent);
       break;
     default:
       break;
@@ -1481,7 +1656,7 @@ async function ensureDebuggerSession(): Promise<NetworkSession> {
     return ensureSessionPromise;
   }
 
-  ensureSessionPromise = ensureDebuggerSessionForTab(undefined, true).finally(() => {
+  ensureSessionPromise = ensureDebuggerSessionForTab(undefined).finally(() => {
     ensureSessionPromise = null;
   });
 
@@ -1490,7 +1665,6 @@ async function ensureDebuggerSession(): Promise<NetworkSession> {
 
 async function ensureDebuggerSessionForTab(
   tabId: number | undefined,
-  activateTarget: boolean,
 ): Promise<NetworkSession> {
   const tab = tabId === undefined ? await queryActiveTab() : await getTab(tabId);
   if (!tab?.id) {
@@ -1505,9 +1679,6 @@ async function ensureDebuggerSessionForTab(
 
   registerDebuggerListeners();
 
-  if (activateTarget) {
-    await activateTabForDebugging(tab);
-  }
   const resolvedTarget = await resolveDebuggerTarget(tab.id, tabUrl);
 
   if (activeSession && activeSession.tabId !== tab.id) {
@@ -1526,6 +1697,7 @@ async function ensureDebuggerSessionForTab(
       fetchEnabled: false,
       runtimeEnabled: false,
       logEnabled: false,
+      debuggerEnabled: false,
       oopifAutoAttachEnabled: false,
       pageStartedAt: Date.now(),
       maxEntries: DEFAULT_MAX_NETWORK_ENTRIES,
@@ -1535,6 +1707,9 @@ async function ensureDebuggerSessionForTab(
       requests: new Map(),
       requestOrder: [],
       consoleMessages: [],
+      scripts: new Map(),
+      webSockets: new Map(),
+      eventSources: new Map(),
     };
   }
 
@@ -1655,6 +1830,11 @@ async function syncChildSessionState(
   if (session.logEnabled) {
     await debuggerSendCommand(target, "Log.enable", {}).catch(() => undefined);
   }
+  if (session.debuggerEnabled) {
+    await debuggerSendCommand(target, "Debugger.enable", {}).catch(
+      () => undefined,
+    );
+  }
   if (proxyEnabled) {
     await applyFetchInterceptionToTarget(target, buildFetchPatterns()).catch(
       () => undefined,
@@ -1695,6 +1875,16 @@ async function ensureConsoleEnabled(session: NetworkSession): Promise<void> {
     }
     session.logEnabled = true;
   }
+}
+
+async function ensureDebuggerEnabled(session: NetworkSession): Promise<void> {
+  if (session.debuggerEnabled) {
+    return;
+  }
+  for (const target of allDebuggerTargets(session)) {
+    await debuggerSendCommand(target, "Debugger.enable", {});
+  }
+  session.debuggerEnabled = true;
 }
 
 async function applyFetchInterception(session: NetworkSession): Promise<void> {
@@ -1813,12 +2003,16 @@ function fetchUrlPatternFromMatcher(
   return base;
 }
 
-function fetchStagesForRule(rule: DebuggerProxyRule): DebuggerProxyStage[] {
+export function fetchStagesForRule(rule: DebuggerProxyRule): DebuggerProxyStage[] {
+  const effectiveRule = materializeScenarioRule(rule);
   const stages = new Set<DebuggerProxyStage>();
-  if (rule.requestHeaders?.length || shouldFulfillAtRequest(rule)) {
+  if (
+    effectiveRule.requestHeaders?.length ||
+    shouldFulfillAtRequest(effectiveRule)
+  ) {
     stages.add("request");
   }
-  if (hasResponseAction(rule)) {
+  if (hasResponseAction(effectiveRule)) {
     stages.add("response");
   }
   return Array.from(stages);
@@ -1830,7 +2024,9 @@ function shouldFulfillAtRequest(rule: DebuggerProxyRule): boolean {
     (rule.responseBody !== undefined ||
       rule.responseBodyBase64 !== undefined ||
       rule.statusCode !== undefined ||
-      Boolean(rule.responseHeaders?.length))
+      rule.responsePhrase !== undefined ||
+      Boolean(rule.responseHeaders?.length) ||
+      Boolean(rule.contentType))
   );
 }
 
@@ -1840,6 +2036,7 @@ function hasResponseAction(rule: DebuggerProxyRule): boolean {
     (rule.responseBody !== undefined ||
       rule.responseBodyBase64 !== undefined ||
       rule.statusCode !== undefined ||
+      rule.responsePhrase !== undefined ||
       Boolean(rule.responseHeaders?.length) ||
       Boolean(rule.contentType))
   );
@@ -1872,6 +2069,7 @@ async function handleFetchRequestPaused(
   const allRules = Array.from(proxyRules.values());
   const rules = allRules
     .filter((rule) => matchesProxyRule(rule, event, stage))
+    .map(materializeScenarioRule)
     .sort(compareProxyRules);
   const ruleDiagnostics = allRules.map((rule) => ({
     ...summarizeProxyRule(rule),
@@ -1969,6 +2167,7 @@ async function handleRequestStagePaused(
     });
     await fulfillFetchRequest(session, event, fulfillRule, "request", source);
     recordProxyHit(fulfillRule, event, "request", "fulfill");
+    await advanceProxyScenario(fulfillRule.id);
     return;
   }
 
@@ -2074,6 +2273,7 @@ async function handleResponseStagePaused(
   for (const rule of responseRules) {
     recordProxyHit(rule, event, "response", "fulfill");
   }
+  await advanceProxyScenarios(responseRules.map((rule) => rule.id));
 }
 
 async function continueFetchRequest(
@@ -2198,6 +2398,67 @@ function debuggeeLabel(target: DebuggerTarget): string {
 
 function currentProxyRules(): DebuggerProxyRule[] {
   return Array.from(proxyRules.values()).sort(compareProxyRules);
+}
+
+function materializeScenarioRule(rule: DebuggerProxyRule): DebuggerProxyRule {
+  const steps = rule.scenarioSteps;
+  if (!steps?.length) {
+    return rule;
+  }
+  const index = Math.min(
+    steps.length - 1,
+    Math.max(0, rule.scenarioStepIndex ?? 0),
+  );
+  const step = steps[index]!;
+  return {
+    ...rule,
+    responseHeaders: step.responseHeaders ?? rule.responseHeaders,
+    responseBody:
+      step.responseBody !== undefined ? step.responseBody : rule.responseBody,
+    responseBodyBase64:
+      step.responseBodyBase64 !== undefined
+        ? step.responseBodyBase64
+        : rule.responseBodyBase64,
+    statusCode:
+      step.statusCode !== undefined ? step.statusCode : rule.statusCode,
+    responsePhrase:
+      step.responsePhrase !== undefined
+        ? step.responsePhrase
+        : rule.responsePhrase,
+    contentType:
+      step.contentType !== undefined ? step.contentType : rule.contentType,
+  };
+}
+
+async function advanceProxyScenario(ruleId: string): Promise<void> {
+  await advanceProxyScenarios([ruleId]);
+}
+
+async function advanceProxyScenarios(ruleIds: string[]): Promise<void> {
+  let changed = false;
+  for (const ruleId of new Set(ruleIds)) {
+    const rule = proxyRules.get(ruleId);
+    const steps = rule?.scenarioSteps;
+    if (!rule || !steps?.length) {
+      continue;
+    }
+    const current = Math.min(
+      steps.length - 1,
+      Math.max(0, rule.scenarioStepIndex ?? 0),
+    );
+    rule.scenarioStepIndex =
+      current >= steps.length - 1
+        ? rule.scenarioRepeat === "loop"
+          ? 0
+          : current
+        : current + 1;
+    rule.scenarioHitCount = (rule.scenarioHitCount ?? 0) + 1;
+    rule.updatedAt = new Date().toISOString();
+    changed = true;
+  }
+  if (changed) {
+    await saveProxyState();
+  }
 }
 
 function compareProxyRules(a: DebuggerProxyRule, b: DebuggerProxyRule): number {
@@ -2758,6 +3019,24 @@ function handleRuntimeConsoleAPICalled(
   });
 }
 
+function handleScriptParsed(event: DebuggerScriptParsedEvent): void {
+  const session = activeSession;
+  if (!session || !event.url) {
+    return;
+  }
+  session.scripts.set(event.url, {
+    scriptId: event.scriptId,
+    url: event.url,
+    sourceMapURL: event.sourceMapURL,
+  });
+  if (session.scripts.size > 2_000) {
+    const oldest = session.scripts.keys().next().value;
+    if (typeof oldest === "string") {
+      session.scripts.delete(oldest);
+    }
+  }
+}
+
 function handleLogEntryAdded(event: LogEntryAddedEvent): void {
   const session = activeSession;
   if (!session) {
@@ -2784,6 +3063,19 @@ function pushConsoleMessage(
 ): void {
   session.consoleMessages.push(message);
   session.consoleMessages = session.consoleMessages.slice(-MAX_CONSOLE_MESSAGES);
+  emitDebuggerActivity({
+    kind: "console",
+    observedAt: message.timestamp,
+    summary: {
+      level: message.level,
+      message: message.text,
+      source: {
+        url: message.url,
+        lineNumber: message.lineNumber,
+        columnNumber: message.columnNumber,
+      },
+    },
+  });
 }
 
 function consoleTypeToLevel(
@@ -2852,6 +3144,19 @@ function handleRequestWillBeSent(event: NetworkRequestWillBeSentEvent): void {
   const session = requireNetworkSession();
   if (event.type === "Document") {
     session.pageStartedAt = Date.now();
+    emitDebuggerActivity({
+      kind: "navigation",
+      observedAt: new Date().toISOString(),
+      summary: {
+        method: event.request.method,
+        url: event.request.url,
+        resourceType: event.type,
+        requestId: event.requestId,
+        initiatorType: event.initiator?.type,
+        source: firstInitiatorSource(event.initiator),
+        reason: "document-request",
+      },
+    });
   }
   const existing = session.requests.get(event.requestId);
   const record: NetworkRequestRecord = {
@@ -2864,7 +3169,12 @@ function handleRequestWillBeSent(event: NetworkRequestWillBeSentEvent): void {
     requestHeaders: normalizeHeaders(event.request.headers),
     requestPostData: event.request.postData,
     startedAt: event.timestamp,
+    startedWallTimeMs:
+      typeof event.wallTime === "number"
+        ? Math.round(event.wallTime * 1_000)
+        : undefined,
     initiatorType: event.initiator?.type,
+    initiatorStack: flattenInitiatorStack(event.initiator),
   };
 
   if (!existing) {
@@ -2891,6 +3201,18 @@ function handleResponseReceived(event: NetworkResponseReceivedEvent): void {
   existing.remoteAddress = event.response.remoteIPAddress
     ? `${event.response.remoteIPAddress}:${event.response.remotePort ?? ""}`
     : undefined;
+  emitDebuggerActivity({
+    kind: "network",
+    observedAt: new Date().toISOString(),
+    summary: {
+      method: existing.method,
+      url: existing.url,
+      resourceType: existing.resourceType,
+      status: existing.status,
+      requestId: existing.requestId,
+      initiatorType: existing.initiatorType,
+    },
+  });
 }
 
 function handleLoadingFinished(event: NetworkLoadingFinishedEvent): void {
@@ -2914,6 +3236,119 @@ function handleLoadingFailed(event: NetworkLoadingFailedEvent): void {
   existing.finishedAt = event.timestamp;
   existing.failed = true;
   existing.errorText = event.errorText;
+  emitDebuggerActivity({
+    kind: "network",
+    observedAt: new Date().toISOString(),
+    summary: {
+      method: existing.method,
+      url: existing.url,
+      resourceType: existing.resourceType,
+      failed: true,
+      requestId: existing.requestId,
+      initiatorType: existing.initiatorType,
+      reason: event.errorText,
+    },
+  });
+}
+
+function handleWebSocketCreated(event: NetworkWebSocketCreatedEvent): void {
+  const session = requireNetworkSession();
+  session.webSockets.set(event.requestId, {
+    requestId: event.requestId,
+    url: event.url?.slice(0, 2_000),
+    openedAt: event.timestamp,
+    sentFrames: 0,
+    receivedFrames: 0,
+    sentBytes: 0,
+    receivedBytes: 0,
+  });
+}
+
+function handleWebSocketHandshake(event: NetworkWebSocketHandshakeEvent): void {
+  const session = requireNetworkSession();
+  const existing = session.webSockets.get(event.requestId);
+  if (existing) {
+    existing.openedAt = event.timestamp ?? existing.openedAt;
+    existing.url = event.request?.url?.slice(0, 2_000) ?? existing.url;
+  }
+}
+
+function handleWebSocketFrame(
+  event: NetworkWebSocketFrameEvent,
+  direction: "sent" | "received",
+): void {
+  const session = requireNetworkSession();
+  const existing =
+    session.webSockets.get(event.requestId) ??
+    ({
+      requestId: event.requestId,
+      sentFrames: 0,
+      receivedFrames: 0,
+      sentBytes: 0,
+      receivedBytes: 0,
+    } satisfies RealtimeWebSocketRecord);
+  const bytes = new TextEncoder().encode(event.response.payloadData ?? "").length;
+  if (direction === "sent") {
+    existing.sentFrames += 1;
+    existing.sentBytes += bytes;
+  } else {
+    existing.receivedFrames += 1;
+    existing.receivedBytes += bytes;
+  }
+  session.webSockets.set(event.requestId, existing);
+}
+
+function handleWebSocketClosed(event: NetworkWebSocketClosedEvent): void {
+  const existing = requireNetworkSession().webSockets.get(event.requestId);
+  if (existing) {
+    existing.closedAt = event.timestamp;
+  }
+}
+
+function handleWebSocketError(event: NetworkWebSocketErrorEvent): void {
+  const existing = requireNetworkSession().webSockets.get(event.requestId);
+  if (existing) {
+    existing.lastError = event.errorMessage.slice(0, 500);
+  }
+}
+
+function handleEventSourceMessage(event: NetworkEventSourceMessageEvent): void {
+  const session = requireNetworkSession();
+  const request = session.requests.get(event.requestId);
+  const existing =
+    session.eventSources.get(event.requestId) ??
+    ({
+      requestId: event.requestId,
+      url: request?.url?.slice(0, 2_000),
+      messageCount: 0,
+    } satisfies RealtimeEventSourceRecord);
+  existing.messageCount += 1;
+  existing.lastEventName = event.eventName?.slice(0, 500);
+  existing.lastEventAt = event.timestamp;
+  session.eventSources.set(event.requestId, existing);
+}
+
+function emitDebuggerActivity(event: BrowserActivityEventInput): void {
+  if (!debuggerActivityMonitoringActive) {
+    return;
+  }
+  for (const listener of debuggerActivityListeners) {
+    listener(event);
+  }
+}
+
+function firstInitiatorSource(
+  initiator: NetworkRequestWillBeSentEvent["initiator"],
+): BrowserActivityEventInput["summary"]["source"] {
+  const frame = initiator?.stack?.callFrames?.[0];
+  return frame
+    ? {
+        url: frame.url,
+        functionName: frame.functionName,
+        lineNumber: frame.lineNumber,
+        columnNumber: frame.columnNumber,
+      }
+    : undefined;
 }
 
 function matchesNetworkFilter(
@@ -2965,6 +3400,7 @@ function toNetworkSummary(
     fromServiceWorker: request.fromServiceWorker,
     encodedDataLength: request.encodedDataLength,
     startedAt: request.startedAt,
+    startedWallTimeMs: request.startedWallTimeMs,
     finishedAt: request.finishedAt,
     durationMs:
       request.finishedAt === undefined
@@ -2972,13 +3408,41 @@ function toNetworkSummary(
         : Math.round((request.finishedAt - request.startedAt) * 1000),
     failed: request.failed,
     errorText: request.errorText,
+    initiatorType: request.initiatorType,
+    initiatorStack: request.initiatorStack,
   };
+}
+
+function flattenInitiatorStack(
+  initiator: NetworkRequestWillBeSentEvent["initiator"],
+): import("../shared/debugger").DebuggerInitiatorCallFrame[] | undefined {
+  const frames: import("../shared/debugger").DebuggerInitiatorCallFrame[] = [];
+  let stack = initiator?.stack;
+  let depth = 0;
+  while (stack && depth < 4 && frames.length < 12) {
+    for (const frame of stack.callFrames ?? []) {
+      frames.push({
+        functionName: frame.functionName,
+        url: frame.url,
+        lineNumber: frame.lineNumber,
+        columnNumber: frame.columnNumber,
+      });
+      if (frames.length >= 12) {
+        break;
+      }
+    }
+    stack = stack.parent;
+    depth += 1;
+  }
+  return frames.length > 0 ? frames : undefined;
 }
 
 function clearNetworkRequests(): void {
   activeSession?.requests.clear();
   if (activeSession) {
     activeSession.requestOrder = [];
+    activeSession.webSockets.clear();
+    activeSession.eventSources.clear();
   }
 }
 
@@ -3028,6 +3492,16 @@ function normalizeHeaders(
   );
 }
 
+interface DebuggerStackTrace {
+  callFrames?: Array<{
+    functionName?: string;
+    url?: string;
+    lineNumber?: number;
+    columnNumber?: number;
+  }>;
+  parent?: DebuggerStackTrace;
+}
+
 interface NetworkRequestWillBeSentEvent {
   requestId: string;
   documentURL?: string;
@@ -3038,10 +3512,18 @@ interface NetworkRequestWillBeSentEvent {
     postData?: string;
   };
   timestamp: number;
+  wallTime?: number;
   type?: string;
   initiator?: {
     type?: string;
+    stack?: DebuggerStackTrace;
   };
+}
+
+interface DebuggerScriptParsedEvent {
+  scriptId: string;
+  url: string;
+  sourceMapURL?: string;
 }
 
 interface NetworkResponseReceivedEvent {
@@ -3070,6 +3552,47 @@ interface NetworkLoadingFailedEvent {
   requestId: string;
   timestamp: number;
   errorText?: string;
+}
+
+interface NetworkWebSocketCreatedEvent {
+  requestId: string;
+  url?: string;
+  timestamp?: number;
+}
+
+interface NetworkWebSocketHandshakeEvent {
+  requestId: string;
+  timestamp?: number;
+  request?: { url?: string };
+}
+
+interface NetworkWebSocketFrameEvent {
+  requestId: string;
+  timestamp: number;
+  response: {
+    opcode?: number;
+    mask?: boolean;
+    payloadData?: string;
+  };
+}
+
+interface NetworkWebSocketClosedEvent {
+  requestId: string;
+  timestamp: number;
+}
+
+interface NetworkWebSocketErrorEvent {
+  requestId: string;
+  timestamp: number;
+  errorMessage: string;
+}
+
+interface NetworkEventSourceMessageEvent {
+  requestId: string;
+  timestamp: number;
+  eventName?: string;
+  eventId?: string;
+  data?: string;
 }
 
 interface PageLayoutMetrics {

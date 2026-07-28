@@ -270,7 +270,7 @@ therefore not committed to the repository.
 
 ## Follow-up capability boundary
 
-Local history, draft recovery, mutation-safe retry, and edit-and-fork now have
-explicit storage and replay contracts and are implemented. Search/export remain
-deferred; if added later, they must operate on the same sanitized text snapshots
-rather than raw tool results or image payloads.
+Local history, draft recovery, mutation-safe retry, edit-and-fork, full-text
+search, and explicit Markdown/JSON export now have storage and replay contracts.
+Search/export operate only on the same sanitized text snapshots; raw tool
+results, runtime status, and image payloads are excluded.

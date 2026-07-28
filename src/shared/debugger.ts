@@ -26,6 +26,16 @@ export interface DebuggerProxyHeaderModification {
   value?: string;
 }
 
+export interface DebuggerProxyScenarioStep {
+  name?: string;
+  responseHeaders?: DebuggerProxyHeaderModification[];
+  responseBody?: string;
+  responseBodyBase64?: string;
+  statusCode?: number;
+  responsePhrase?: string;
+  contentType?: string;
+}
+
 export interface DebuggerProxyRuleInput {
   id?: string;
   enabled?: boolean;
@@ -43,6 +53,9 @@ export interface DebuggerProxyRuleInput {
   responsePhrase?: string;
   contentType?: string;
   mockStage?: DebuggerProxyStage;
+  scenarioSteps?: DebuggerProxyScenarioStep[];
+  scenarioRepeat?: "hold-last" | "loop";
+  resetScenario?: boolean;
 }
 
 export interface DebuggerProxyRule extends DebuggerProxyRuleInput {
@@ -52,6 +65,8 @@ export interface DebuggerProxyRule extends DebuggerProxyRuleInput {
   updatedAt: string;
   hitCount: number;
   lastHitAt?: string;
+  scenarioStepIndex?: number;
+  scenarioHitCount?: number;
 }
 
 export interface DebuggerProxyStatus {
@@ -168,10 +183,20 @@ export interface DebuggerNetworkRequestSummary {
   fromServiceWorker?: boolean;
   encodedDataLength?: number;
   startedAt: number;
+  startedWallTimeMs?: number;
   finishedAt?: number;
   durationMs?: number;
   failed?: boolean;
   errorText?: string;
+  initiatorType?: string;
+  initiatorStack?: DebuggerInitiatorCallFrame[];
+}
+
+export interface DebuggerInitiatorCallFrame {
+  functionName?: string;
+  url?: string;
+  lineNumber?: number;
+  columnNumber?: number;
 }
 
 export interface DebuggerNetworkRequestDetail
@@ -180,7 +205,6 @@ export interface DebuggerNetworkRequestDetail
   requestHeaders?: Record<string, string>;
   responseHeaders?: Record<string, string>;
   requestPostData?: string;
-  initiatorType?: string;
   remoteAddress?: string;
   body?: DebuggerNetworkResponseBody;
 }

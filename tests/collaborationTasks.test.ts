@@ -3,15 +3,18 @@ import test from "node:test";
 import { ExecutionBrokerError } from "../src/daemon/executionBroker";
 import { BrowserStateHub } from "../src/mcp/browserStateHub";
 import {
+  cancelCollaborationTask,
   claimCollaborationTask,
   completeCollaborationTask,
   delegateCollaborationTask,
+  updateCollaborationTask,
   waitForCollaborationTaskResult,
 } from "../src/mcp/collaborationTaskRuntime";
 import {
   DELEGATED_TASK_VERSION,
   delegatedTaskClaimItemId,
   delegatedTaskConversationKey,
+  delegatedTaskEventItemId,
   findDelegatedTask,
   isDelegatedTaskBoundToConversation,
   isDelegatedTaskConversationId,
@@ -19,6 +22,16 @@ import {
 } from "../src/shared/collaborationTasks";
 
 const SESSION_ID = "profile-collaboration";
+
+test("long delegated task event IDs remain bounded and collision resistant", () => {
+  const taskId = `task_${"a".repeat(120)}`;
+  const first = delegatedTaskEventItemId(taskId, `evt_${"b".repeat(79)}1`);
+  const second = delegatedTaskEventItemId(taskId, `evt_${"b".repeat(79)}2`);
+
+  assert.equal(first.length, 200);
+  assert.equal(second.length, 200);
+  assert.notEqual(first, second);
+});
 
 test("delegated tasks deduplicate by taskId and reject conflicting reuse", () => {
   const hub = createHubWithTarget();
@@ -469,6 +482,121 @@ test("a fresh unclaimed delegation cannot be cancelled without acceptance", () =
       ),
     (error: unknown) =>
       error instanceof ExecutionBrokerError && error.code === "ROLE_FORBIDDEN",
+  );
+});
+
+test("collaboration task V2 appends idempotent progress and evidence events", () => {
+  const hub = createHubWithTarget();
+  delegateCollaborationTask(delegateArgs(), SESSION_ID, "codex", hub);
+  claimCollaborationTask(
+    { taskId: "task_abcdefgh", resume: false, conversationId: "chat-events" },
+    SESSION_ID,
+    "sidepanel",
+    hub,
+  );
+
+  const progress = updateCollaborationTask(
+    {
+      taskId: "task_abcdefgh",
+      eventId: "evt_progress01",
+      eventType: "progress",
+      message: "Observed the form.",
+      progress: 40,
+      conversationId: "chat-events",
+    },
+    SESSION_ID,
+    "sidepanel",
+    "extension_agent",
+    hub,
+  );
+  const duplicate = updateCollaborationTask(
+    {
+      taskId: "task_abcdefgh",
+      eventId: "evt_progress01",
+      eventType: "progress",
+      message: "Observed the form.",
+      progress: 40,
+      conversationId: "chat-events",
+    },
+    SESSION_ID,
+    "sidepanel-reconnected",
+    "extension_agent",
+    hub,
+  );
+  updateCollaborationTask(
+    {
+      taskId: "task_abcdefgh",
+      eventId: "evt_evidence01",
+      eventType: "evidence",
+      message: "Attached the bounded issue bundle.",
+      artifactUris: ["ai-devtools://artifact/evidence-1"],
+    },
+    SESSION_ID,
+    "codex",
+    "mcp_agent",
+    hub,
+  );
+
+  assert.equal(progress.data.deduplicated, false);
+  assert.equal(duplicate.data.deduplicated, true);
+  const task = findDelegatedTask(
+    hub.snapshot(SESSION_ID).collaborationWorkspace,
+    "task_abcdefgh",
+  );
+  assert.equal(task?.events.length, 2);
+  assert.equal(task?.events[0]?.content.progress, 40);
+  assert.deepEqual(task?.events[1]?.content.artifactUris, [
+    "ai-devtools://artifact/evidence-1",
+  ]);
+  assert.throws(
+    () =>
+      updateCollaborationTask(
+        {
+          taskId: "task_abcdefgh",
+          eventId: "evt_progress01",
+          eventType: "progress",
+          message: "Conflicting event content.",
+          progress: 80,
+          conversationId: "chat-events",
+        },
+        SESSION_ID,
+        "sidepanel",
+        "extension_agent",
+        hub,
+      ),
+    (error: unknown) =>
+      error instanceof ExecutionBrokerError &&
+      error.code === "IDEMPOTENCY_CONFLICT",
+  );
+});
+
+test("Codex can durably cancel pending delegated work", async () => {
+  const hub = createHubWithTarget();
+  delegateCollaborationTask(delegateArgs(), SESSION_ID, "codex", hub);
+  const waiting = waitForCollaborationTaskResult(
+    "task_abcdefgh",
+    SESSION_ID,
+    new AbortController().signal,
+    hub,
+  );
+
+  cancelCollaborationTask(
+    {
+      taskId: "task_abcdefgh",
+      reason: "The parent Codex task was cancelled.",
+    },
+    SESSION_ID,
+    "codex",
+    hub,
+  );
+
+  assert.equal((await waiting).status, "cancelled");
+  assert.equal(
+    findDelegatedTask(
+      hub.snapshot(SESSION_ID).collaborationWorkspace,
+      "task_abcdefgh",
+    )?.phase,
+    "cancelled",
   );
 });
 

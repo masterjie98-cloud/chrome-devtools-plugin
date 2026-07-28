@@ -7,6 +7,7 @@ import {
   MAX_AGENT_TOOL_BATCH_SIZE,
 } from "../src/sidepanel/services/agentExecutionStrategy";
 import {
+  getAgentToolPreExecutionFailure,
   isAgentToolResultDefinitelyNotExecuted,
   isSuccessfulAgentToolResultContent,
 } from "../src/sidepanel/services/agentToolResult";
@@ -98,6 +99,29 @@ test("tool result success classification rejects failed and skipped states", () 
       '{"error":"MCP tool connection closed before a result was returned."}',
     ),
     false,
+  );
+  assert.deepEqual(
+    getAgentToolPreExecutionFailure(
+      '{"error":"browser_click arguments invalid: selector or target is required."}',
+    ),
+    {
+      kind: "invalid_arguments",
+      message:
+        "browser_click arguments invalid: selector or target is required.",
+      retryAfterProgress: false,
+    },
+  );
+  assert.equal(
+    isAgentToolResultDefinitelyNotExecuted(
+      '{"error":"TOOL_FAILED: FRAME_UNAVAILABLE: no accessible content frame has registered for the selected tab."}',
+    ),
+    true,
+  );
+  assert.equal(
+    getAgentToolPreExecutionFailure(
+      '{"error":"TOOL_FAILED: FRAME_UNAVAILABLE: no accessible content frame has registered for the selected tab."}',
+    )?.retryAfterProgress,
+    true,
   );
 });
 

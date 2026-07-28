@@ -34,6 +34,55 @@ export interface ChatWorkspaceState {
   conversations: StoredChatConversation[];
 }
 
+export function conversationSearchText(
+  conversation: StoredChatConversation,
+): string {
+  return [
+    conversation.title,
+    conversation.draft,
+    ...conversation.messages.map((message) => message.content),
+  ]
+    .join("\n")
+    .toLocaleLowerCase();
+}
+
+export function exportStoredConversation(
+  conversation: StoredChatConversation,
+  format: "markdown" | "json",
+): string {
+  if (format === "json") {
+    return JSON.stringify(
+      {
+        version: "ai-devtools-conversation-export-v1",
+        exportedAt: new Date().toISOString(),
+        conversation,
+      },
+      null,
+      2,
+    );
+  }
+  const lines = [
+    `# ${conversation.title}`,
+    "",
+    `- Created: ${conversation.createdAt}`,
+    `- Updated: ${conversation.updatedAt}`,
+    ...(conversation.forkedFromConversationId
+      ? [`- Forked from: ${conversation.forkedFromConversationId}`]
+      : []),
+    "",
+    ...conversation.messages.flatMap((message) => [
+      `## ${message.role === "user" ? "用户" : "插件 AI"}`,
+      "",
+      message.content,
+      "",
+    ]),
+    ...(conversation.draft
+      ? ["## 未发送草稿", "", conversation.draft, ""]
+      : []),
+  ];
+  return lines.join("\n").trimEnd();
+}
+
 export function createEmptyChatWorkspace(): ChatWorkspaceState {
   return { version: 1, conversations: [] };
 }

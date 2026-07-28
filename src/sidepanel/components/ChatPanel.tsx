@@ -17,6 +17,7 @@ import {
   GlobalOutlined,
   HistoryOutlined,
   InboxOutlined,
+  LeftOutlined,
   PictureOutlined,
   RedoOutlined,
   RightOutlined,
@@ -42,7 +43,9 @@ import type { ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createMessageId } from "../../shared/messaging";
 import type { ToolName } from "../../shared/tools";
+import type { BrowserTargetTab } from "../../shared/dom";
 import type { DelegatedTaskSnapshot } from "../../shared/collaborationTasks";
+import type { ActiveTabSnapshot } from "../../shared/wsProtocol";
 import {
   formatAgentRunBudgetAmount,
   type AgentRunBudgetExtensionDecision,
@@ -59,6 +62,7 @@ import type {
   ChatConversationSummary,
   ChatMessage,
   ChatSendMode,
+  ExecutionTaskBinding,
   PendingToolApproval,
   QueuedChatSubmission,
 } from "../types";
@@ -79,10 +83,13 @@ interface ChatPanelProps {
   };
   contextLabel: string;
   streamingMessageId?: string;
-  pendingToolApproval?: PendingToolApproval | null;
+  pendingToolApprovals: PendingToolApproval[];
   pendingBudgetExtension?: AgentRunBudgetExtensionRequest | null;
   executionApprovalMode: ExecutionApprovalMode;
-  executionApprovalOrigin?: string;
+  executionApprovalScopeLabel?: string;
+  activeExecutionBinding?: ExecutionTaskBinding;
+  selectedToolTarget?: ActiveTabSnapshot;
+  foregroundTab?: BrowserTargetTab;
   queuedMessages: QueuedChatSubmission[];
   delegatedTasks: DelegatedTaskSnapshot[];
   delegatedInboxTasks: DelegatedTaskSnapshot[];
@@ -114,11 +121,15 @@ interface ChatPanelProps {
     sourceDraft: string,
   ) => boolean;
   onDraftChange: (value: string) => void;
-  onResolveToolApproval: (decision: ToolApprovalDecision) => void;
+  onResolveToolApproval: (
+    approvalId: string,
+    decision: ToolApprovalDecision,
+  ) => void;
   onResolveBudgetExtension: (
     decision: AgentRunBudgetExtensionDecision,
   ) => void;
   onChangeExecutionApprovalMode: (mode: ExecutionApprovalMode) => void;
+  onFocusExecutionTarget: (tabId: number) => void;
   onReadPage: () => void;
   onPickElement: () => void;
   onCancelElementPick: () => void;
@@ -143,10 +154,13 @@ export function ChatPanel({
   permissions,
   contextLabel,
   streamingMessageId,
-  pendingToolApproval,
+  pendingToolApprovals,
   pendingBudgetExtension,
   executionApprovalMode,
-  executionApprovalOrigin,
+  executionApprovalScopeLabel,
+  activeExecutionBinding,
+  selectedToolTarget,
+  foregroundTab,
   queuedMessages,
   delegatedTasks,
   delegatedInboxTasks,
@@ -172,6 +186,7 @@ export function ChatPanel({
   onResolveToolApproval,
   onResolveBudgetExtension,
   onChangeExecutionApprovalMode,
+  onFocusExecutionTarget,
   onReadPage,
   onPickElement,
   onCancelElementPick,
@@ -187,7 +202,9 @@ export function ChatPanel({
   const [composerFocused, setComposerFocused] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string>();
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyQuery, setHistoryQuery] = useState("");
   const [delegatedInboxOpen, setDelegatedInboxOpen] = useState(false);
+  const [activeApprovalId, setActiveApprovalId] = useState<string>();
   const [editingMessageId, setEditingMessageId] = useState<string>();
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -225,6 +242,20 @@ export function ChatPanel({
     }
   }, [delegatedInboxTasks.length]);
 
+  const latestApprovalId =
+    pendingToolApprovals[pendingToolApprovals.length - 1]?.id;
+  useEffect(() => {
+    setActiveApprovalId(latestApprovalId);
+  }, [latestApprovalId]);
+
+  const activeApprovalIndex = Math.max(
+    0,
+    pendingToolApprovals.findIndex(
+      (approval) => approval.id === activeApprovalId,
+    ),
+  );
+  const activeApproval = pendingToolApprovals[activeApprovalIndex];
+
   const handleScroll = () => {
     const container = scrollRef.current;
     if (!container) {
@@ -259,6 +290,22 @@ export function ChatPanel({
     }
   };
 
+  const copyText = async (copyId: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedMessageId(copyId);
+      if (copyResetTimerRef.current) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+      copyResetTimerRef.current = window.setTimeout(
+        () => setCopiedMessageId(undefined),
+        1600,
+      );
+    } catch {
+      onAttachmentRejected("复制失败，请手动选择内容。");
+    }
+  };
+
   const copyDelegatedTask = async (task: DelegatedTaskSnapshot) => {
     try {
       await navigator.clipboard.writeText(formatDelegatedTaskClipboard(task));
@@ -278,6 +325,13 @@ export function ChatPanel({
   const composerBlocked = busy && !agentBusy;
   const hasDraft = Boolean(draftValue.trim() || attachments.length);
   const shortcutState = getChatShortcutState(agentBusy, runningTool);
+  const filteredConversations = useMemo(() => {
+    const query = historyQuery.trim().toLocaleLowerCase();
+    if (!query) return conversations;
+    return conversations.filter((conversation) =>
+      conversation.searchText.includes(query),
+    );
+  }, [conversations, historyQuery]);
 
   const submit = (mode?: ChatSendMode) => {
     if (composerBlocked) {
@@ -460,7 +514,16 @@ export function ChatPanel({
                 。请使用工具的分页或 cursor 参数继续读取。
               </div>
             ) : null}
-            <ToolResultViewport content={message.content} />
+            {message.toolName === "browser_capture_issue_evidence" ? (
+              <IssueEvidenceWorkbench
+                content={message.content}
+                copiedId={copiedMessageId}
+                messageId={message.id}
+                onCopy={copyText}
+              />
+            ) : (
+              <ToolResultViewport content={message.content} />
+            )}
           </div>
         ) : null}
       </div>
@@ -469,7 +532,8 @@ export function ChatPanel({
 
   return (
     <div className="chat-panel">
-      <div className="chat-status-row">
+      <div className="chat-top-stack">
+        <div className="chat-status-row">
         <Tag color={agentBusy ? "processing" : aiConfigured ? "green" : "orange"}>
           {agentBusy
             ? `AI 回复中${queuedMessages.length ? ` · 待发送 ${queuedMessages.length}` : ""}`
@@ -531,6 +595,31 @@ export function ChatPanel({
             />
           </Tooltip>
         </div>
+        </div>
+        {activeExecutionBinding ? (
+          <ExecutionTargetBar
+            target={activeExecutionBinding.target}
+            mode="task"
+            foregroundTab={foregroundTab}
+            queuedCount={queuedMessages.length}
+            onFocus={onFocusExecutionTarget}
+          />
+        ) : selectedToolTarget?.tabId !== undefined &&
+          selectedToolTarget.tabId !== foregroundTab?.id ? (
+          <ExecutionTargetBar
+            target={{
+              tabId: selectedToolTarget.tabId,
+              windowId: selectedToolTarget.windowId,
+              targetId: selectedToolTarget.targetId,
+              title: selectedToolTarget.title,
+              url: selectedToolTarget.url,
+            }}
+            mode="tool"
+            foregroundTab={foregroundTab}
+            queuedCount={0}
+            onFocus={onFocusExecutionTarget}
+          />
+        ) : null}
       </div>
 
       <div className="chat-permission-row">
@@ -693,15 +782,61 @@ export function ChatPanel({
             onResolve={onResolveBudgetExtension}
           />
         ) : null}
-        {pendingToolApproval ? (
-          <ToolApprovalCard
-            approval={pendingToolApproval}
-            onResolve={onResolveToolApproval}
-          />
+        {activeApproval ? (
+          <div className="tool-approval-stack">
+            {pendingToolApprovals.length > 1 ? (
+              <div
+                className="tool-approval-queue-nav"
+                role="status"
+                aria-live="polite"
+              >
+                <span>
+                  待审批 {pendingToolApprovals.length} 条
+                  <Typography.Text type="secondary">
+                    {activeApprovalIndex + 1} / {pendingToolApprovals.length}
+                  </Typography.Text>
+                </span>
+                <div className="tool-approval-queue-actions">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<LeftOutlined />}
+                    disabled={activeApprovalIndex === 0}
+                    onClick={() =>
+                      setActiveApprovalId(
+                        pendingToolApprovals[activeApprovalIndex - 1]?.id,
+                      )
+                    }
+                    aria-label="查看上一条审批"
+                  />
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<RightOutlined />}
+                    disabled={
+                      activeApprovalIndex >= pendingToolApprovals.length - 1
+                    }
+                    onClick={() =>
+                      setActiveApprovalId(
+                        pendingToolApprovals[activeApprovalIndex + 1]?.id,
+                      )
+                    }
+                    aria-label="查看下一条审批"
+                  />
+                </div>
+              </div>
+            ) : null}
+            <ToolApprovalCard
+              approval={activeApproval}
+              onResolve={(decision) =>
+                onResolveToolApproval(activeApproval.id, decision)
+              }
+            />
+          </div>
         ) : null}
         <ExecutionApprovalModeBar
           mode={executionApprovalMode}
-          origin={executionApprovalOrigin}
+          scopeLabel={executionApprovalScopeLabel}
           onChange={onChangeExecutionApprovalMode}
         />
         <div className={`chat-composer ${composerFocused ? "chat-composer-focused" : ""}`}>
@@ -733,6 +868,11 @@ export function ChatPanel({
                     {submission.input || "仅图片消息"}
                     {submission.attachments.length
                       ? ` · ${submission.attachments.length} 张图片`
+                      : ""}
+                    {submission.executionBinding
+                      ? ` · ${formatTaskTargetHost(
+                          submission.executionBinding.target.url,
+                        ) ?? `Tab ${submission.executionBinding.target.tabId}`}`
                       : ""}
                   </span>
                   <Tooltip title="下一条立即发送">
@@ -964,9 +1104,17 @@ export function ChatPanel({
         <Typography.Paragraph type="secondary" className="chat-history-note">
           仅保存在当前 Chrome Profile。工具原始结果、运行状态和图片不会写入历史。
         </Typography.Paragraph>
+        <Input
+          allowClear
+          value={historyQuery}
+          onChange={(event) => setHistoryQuery(event.target.value)}
+          placeholder="搜索标题、消息或草稿"
+          aria-label="搜索本地对话"
+          className="chat-history-search"
+        />
         {conversations.length ? (
           <div className="chat-history-list">
-            {conversations.map((conversation) => {
+            {filteredConversations.map((conversation) => {
               const active = conversation.id === activeConversationId;
               return (
                 <div
@@ -990,9 +1138,40 @@ export function ChatPanel({
                       {conversation.forked ? " · 分支" : ""}
                     </span>
                   </button>
-                  {active ? (
-                    <Tag color="blue">当前</Tag>
-                  ) : (
+                  <div className="chat-history-actions">
+                    {active ? <Tag color="blue">当前</Tag> : null}
+                    <Tooltip title="导出 Markdown">
+                      <Button
+                        size="small"
+                        type="text"
+                        icon={<DownloadOutlined />}
+                        onClick={() =>
+                          downloadTextFile(
+                            conversation.exportMarkdown,
+                            `${conversation.title}.md`,
+                            "text/markdown;charset=utf-8",
+                          )
+                        }
+                        aria-label={`导出对话 ${conversation.title} 为 Markdown`}
+                      />
+                    </Tooltip>
+                    <Tooltip title="导出 JSON">
+                      <Button
+                        size="small"
+                        type="text"
+                        onClick={() =>
+                          downloadTextFile(
+                            conversation.exportJson,
+                            `${conversation.title}.json`,
+                            "application/json;charset=utf-8",
+                          )
+                        }
+                        aria-label={`导出对话 ${conversation.title} 为 JSON`}
+                      >
+                        JSON
+                      </Button>
+                    </Tooltip>
+                    {!active ? (
                     <Popconfirm
                       title="删除这条本地对话？"
                       description="只删除扩展本地保存的文本历史。"
@@ -1009,10 +1188,17 @@ export function ChatPanel({
                         aria-label={`删除对话 ${conversation.title}`}
                       />
                     </Popconfirm>
-                  )}
+                    ) : null}
+                  </div>
                 </div>
               );
             })}
+            {filteredConversations.length === 0 ? (
+              <Empty
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description="没有匹配的对话"
+              />
+            ) : null}
           </div>
         ) : (
           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无本地对话" />
@@ -1028,7 +1214,17 @@ function formatDelegatedTaskClipboard(task: DelegatedTaskSnapshot): string {
         .map((criterion) => `- ${criterion}`)
         .join("\n")}`
     : "";
-  return `${task.requestItem.title}\n\n${task.request.instruction}${criteria}`;
+  const events = task.events.length
+    ? `\n\n进度记录：\n${task.events
+        .map(
+          ({ content }) =>
+            `- [${content.eventType}] ${content.message}${
+              content.progress !== undefined ? ` (${content.progress}%)` : ""
+            }`,
+        )
+        .join("\n")}`
+    : "";
+  return `${task.requestItem.title}\n\n${task.request.instruction}${criteria}${events}`;
 }
 
 function RetryMessageAction({
@@ -1322,13 +1518,84 @@ function ToolApprovalCard({
   );
 }
 
+function ExecutionTargetBar({
+  target,
+  mode,
+  foregroundTab,
+  queuedCount,
+  onFocus,
+}: {
+  target: ExecutionTaskBinding["target"];
+  mode: "task" | "tool";
+  foregroundTab?: BrowserTargetTab;
+  queuedCount: number;
+  onFocus: (tabId: number) => void;
+}) {
+  const viewingAnotherTab =
+    foregroundTab?.id !== undefined &&
+    foregroundTab.id !== target.tabId;
+  const taskTitle =
+    target.title?.trim() ||
+    formatTaskTargetHost(target.url) ||
+    `Tab ${target.tabId}`;
+  const foregroundTitle =
+    foregroundTab?.title?.trim() ||
+    formatTaskTargetHost(foregroundTab?.url) ||
+    (foregroundTab?.id ? `Tab ${foregroundTab.id}` : undefined);
+
+  return (
+    <section
+      className="execution-target-bar"
+      aria-label={mode === "task" ? "运行中任务目标页" : "工具调用目标页"}
+    >
+      <span className="execution-target-icon" aria-hidden="true">
+        <AimOutlined />
+      </span>
+      <span className="execution-target-copy">
+        <strong title={taskTitle}>
+          {mode === "task" ? "后台执行" : "工具目标"} · {taskTitle}
+        </strong>
+        <span>
+          {viewingAnotherTab
+            ? mode === "task"
+              ? `当前浏览：${foregroundTitle}；新消息将作为独立任务排队到此页`
+              : `当前浏览：${foregroundTitle}；后续工具调用仍发送到此页`
+            : `任务固定在 Tab ${target.tabId}${
+                queuedCount ? ` · 队列 ${queuedCount}` : ""
+              }`}
+        </span>
+      </span>
+      {viewingAnotherTab ? (
+        <Button
+          size="small"
+          onClick={() => onFocus(target.tabId)}
+          aria-label={`返回${mode === "task" ? "运行中的任务" : "工具目标"}页面 ${taskTitle}`}
+        >
+          返回
+        </Button>
+      ) : null}
+    </section>
+  );
+}
+
+function formatTaskTargetHost(url: string | undefined): string | undefined {
+  if (!url) {
+    return undefined;
+  }
+  try {
+    return new URL(url).host;
+  } catch {
+    return undefined;
+  }
+}
+
 function ExecutionApprovalModeBar({
   mode,
-  origin,
+  scopeLabel,
   onChange,
 }: {
   mode: ExecutionApprovalMode;
-  origin?: string;
+  scopeLabel?: string;
   onChange: (mode: ExecutionApprovalMode) => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1353,7 +1620,7 @@ function ExecutionApprovalModeBar({
     {
       key: "full",
       title: "完全访问权限",
-      description: "当前聊天与当前域名内不再逐次询问",
+      description: "绑定当前聊天和目标 Tab，跨域登录不重置",
       icon: <GlobalOutlined />,
     },
   ];
@@ -1398,7 +1665,7 @@ function ExecutionApprovalModeBar({
             <span className="execution-approval-mode-scope">
               {mode === "ask"
                 ? active.description
-                : `${origin ?? "当前页面"} · 当前聊天`}
+                : `${scopeLabel ?? "当前页面"} · 当前聊天`}
             </span>
           </span>
         </span>
@@ -1526,6 +1793,89 @@ const TOOL_RESULT_VIRTUAL_LINE_THRESHOLD = 240;
 const TOOL_RESULT_LINE_HEIGHT = 19;
 const TOOL_RESULT_VIEWPORT_HEIGHT = 342;
 const TOOL_RESULT_OVERSCAN_LINES = 12;
+
+function IssueEvidenceWorkbench({
+  content,
+  copiedId,
+  messageId,
+  onCopy,
+}: {
+  content: string;
+  copiedId?: string;
+  messageId: string;
+  onCopy: (copyId: string, value: string) => Promise<void>;
+}) {
+  const parsed = parseJsonObject(content);
+  const timeline = Array.isArray(parsed?.timeline)
+    ? parsed.timeline.filter(
+        (entry): entry is Record<string, unknown> =>
+          typeof entry === "object" && entry !== null && !Array.isArray(entry),
+      )
+    : [];
+  const exportValue =
+    parsed?.export &&
+    typeof parsed.export === "object" &&
+    !Array.isArray(parsed.export)
+      ? (parsed.export as Record<string, unknown>)
+      : {};
+  const markdown =
+    typeof exportValue.markdown === "string" ? exportValue.markdown : "";
+  const markdownCopyId = `${messageId}:markdown`;
+  const jsonCopyId = `${messageId}:json`;
+
+  if (!parsed || timeline.length === 0) {
+    return <ToolResultViewport content={content} />;
+  }
+
+  return (
+    <div className="issue-evidence-workbench">
+      <div className="issue-evidence-summary">
+        <div>
+          <strong>{String(parsed.title ?? "问题证据包")}</strong>
+          <span>{String(parsed.workflowStatus ?? "unknown")}</span>
+        </div>
+        <div className="issue-evidence-actions">
+          <Button
+            size="small"
+            onClick={() => void onCopy(markdownCopyId, markdown)}
+            disabled={!markdown}
+          >
+            {copiedId === markdownCopyId ? "Markdown 已复制" : "复制 Markdown"}
+          </Button>
+          <Button
+            size="small"
+            onClick={() => void onCopy(jsonCopyId, content)}
+          >
+            {copiedId === jsonCopyId ? "JSON 已复制" : "复制 JSON"}
+          </Button>
+        </div>
+      </div>
+      <ol className="issue-evidence-timeline">
+        {timeline.map((entry, index) => (
+          <li key={`${String(entry.id ?? entry.type ?? "event")}:${index}`}>
+            <span
+              className={`issue-evidence-dot is-${String(
+                entry.status ?? "unknown",
+              )}`}
+              aria-hidden="true"
+            />
+            <div>
+              <strong>{String(entry.label ?? entry.type ?? "事件")}</strong>
+              <span>{String(entry.status ?? "unknown")}</span>
+              {typeof entry.detail === "string" ? (
+                <p>{entry.detail}</p>
+              ) : null}
+            </div>
+          </li>
+        ))}
+      </ol>
+      <details className="issue-evidence-raw">
+        <summary>查看原始证据 JSON</summary>
+        <ToolResultViewport content={content} />
+      </details>
+    </div>
+  );
+}
 
 function ToolResultViewport({ content }: { content: string }) {
   const lines = useMemo(() => content.split("\n"), [content]);
@@ -1676,6 +2026,36 @@ function DelegatedTaskCard({
             </ul>
           </div>
         ) : null}
+        {task.events.length ? (
+          <div className="delegated-task-events" aria-label="委托任务进度">
+            <span className="delegated-task-criteria-label">协作进度</span>
+            {task.events.map(({ item, content }) => (
+              <div className="delegated-task-event" key={item.id}>
+                <div className="delegated-task-event-heading">
+                  <span>{delegatedTaskEventLabel(content.eventType)}</span>
+                  {content.progress !== undefined ? (
+                    <span>{Math.round(content.progress)}%</span>
+                  ) : null}
+                </div>
+                <div>{content.message}</div>
+                {content.requirements?.length ? (
+                  <ul>
+                    {content.requirements.map((requirement) => (
+                      <li key={requirement}>{requirement}</li>
+                    ))}
+                  </ul>
+                ) : null}
+                {content.artifactUris?.length ? (
+                  <div className="delegated-task-artifacts">
+                    {content.artifactUris.map((uri) => (
+                      <code key={uri}>{uri}</code>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
         {isInterrupted ? (
           <div className="delegated-task-notice is-warning">
             上次运行已中断。恢复时会先重新观察页面，不会自动重放结果未知的写操作。
@@ -1732,6 +2112,17 @@ function DelegatedTaskCard({
   );
 }
 
+function delegatedTaskEventLabel(
+  eventType: DelegatedTaskSnapshot["events"][number]["content"]["eventType"],
+): string {
+  return {
+    progress: "进度",
+    clarification: "澄清问题",
+    requirement: "追加要求",
+    evidence: "证据附件",
+  }[eventType];
+}
+
 function PermissionSwitch({
   icon,
   label,
@@ -1773,6 +2164,22 @@ function downloadDataUrl(dataUrl: string, filename: string): void {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
+}
+
+function downloadTextFile(
+  content: string,
+  filename: string,
+  mimeType: string,
+): void {
+  const url = URL.createObjectURL(new Blob([content], { type: mimeType }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = sanitizeDownloadName(filename);
+  anchor.rel = "noreferrer";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function sanitizeDownloadName(filename: string): string {

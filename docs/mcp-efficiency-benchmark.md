@@ -346,3 +346,74 @@ npm run verify:workflow-evidence -- \
    顶层 CDP 树缺失时只按唯一活跃 URL 关联；重复 sibling URL 继续失败关闭；
 4. 扩展重新加载后，已打开页面必须刷新才能重新注册 content scripts。这是开发态
    装载前置条件，不计入运行时任务性能。
+
+## 2026-07-27 增量诊断链路真实验收
+
+本轮继续使用 8765 顶层 fixture、8766 跨源 child fixture，并新增同源
+same-process iframe 与固定诊断请求。它是正确性回归，不是新的性能样本，因此不
+复用旧中位数或补造 P95。
+
+- 三端兼容身份一致：`0.1.0+ws8 / 3fd82d5a`。
+- Smart Profile 实际暴露 20 个任务工具；当前打包 adapter 总计暴露 84 个 MCP 工具。回归
+  过程中发现并修复了“工具已实现但未进入公共暴露顺序表”的注册缺陷。
+- `resources/subscribe` 收到活动资源的 `resources/updated` 通知；一次资源读取
+  包含 `console`、`dom`、`navigation`、`network` 四类有序增量事件，无需轮询。
+- 固定按钮触发的 `/activity-fixture.json` 请求被关联到动作
+  `activity-trigger`，置信度为 high；理由同时包含受限动作时间窗和 CDP initiator
+  stack，未把时间邻近伪装成确定因果。
+- 一次观察返回两个可操作 child frame。OOPIF 与 same-process frame 都通过
+  `frameRef + documentId + targetRef` 完成直接输入，独立观察分别验证
+  `direct-frame-value` 与 `same-process-after`。
+- 纯 HTML 按钮的源码定位返回 `matched=true`、`framework=unknown`，证明未在缺少
+  React/Vue 元数据时虚构组件归属。
+- 问题证据包返回 session artifact URI；JSON manifest 不包含 inline data URL，
+  截图仍作为独立受限 artifact 保存。
+- 自动化最终为 338/338 通过；TypeScript、生产构建和 diff whitespace 检查通过。
+
+### 下一批高收益能力（当前实现状态）
+
+1. **CSS 级解释已实现 V2。** `browser_explain_css` 返回 matched rules、computed
+   values、CSS 变量、box model、生成样式表来源，以及同源可读样式表的原始
+   source-map sources；React/Vue/JavaScript 归属继续由
+   `browser_locate_source` 负责。
+2. **最小复现协议已实现 V1。** 配方写入 session artifact，重放前校验 URL，重新
+   走审批和 execution grant；未知状态写操作不自动重放。
+3. **本地工作区源码桥已实现 V1。** `browser_find_workspace_source` 只扫描
+   `AI_DEVTOOLS_WORKSPACE_ROOTS` 或 adapter cwd，限制 5,000 文件、512 KiB/文件和
+   50 个结果，可选返回 1,500 字符 excerpt。
+4. **性能诊断已实现 V2。** 返回 Navigation/Resource Timing、buffered LCP、
+   layout shift、Long Task、bounded interaction/INP 和 trace summary；动作到
+   Network/组件/源码的因果关联仍由 activity correlation 单独给出置信度。
+5. **实时应用摘要已实现 V1。** 返回无正文的 WebSocket/SSE 计数、Service Worker
+   元数据和 IndexedDB schema；现有订阅资源仍负责 DOM/Network/Console 增量。
+6. **状态化 Mock 已实现。** 现有代理规则支持最多 50 个响应步骤、
+   `hold-last/loop`、持久化游标/命中数与显式 reset。
+
+当前自动化为 370/370，生产构建和 86-tool 打包进程验证通过。
+
+## 2026-07-28 Diagnostic Automation V3 真实验收
+
+在刷新后的 8765 顶层 fixture、跨源 OOPIF 和同源 same-process iframe 上，
+`verify:workflow-evidence` 最终返回 `"ok": true`。本轮仍是正确性验收，不把人工
+审批耗时写成浏览器执行性能，也不补造中位数或 P95。
+
+- 三端兼容身份一致：`0.1.0+ws8 / 91428723`。
+- 四动作 `browser_workflow` 返回四个 post-state，验证通过，并同时返回
+  DOM、URL、Network、Console 四类证据。
+- OOPIF 和 same-process iframe 都以 `frameRef + documentId + targetRef` 完成
+  直接动作并由新观察验证。
+- 相同元素的第二次截图 diff 为 `changed=false`、`changedPixelRatio=0`、
+  `baselineAvailable=true`。
+- 增量活动包含 console、DOM、navigation、network；固定请求的动作因果置信度为
+  high。
+- CSS 解释返回一条匹配规则和 180px box width；未发现原始 CSS source hint，
+  因而没有虚构 source-map 归属。
+- 本地源码桥扫描 212 个受限文件，命中 `src/mcp/workspaceTools.ts`。
+- 可复现配方重放完成且验证通过；性能诊断返回 Navigation/FCP/LCP/Long Task
+  数据；实时摘要返回 IndexedDB 的数据库、版本和 store schema。
+- Stateful Mock 在两次命中后到达 step index 1，验证通过。
+- 问题证据包完成并返回 session artifact URI；截图 diff 没有以内联 data URL
+  混入 structured content。
+
+当前仍明确不读取 WebSocket/SSE 正文和 IndexedDB 值。CSS source map 只解析
+同源可读资源；跨源或无 map 的生产 bundle 会返回空 source hint，不虚构归属。

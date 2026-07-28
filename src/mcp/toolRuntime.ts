@@ -48,6 +48,7 @@ import {
   RUNTIME_BUILD_ID,
   RUNTIME_SCHEMA_HASH,
 } from "../shared/runtimeIdentity";
+import type { ArtifactReference } from "../shared/artifacts";
 
 const noArgSchema = z.object({});
 interface SnapshotReferenceBinding {
@@ -224,6 +225,25 @@ const queryDomSchema = z
         }
       });
     }
+  });
+
+const locateSourceSchema = z
+  .object({
+    ref: z
+      .string()
+      .refine(isSnapshotTargetRef, "invalid snapshot target ref")
+      .optional(),
+    selector: z.string().min(1).optional(),
+    frameRef: z
+      .string()
+      .refine(isSnapshotFrameRef, "invalid snapshot frame ref")
+      .optional(),
+    documentId: z.string().min(1).max(300).optional(),
+    maxDepth: z.number().int().min(1).max(20).optional(),
+    includeSourceExcerpt: z.boolean().optional(),
+  })
+  .refine((value) => Boolean(value.ref) !== Boolean(value.selector), {
+    message: "provide exactly one of ref or selector",
   });
 
 const highlightElementSchema = z.object({
@@ -659,8 +679,16 @@ const workflowObservationSchema = z
 const browserWorkflowSchema = z
   .object({
     observation: workflowObservationSchema.optional(),
+    preconditions: z
+      .object({
+        checks: z.array(verifyCheckSchema).min(1).max(20),
+        onFailure: z.enum(["abort", "skip_actions"]).optional(),
+      })
+      .strict()
+      .optional(),
     actions: actionStageSchema.shape.actions.optional(),
     checks: z.array(verifyCheckSchema).min(1).max(20).optional(),
+    cleanupActions: actionStageSchema.shape.actions.max(10).optional(),
     evidence: z
       .object({
         dom: z.boolean().optional(),
@@ -674,6 +702,55 @@ const browserWorkflowSchema = z
       .optional(),
     stopOnFailure: z.boolean().optional(),
     decisionBarrier: z.boolean().optional(),
+  })
+  .strict();
+
+const captureIssueEvidenceSchema = browserWorkflowSchema
+  .extend({
+    title: z.string().min(1).max(240),
+    description: z.string().max(4_000).optional(),
+    captureScreenshots: z.boolean().optional(),
+  })
+  .strict();
+
+const explainCssSchema = z
+  .object({
+    selector: z.string().min(1),
+    ...frameReferenceShape,
+    properties: z.array(z.string().min(1).max(200)).max(64).optional(),
+    maxRules: z.number().int().min(1).max(200).optional(),
+    includeVariables: z.boolean().optional(),
+  })
+  .strict();
+
+const createReproductionRecipeSchema = z
+  .object({
+    name: z.string().min(1).max(240),
+    description: z.string().max(4_000).optional(),
+    targetUrlPattern: z.string().min(1).max(2_000).optional(),
+    workflow: browserWorkflowSchema,
+  })
+  .strict();
+
+const runReproductionRecipeSchema = z
+  .object({
+    artifactId: z.string().min(1).max(300),
+    requireUrlMatch: z.boolean().optional(),
+  })
+  .strict();
+
+const performanceDiagnosticsSchema = z
+  .object({
+    ...frameReferenceShape,
+    resourceLimit: z.number().int().min(1).max(100).optional(),
+    longTaskLimit: z.number().int().min(1).max(100).optional(),
+  })
+  .strict();
+
+const realtimeActivitySchema = z
+  .object({
+    ...frameReferenceShape,
+    limit: z.number().int().min(1).max(100).optional(),
   })
   .strict();
 
@@ -792,6 +869,14 @@ const networkStartSchema = z.object({
   maxEntries: z.number().int().min(10).max(5000).optional(),
 });
 
+const activityStartSchema = z.object({
+  includeDom: z.boolean().optional(),
+  includeNetwork: z.boolean().optional(),
+  includeConsole: z.boolean().optional(),
+  preserveLog: z.boolean().optional(),
+  maxNetworkEntries: z.number().int().min(10).max(2000).optional(),
+});
+
 const networkListSchema = z.object({
   cursor: z
     .string()
@@ -881,6 +966,36 @@ const proxyRuleSchema = z
     responsePhrase: z.string().min(1).optional(),
     contentType: z.string().min(1).optional(),
     mockStage: z.enum(["request", "response"]).optional(),
+    scenarioSteps: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1).max(200).optional(),
+            responseHeaders: z.array(headerModificationSchema).optional(),
+            responseBody: z.string().optional(),
+            responseBodyBase64: z.string().min(1).optional(),
+            statusCode: z.number().int().min(100).max(599).optional(),
+            responsePhrase: z.string().min(1).optional(),
+            contentType: z.string().min(1).optional(),
+          })
+          .strict()
+          .refine(
+            (step) =>
+              Boolean(
+                step.responseHeaders?.length ||
+                  step.responseBody !== undefined ||
+                  step.responseBodyBase64 ||
+                  step.statusCode !== undefined ||
+                  step.contentType,
+              ),
+            { message: "scenario step requires at least one response action" },
+          ),
+      )
+      .min(1)
+      .max(50)
+      .optional(),
+    scenarioRepeat: z.enum(["hold-last", "loop"]).optional(),
+    resetScenario: z.boolean().optional(),
   })
   .refine(
     (value) =>
@@ -897,7 +1012,8 @@ const proxyRuleSchema = z
           value.responseBody !== undefined ||
           value.responseBodyBase64 ||
           value.statusCode !== undefined ||
-          value.contentType,
+          value.contentType ||
+          value.scenarioSteps?.length,
       ),
     {
       message: "at least one proxy action is required",
@@ -919,7 +1035,11 @@ const removeCssPatchSchema = z.object({
 
 const MCP_TOOL_INPUT_SCHEMA_BASE: Record<McpToolName, ZodTypeAny> = {
   [MCP_TOOL_NAMES.BROWSER_STATUS]: noArgSchema,
+  [MCP_TOOL_NAMES.BROWSER_ACTIVITY_START]: activityStartSchema,
+  [MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP]: noArgSchema,
   [MCP_TOOL_NAMES.BROWSER_WORKFLOW]: browserWorkflowSchema,
+  [MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE]:
+    captureIssueEvidenceSchema,
   [MCP_TOOL_NAMES.BROWSER_OBSERVE]: browserObserveInputSchema,
   [MCP_TOOL_NAMES.BROWSER_ACT]: actionStageSchema,
   [MCP_TOOL_NAMES.BROWSER_VERIFY]: browserVerifySchema,
@@ -932,6 +1052,15 @@ const MCP_TOOL_INPUT_SCHEMA_BASE: Record<McpToolName, ZodTypeAny> = {
   [MCP_TOOL_NAMES.BROWSER_GET_PAGE_CONTEXT]: noArgSchema,
   [MCP_TOOL_NAMES.BROWSER_SNAPSHOT]: semanticSnapshotInputSchema,
   [MCP_TOOL_NAMES.BROWSER_QUERY_DOM]: queryDomSchema,
+  [MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE]: locateSourceSchema,
+  [MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS]: explainCssSchema,
+  [MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE]:
+    createReproductionRecipeSchema,
+  [MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE]:
+    runReproductionRecipeSchema,
+  [MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS]:
+    performanceDiagnosticsSchema,
+  [MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY]: realtimeActivitySchema,
   [MCP_TOOL_NAMES.BROWSER_START_ELEMENT_PICKER]: noArgSchema,
   [MCP_TOOL_NAMES.BROWSER_CANCEL_ELEMENT_PICKER]: noArgSchema,
   [MCP_TOOL_NAMES.BROWSER_HIGHLIGHT_ELEMENT]: highlightElementSchema,
@@ -1049,8 +1178,17 @@ export function runtimeToolsForProfile(
   if (profile === "smart") {
     const smartTools = new Set<McpToolName>([
       MCP_TOOL_NAMES.BROWSER_STATUS,
+      MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
+      MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
       MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+      MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
       MCP_TOOL_NAMES.BROWSER_OBSERVE,
+      MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+      MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS,
+      MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS,
+      MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE,
+      MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE,
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
       MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
@@ -1179,6 +1317,10 @@ export async function executeMcpToolData(
   context: {
     sessionId?: string;
     listAuditEvents?: () => Promise<RedactedAuditEvent[]>;
+    storeJsonArtifact?: (
+      value: unknown,
+    ) => Promise<ArtifactReference>;
+    readJsonArtifact?: (artifactId: string) => Promise<unknown>;
   } = {},
 ): Promise<unknown> {
   const normalizedToolName = normalizeMcpToolName(toolName);
@@ -1193,15 +1335,38 @@ export async function executeMcpToolData(
     pluginBridge,
     context.sessionId,
   );
+  parsedArgs = resolveDirectFrameReference(
+    normalizedToolName,
+    parsedArgs,
+    context.sessionId,
+  );
 
   switch (normalizedToolName) {
     case MCP_TOOL_NAMES.BROWSER_STATUS:
       return readBrowserStatus(context.sessionId);
+    case MCP_TOOL_NAMES.BROWSER_ACTIVITY_START:
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.BROWSER_ACTIVITY_START,
+        args: parsedArgs,
+      });
+    case MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP:
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.BROWSER_ACTIVITY_STOP,
+        args: {},
+      });
     case MCP_TOOL_NAMES.BROWSER_WORKFLOW:
       return executeBrowserWorkflow(
         pluginBridge,
         parsedArgs,
         context.sessionId,
+      );
+    case MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE:
+      return captureIssueEvidenceBundle(
+        pluginBridge,
+        parsedArgs,
+        context,
       );
     case MCP_TOOL_NAMES.BROWSER_OBSERVE:
       return readSemanticSnapshot(
@@ -1250,6 +1415,38 @@ export async function executeMcpToolData(
       return readSemanticSnapshot(pluginBridge, parsedArgs, context.sessionId);
     case MCP_TOOL_NAMES.BROWSER_QUERY_DOM:
       return executeDomQueryRequest(pluginBridge, parsedArgs);
+    case MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE:
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DOM_LOCATE_SOURCE,
+        args: parsedArgs,
+      } as unknown as AnyToolCall);
+    case MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS:
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DOM_EXPLAIN_CSS,
+        args: parsedArgs,
+      } as unknown as AnyToolCall);
+    case MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS:
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.PAGE_PERFORMANCE_DIAGNOSTICS,
+        args: parsedArgs,
+      } as unknown as AnyToolCall);
+    case MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY:
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.PAGE_REALTIME_ACTIVITY,
+        args: parsedArgs,
+      } as unknown as AnyToolCall);
+    case MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE:
+      return createReproductionRecipe(parsedArgs, context);
+    case MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE:
+      return runReproductionRecipe(
+        pluginBridge,
+        parsedArgs,
+        context,
+      );
     case MCP_TOOL_NAMES.BROWSER_START_ELEMENT_PICKER:
       return proxyBrowserTool(pluginBridge, {
         id: createMessageId(),
@@ -1861,10 +2058,21 @@ async function executeBrowserWorkflow(
     const beforeObservation = isRecordValue(before.observation)
       ? before.observation
       : {};
+    const preconditions = isRecordValue(args.preconditions)
+      ? await verifyBrowserState(
+          pluginBridge,
+          {
+            checks: args.preconditions.checks,
+          },
+          sessionId,
+        )
+      : null;
+    const preconditionsPassed =
+      !isRecordValue(preconditions) || preconditions.passed !== false;
     const actions = Array.isArray(args.actions)
       ? (args.actions as Record<string, unknown>[])
       : [];
-    const actionStage = actions.length > 0
+    const actionStage = preconditionsPassed && actions.length > 0
       ? await executeActionStage(pluginBridge, {
           actions,
           stopOnFailure: args.stopOnFailure,
@@ -1873,35 +2081,74 @@ async function executeBrowserWorkflow(
       : {
           version: "action-stage-v1",
           completed: 0,
-          requested: 0,
+          requested: actions.length,
           stoppedAt: null,
           barrierReached: false,
           requiresVerification: false,
           results: [],
+          ...(preconditionsPassed
+            ? {}
+            : {
+                skipped: true,
+                reason: "WORKFLOW_PRECONDITION_FAILED",
+              }),
         };
-    const after = await readSemanticSnapshot(
-      pluginBridge,
-      {
-        ...observation,
-        frameScope: observation.frameScope ?? "auto",
-        ...(typeof beforeObservation.domRevision === "number"
-          ? { sinceRevision: beforeObservation.domRevision }
-          : {}),
-      },
-      sessionId,
-      { compact: true, retryStaleOnce: true },
-    ) as Record<string, unknown>;
+    const cleanupActions = Array.isArray(args.cleanupActions)
+      ? (args.cleanupActions as Record<string, unknown>[])
+      : [];
+    const cleanupStage =
+      preconditionsPassed && cleanupActions.length > 0
+        ? await executeActionStage(pluginBridge, {
+            actions: cleanupActions,
+            stopOnFailure: false,
+            decisionBarrier: false,
+          })
+        : null;
+    let postActionObservationError: string | undefined;
+    let after: Record<string, unknown>;
+    try {
+      after = await readPostActionSemanticSnapshot(
+        pluginBridge,
+        {
+          ...observation,
+          frameScope: observation.frameScope ?? "auto",
+          ...(typeof beforeObservation.domRevision === "number"
+            ? { sinceRevision: beforeObservation.domRevision }
+            : {}),
+        },
+        sessionId,
+      );
+    } catch (error) {
+      postActionObservationError =
+        error instanceof Error ? error.message.slice(0, 1_000) : String(error);
+      after = {
+        version: "browser-post-action-observation-v1",
+        errorCode: "POST_ACTION_OBSERVATION_UNAVAILABLE",
+        error: postActionObservationError,
+        actionOutcome: "preserved_do_not_replay",
+        retryable: true,
+        target: getBrowserStateSnapshot(sessionId).activeTab ?? null,
+      };
+    }
     const checks = Array.isArray(args.checks)
-      ? await verifyBrowserState(
-          pluginBridge,
-          {
-            checks: args.checks,
-            ...(typeof beforeObservation.domRevision === "number"
-              ? { sinceRevision: beforeObservation.domRevision }
-              : {}),
-          },
-          sessionId,
-        )
+      ? postActionObservationError
+        ? {
+            version: "browser-verification-v1",
+            passed: false,
+            skipped: true,
+            reason:
+              "Post-action document was not ready. The completed action was not replayed; observe the current page and verify separately.",
+          }
+        : await verifyBrowserState(
+            pluginBridge,
+            {
+              checks: args.checks,
+              ...(typeof beforeObservation.domRevision === "number"
+                ? { sinceRevision: beforeObservation.domRevision }
+                : {}),
+            },
+            sessionId,
+          )
       : null;
     const afterPage = isRecordValue(after.page) ? after.page : {};
     const afterObservation = isRecordValue(after.observation)
@@ -1924,11 +2171,29 @@ async function executeBrowserWorkflow(
       },
       consoleBefore,
     );
+    const networkEvidence = includeNetwork
+      ? await buildWorkflowNetworkEvidence(
+          pluginBridge,
+          activity.network,
+          actionStage,
+          actions,
+        )
+      : null;
     const completedAt = new Date().toISOString();
     return {
       version: "browser-workflow-v1",
       status:
-        isRecordValue(checks) && checks.passed === false
+        !preconditionsPassed
+          ? args.preconditions &&
+            isRecordValue(args.preconditions) &&
+            args.preconditions.onFailure === "skip_actions"
+            ? "condition_skipped"
+            : "condition_failed"
+        : postActionObservationError
+          ? "verification_unavailable"
+          : isRecordValue(cleanupStage) && cleanupStage.stoppedAt
+            ? "cleanup_failed"
+          : isRecordValue(checks) && checks.passed === false
           ? "verification_failed"
           : actionStage.stoppedAt
             ? "action_stopped"
@@ -1936,7 +2201,9 @@ async function executeBrowserWorkflow(
       startedAt,
       completedAt,
       before,
+      preconditions,
       actions: actionStage,
+      cleanup: cleanupStage,
       verification: checks,
       after,
       evidence: {
@@ -1964,7 +2231,7 @@ async function executeBrowserWorkflow(
         network: includeNetwork
           ? {
               started: networkStart,
-              result: activity.network,
+              result: networkEvidence,
               complete: !isToolDataError(activity.network),
             }
           : null,
@@ -1993,6 +2260,450 @@ async function executeBrowserWorkflow(
   }
 }
 
+// A full navigation can replace the renderer before the extension content
+// frame registers again. Keep the action one-shot, but allow its read-only
+// verification to follow that replacement document for up to 7.85 seconds.
+const POST_ACTION_OBSERVATION_RETRY_DELAYS_MS = [
+  100,
+  250,
+  500,
+  1_000,
+  2_000,
+  4_000,
+] as const;
+
+async function readPostActionSemanticSnapshot(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+  sessionId?: string,
+): Promise<Record<string, unknown>> {
+  let lastError: unknown;
+  for (
+    let attempt = 0;
+    attempt <= POST_ACTION_OBSERVATION_RETRY_DELAYS_MS.length;
+    attempt += 1
+  ) {
+    try {
+      return await readSemanticSnapshot(
+        pluginBridge,
+        args,
+        sessionId,
+        { compact: true, retryStaleOnce: true },
+      ) as Record<string, unknown>;
+    } catch (error) {
+      if (!isTransientPostActionReadError(error)) {
+        throw error;
+      }
+      lastError = error;
+      const delayMs = POST_ACTION_OBSERVATION_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined) {
+        break;
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs);
+      });
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Post-action browser observation did not become ready.");
+}
+
+function isTransientPostActionReadError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  if (error.message.startsWith("EXECUTION_GRANT_INVALID:")) {
+    const fields = error.message
+      .match(/fields=([^)]+)/)?.[1]
+      ?.split(",")
+      .map((field) => field.trim())
+      .filter(Boolean);
+    return Boolean(
+      fields?.length &&
+        fields.every(
+          (field) =>
+            field === "documentId" ||
+            field === "navigationId" ||
+            field === "url",
+        ),
+    );
+  }
+  return (
+    error.message.startsWith("STALE_CONTEXT:") ||
+    error.message.includes("STALE_FRAME:") ||
+    error.message.includes("FRAME_UNAVAILABLE") ||
+    error.message.includes("TARGET_NOT_FOUND")
+  );
+}
+
+async function captureIssueEvidenceBundle(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+  context: {
+    sessionId?: string;
+    storeJsonArtifact?: (value: unknown) => Promise<ArtifactReference>;
+  },
+): Promise<Record<string, unknown>> {
+  if (!context.sessionId) {
+    throw new Error(
+      "EVIDENCE_SESSION_UNBOUND: select a Chrome Profile session before capturing an evidence bundle.",
+    );
+  }
+  const {
+    title,
+    description,
+    captureScreenshots,
+    ...workflowArgs
+  } = args;
+  const shouldCaptureScreenshots = captureScreenshots !== false;
+  const captureScreenshot = (diffAgainst: "previous") =>
+    proxyBrowserTool(pluginBridge, {
+      id: createMessageId(),
+      toolName: TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
+      args: {
+        type: "png",
+        diffAgainst,
+        returnImage: "always",
+      },
+    });
+  const beforeScreenshot = shouldCaptureScreenshots
+    ? await captureScreenshot("previous").catch((error) => ({
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    : null;
+  const workflow = await executeBrowserWorkflow(
+    pluginBridge,
+    workflowArgs,
+    context.sessionId,
+  );
+  const afterScreenshot = shouldCaptureScreenshots
+    ? await captureScreenshot("previous").catch((error) => ({
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    : null;
+  const state = getBrowserStateSnapshot(context.sessionId);
+  const manifest = {
+    version: "browser-issue-evidence-v1",
+    capturedAt: new Date().toISOString(),
+    issue: {
+      title,
+      ...(typeof description === "string" ? { description } : {}),
+    },
+    runtime: {
+      buildId: RUNTIME_BUILD_ID,
+      schemaHash: RUNTIME_SCHEMA_HASH,
+    },
+    session: {
+      sessionId: context.sessionId,
+      target: state.activeTab ?? null,
+    },
+    workflow,
+    screenshots: {
+      before: summarizeEvidenceScreenshot(beforeScreenshot),
+      after: summarizeEvidenceScreenshot(afterScreenshot),
+    },
+    integrity: {
+      screenshotBytesExternalized: true,
+      rawNetworkHeadersIncluded: false,
+      rawNetworkBodiesIncluded: false,
+      rawNetworkQueryValuesIncluded: false,
+    },
+  };
+  const artifact = context.storeJsonArtifact
+    ? await context.storeJsonArtifact(manifest)
+    : undefined;
+  const workflowStatus =
+    typeof workflow.status === "string" ? workflow.status : "unknown";
+  const evidence = isRecordValue(workflow.evidence) ? workflow.evidence : {};
+  const networkEvidence = isRecordValue(evidence.network)
+    ? evidence.network
+    : {};
+  const networkResult = isRecordValue(networkEvidence.result)
+    ? networkEvidence.result
+    : {};
+  const causalLinks = Array.isArray(networkResult.causalLinks)
+    ? networkResult.causalLinks.length
+    : 0;
+  const timeline = buildIssueEvidenceTimeline(workflow);
+  const markdown = formatIssueEvidenceMarkdown({
+    title: String(title),
+    description: typeof description === "string" ? description : undefined,
+    capturedAt: manifest.capturedAt,
+    workflowStatus,
+    causalLinks,
+    timeline,
+    artifactUri: artifact?.uri,
+  });
+  return {
+    version: "browser-issue-evidence-v1",
+    capturedAt: manifest.capturedAt,
+    title,
+    workflowStatus,
+    causalLinkCount: causalLinks,
+    screenshotDiff:
+      isRecordValue(afterScreenshot) &&
+      isRecordValue(afterScreenshot.comparison)
+        ? afterScreenshot.comparison
+        : null,
+    timeline,
+    export: {
+      markdown,
+      jsonArtifactUri: artifact?.uri ?? null,
+    },
+    artifact: artifact ?? null,
+    ...(artifact
+      ? {}
+      : {
+          manifest,
+          warning:
+            "Artifact storage is unavailable on this transport; returning the bounded manifest inline.",
+        }),
+  };
+}
+
+function buildIssueEvidenceTimeline(
+  workflow: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  const timeline: Array<Record<string, unknown>> = [];
+  if (typeof workflow.startedAt === "string") {
+    timeline.push({
+      type: "observation",
+      at: workflow.startedAt,
+      label: "Captured initial DOM, URL, Network and Console baseline",
+      status: "completed",
+    });
+  }
+  const actionStage = isRecordValue(workflow.actions) ? workflow.actions : {};
+  const actionResults = Array.isArray(actionStage.results)
+    ? actionStage.results
+    : [];
+  for (const result of actionResults.slice(0, 40)) {
+    if (!isRecordValue(result) || result.type === "batch_evidence") {
+      continue;
+    }
+    timeline.push({
+      type: "action",
+      id: result.id ?? null,
+      label: result.type ?? "browser action",
+      status: result.status ?? "unknown",
+      at:
+        typeof result.completedAtMs === "number"
+          ? new Date(result.completedAtMs).toISOString()
+          : null,
+      ...(typeof result.error === "string"
+        ? { detail: result.error.slice(0, 1000) }
+        : {}),
+    });
+  }
+  const verification = isRecordValue(workflow.verification)
+    ? workflow.verification
+    : {};
+  if (Array.isArray(verification.checks)) {
+    for (const check of verification.checks.slice(0, 20)) {
+      if (!isRecordValue(check)) continue;
+      timeline.push({
+        type: "verification",
+        id: check.id ?? null,
+        label: check.type ?? "verification check",
+        status: check.passed === true ? "passed" : "failed",
+        at: workflow.completedAt ?? null,
+      });
+    }
+  }
+  if (typeof workflow.completedAt === "string") {
+    timeline.push({
+      type: "summary",
+      at: workflow.completedAt,
+      label: "Evidence capture completed",
+      status: workflow.status ?? "unknown",
+    });
+  }
+  return timeline.slice(0, 64);
+}
+
+function formatIssueEvidenceMarkdown(input: {
+  title: string;
+  description?: string;
+  capturedAt: string;
+  workflowStatus: string;
+  causalLinks: number;
+  timeline: Array<Record<string, unknown>>;
+  artifactUri?: string;
+}): string {
+  const lines = [
+    `# ${input.title.replace(/\r?\n/g, " ")}`,
+    "",
+    input.description?.trim() ?? "",
+    input.description?.trim() ? "" : "",
+    `- Captured at: ${input.capturedAt}`,
+    `- Workflow status: ${input.workflowStatus}`,
+    `- Network causal links: ${input.causalLinks}`,
+    ...(input.artifactUri ? [`- JSON evidence: ${input.artifactUri}`] : []),
+    "",
+    "## Timeline",
+    "",
+    ...input.timeline.map((entry) => {
+      const detail =
+        typeof entry.detail === "string"
+          ? ` — ${entry.detail.replace(/\r?\n/g, " ")}`
+          : "";
+      return `- [${String(entry.status ?? "unknown")}] ${String(
+        entry.label ?? entry.type ?? "event",
+      )}${detail}`;
+    }),
+  ];
+  return lines.filter((line, index) => line || lines[index - 1] !== "").join("\n");
+}
+
+async function createReproductionRecipe(
+  args: Record<string, unknown>,
+  context: {
+    sessionId?: string;
+    storeJsonArtifact?: (value: unknown) => Promise<ArtifactReference>;
+  },
+): Promise<Record<string, unknown>> {
+  if (!context.sessionId) {
+    throw new Error(
+      "RECIPE_SESSION_UNBOUND: select a Chrome Profile session before creating a reproduction recipe.",
+    );
+  }
+  if (!context.storeJsonArtifact) {
+    throw new Error(
+      "RECIPE_STORAGE_UNAVAILABLE: this runtime cannot persist reproduction recipes.",
+    );
+  }
+  const workflow = browserWorkflowSchema.parse(args.workflow);
+  const state = getBrowserStateSnapshot(context.sessionId);
+  const manifest = {
+    version: "browser-reproduction-recipe-v1",
+    createdAt: new Date().toISOString(),
+    name: args.name,
+    ...(typeof args.description === "string"
+      ? { description: args.description }
+      : {}),
+    ...(typeof args.targetUrlPattern === "string"
+      ? { targetUrlPattern: args.targetUrlPattern }
+      : {}),
+    runtime: {
+      buildId: RUNTIME_BUILD_ID,
+      schemaHash: RUNTIME_SCHEMA_HASH,
+    },
+    target: state.activeTab ?? null,
+    workflow,
+  };
+  const artifact = await context.storeJsonArtifact(manifest);
+  return {
+    version: "browser-reproduction-recipe-v1",
+    createdAt: manifest.createdAt,
+    name: args.name,
+    artifact,
+    target: manifest.target,
+    stepCount: Array.isArray(workflow.actions) ? workflow.actions.length : 0,
+    checkCount: Array.isArray(workflow.checks) ? workflow.checks.length : 0,
+  };
+}
+
+async function runReproductionRecipe(
+  pluginBridge: PluginWebSocketServer,
+  args: Record<string, unknown>,
+  context: {
+    sessionId?: string;
+    readJsonArtifact?: (artifactId: string) => Promise<unknown>;
+  },
+): Promise<Record<string, unknown>> {
+  if (!context.sessionId) {
+    throw new Error(
+      "RECIPE_SESSION_UNBOUND: select a Chrome Profile session before running a reproduction recipe.",
+    );
+  }
+  if (!context.readJsonArtifact) {
+    throw new Error(
+      "RECIPE_STORAGE_UNAVAILABLE: this runtime cannot read reproduction recipes.",
+    );
+  }
+  const artifactId = args.artifactId as string;
+  const raw = await context.readJsonArtifact(artifactId);
+  if (!isRecordValue(raw) || raw.version !== "browser-reproduction-recipe-v1") {
+    throw new Error(
+      "RECIPE_INVALID: artifact is not a supported browser reproduction recipe.",
+    );
+  }
+  const workflow = browserWorkflowSchema.parse(raw.workflow);
+  const targetUrlPattern =
+    typeof raw.targetUrlPattern === "string" ? raw.targetUrlPattern : undefined;
+  const state = getBrowserStateSnapshot(context.sessionId);
+  const activeUrl = state.activeTab?.url;
+  if (
+    args.requireUrlMatch !== false &&
+    targetUrlPattern &&
+    (!activeUrl || !matchesWildcardPattern(activeUrl, targetUrlPattern))
+  ) {
+    throw new Error(
+      `RECIPE_TARGET_MISMATCH: active URL does not match ${targetUrlPattern}.`,
+    );
+  }
+  const startedAt = new Date().toISOString();
+  const workflowResult = await executeBrowserWorkflow(
+    pluginBridge,
+    workflow,
+    context.sessionId,
+  );
+  return {
+    version: "browser-reproduction-run-v1",
+    artifactId,
+    name: typeof raw.name === "string" ? raw.name : "Unnamed recipe",
+    startedAt,
+    completedAt: new Date().toISOString(),
+    workflow: workflowResult,
+  };
+}
+
+function matchesWildcardPattern(value: string, pattern: string): boolean {
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`).test(value);
+}
+
+function summarizeEvidenceScreenshot(value: unknown): unknown {
+  if (!isRecordValue(value)) {
+    return value;
+  }
+  if (typeof value.error === "string") {
+    return { error: value.error };
+  }
+  const artifact = isRecordValue(value.artifact) ? value.artifact : undefined;
+  return {
+    capturedAt:
+      typeof value.capturedAt === "string" ? value.capturedAt : undefined,
+    mimeType:
+      typeof value.mimeType === "string" ? value.mimeType : undefined,
+    method: typeof value.method === "string" ? value.method : undefined,
+    width: typeof value.width === "number" ? value.width : undefined,
+    height: typeof value.height === "number" ? value.height : undefined,
+    comparison: isRecordValue(value.comparison)
+      ? value.comparison
+      : undefined,
+    artifact: artifact
+      ? {
+          id: typeof artifact.id === "string" ? artifact.id : undefined,
+          uri: typeof artifact.uri === "string" ? artifact.uri : undefined,
+          mimeType:
+            typeof artifact.mimeType === "string"
+              ? artifact.mimeType
+              : undefined,
+          byteLength:
+            typeof artifact.byteLength === "number"
+              ? artifact.byteLength
+              : undefined,
+          sha256:
+            typeof artifact.sha256 === "string"
+              ? artifact.sha256
+              : undefined,
+        }
+      : null,
+  };
+}
+
 async function readWorkflowActivity(
   pluginBridge: PluginWebSocketServer,
   options: {
@@ -2008,7 +2719,7 @@ async function readWorkflowActivity(
       ? proxyBrowserTool(pluginBridge, {
           id: createMessageId(),
           toolName: TOOL_NAMES.DEBUGGER_NETWORK_LIST,
-          args: { digestOnly: true, limit: options.networkLimit },
+          args: { digestOnly: false, limit: options.networkLimit },
         }).catch((error) => ({
           error: error instanceof Error ? error.message : String(error),
         }))
@@ -2027,6 +2738,271 @@ async function readWorkflowActivity(
     network,
     console: subtractConsoleSnapshot(consoleBefore, consoleAfter),
   };
+}
+
+async function buildWorkflowNetworkEvidence(
+  pluginBridge: PluginWebSocketServer,
+  network: unknown,
+  actionStage: Record<string, unknown>,
+  requestedActions: Record<string, unknown>[],
+): Promise<unknown> {
+  if (!isRecordValue(network) || !Array.isArray(network.requests)) {
+    return network;
+  }
+  const stageResults = Array.isArray(actionStage.results)
+    ? actionStage.results.filter(isRecordValue)
+    : [];
+  const completedActions = stageResults
+    .filter(
+      (result) =>
+        typeof result.id === "string" &&
+        result.status === "completed" &&
+        typeof result.startedAtMs === "number" &&
+        typeof result.completedAtMs === "number",
+    )
+    .map((result) => {
+      const requested = requestedActions.find((action) => action.id === result.id);
+      return {
+        id: result.id as string,
+        type:
+          typeof result.type === "string"
+            ? result.type
+            : typeof requested?.type === "string"
+              ? requested.type
+              : "unknown",
+        selector:
+          typeof requested?.selector === "string"
+            ? requested.selector
+            : undefined,
+        frameId:
+          typeof requested?.frameId === "number"
+            ? requested.frameId
+            : undefined,
+        documentId:
+          typeof requested?.documentId === "string"
+            ? requested.documentId
+            : undefined,
+        startedAtMs: result.startedAtMs as number,
+        completedAtMs: result.completedAtMs as number,
+      };
+    });
+
+  const requests = network.requests
+    .filter(isRecordValue)
+    .slice(0, 100);
+  const links = requests.map((request) => {
+    const requestStartedAt =
+      typeof request.startedWallTimeMs === "number"
+        ? request.startedWallTimeMs
+        : undefined;
+    const candidates =
+      requestStartedAt === undefined
+        ? []
+        : completedActions
+            .filter(
+              (action) =>
+                requestStartedAt >= action.startedAtMs - 100 &&
+                requestStartedAt <= action.completedAtMs + 2_000,
+            )
+            .sort(
+              (left, right) =>
+                Math.abs(requestStartedAt - left.completedAtMs) -
+                Math.abs(requestStartedAt - right.completedAtMs),
+            );
+    const action = candidates[0];
+    const initiatorStack = Array.isArray(request.initiatorStack)
+      ? request.initiatorStack.filter(isRecordValue).slice(0, 12)
+      : [];
+    const initiator = initiatorStack[0];
+    const deltaMs =
+      action && requestStartedAt !== undefined
+        ? requestStartedAt - action.completedAtMs
+        : undefined;
+    return {
+      requestId:
+        typeof request.requestId === "string" ? request.requestId : undefined,
+      method:
+        typeof request.method === "string" ? request.method : undefined,
+      url:
+        typeof request.url === "string"
+          ? sanitizeWorkflowEvidenceUrl(request.url)
+          : undefined,
+      resourceType:
+        typeof request.resourceType === "string"
+          ? request.resourceType
+          : undefined,
+      status: typeof request.status === "number" ? request.status : undefined,
+      failed: request.failed === true,
+      initiatorType:
+        typeof request.initiatorType === "string"
+          ? request.initiatorType
+          : undefined,
+      initiator:
+        initiator &&
+        typeof initiator.url === "string" &&
+        typeof initiator.lineNumber === "number" &&
+        typeof initiator.columnNumber === "number"
+          ? {
+              url: sanitizeWorkflowEvidenceUrl(initiator.url),
+              functionName:
+                typeof initiator.functionName === "string"
+                  ? initiator.functionName.slice(0, 160)
+                  : undefined,
+              lineNumber: initiator.lineNumber,
+              columnNumber: initiator.columnNumber,
+            }
+          : undefined,
+      action: action
+        ? {
+            id: action.id,
+            type: action.type,
+            selector: action.selector,
+            deltaMs,
+          }
+        : undefined,
+      confidence:
+        action && initiator
+          ? Math.abs(deltaMs ?? Number.POSITIVE_INFINITY) <= 500
+            ? "high"
+            : "medium"
+          : action
+            ? "medium"
+            : initiator
+              ? "low"
+              : "unattributed",
+      reason:
+        action && initiator
+          ? "Request started in the bounded post-action window and CDP supplied an initiator stack."
+          : action
+            ? "Request started in the bounded post-action window; no script initiator was available."
+            : initiator
+              ? "CDP supplied a script initiator, but no workflow action window matched."
+              : "Neither a matching action window nor a script initiator was available.",
+      _sourceInput:
+        initiator &&
+        typeof initiator.url === "string" &&
+        typeof initiator.lineNumber === "number" &&
+        typeof initiator.columnNumber === "number"
+          ? {
+              url: initiator.url,
+              lineNumber: initiator.lineNumber,
+              columnNumber: initiator.columnNumber,
+              functionName:
+                typeof initiator.functionName === "string"
+                  ? initiator.functionName
+                  : undefined,
+            }
+          : undefined,
+      _actionInput: action,
+    };
+  });
+
+  const sourceMapLookups = new Map<string, Promise<unknown>>();
+  const componentLookups = new Map<string, Promise<unknown>>();
+  const resolveSourceMap = (input: Record<string, unknown>) => {
+    const key = JSON.stringify(input);
+    const existing = sourceMapLookups.get(key);
+    if (existing) {
+      return existing;
+    }
+    const lookup = proxyBrowserTool(pluginBridge, {
+      id: createMessageId(),
+      toolName: TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE,
+      args: input,
+    } as unknown as AnyToolCall).catch((error) => ({
+      status: "failed",
+      reason: error instanceof Error ? error.message : String(error),
+    }));
+    sourceMapLookups.set(key, lookup);
+    return lookup;
+  };
+  const locateComponent = (action: {
+    selector: string;
+    frameId?: number;
+    documentId?: string;
+  }) => {
+    const input = {
+      selector: action.selector,
+      ...(typeof action.frameId === "number"
+        ? { frameId: action.frameId }
+        : {}),
+      ...(typeof action.documentId === "string"
+        ? { documentId: action.documentId }
+        : {}),
+      maxDepth: 8,
+      includeSourceExcerpt: false,
+    };
+    const key = JSON.stringify(input);
+    const existing = componentLookups.get(key);
+    if (existing) {
+      return existing;
+    }
+    const lookup = proxyBrowserTool(pluginBridge, {
+      id: createMessageId(),
+      toolName: TOOL_NAMES.DOM_LOCATE_SOURCE,
+      args: input,
+    } as AnyToolCall).catch((error) => ({
+      matched: false,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    componentLookups.set(key, lookup);
+    return lookup;
+  };
+
+  const enriched = await Promise.all(
+    links.slice(0, 50).map(async (link, index) => {
+      const sourceMap =
+        index < 12 && link._sourceInput
+          ? await resolveSourceMap(link._sourceInput)
+          : undefined;
+      const component =
+        index < 12 &&
+        link._actionInput?.selector &&
+        typeof link._actionInput.selector === "string"
+          ? await locateComponent({
+              selector: link._actionInput.selector,
+              frameId: link._actionInput.frameId,
+              documentId: link._actionInput.documentId,
+            })
+          : undefined;
+      const {
+        _sourceInput: _discardedSource,
+        _actionInput: _discardedAction,
+        ...publicLink
+      } = link;
+      return {
+        ...publicLink,
+        ...(sourceMap ? { sourceMap } : {}),
+        ...(component ? { component } : {}),
+      };
+    }),
+  );
+
+  return {
+    attached: network.attached === true,
+    total: typeof network.total === "number" ? network.total : requests.length,
+    observed: requests.length,
+    activityDigest: network.activityDigest ?? null,
+    observationSessionId:
+      typeof network.observationSessionId === "string"
+        ? network.observationSessionId
+        : undefined,
+    causalLinks: enriched,
+    rawRequestsOmitted: true,
+  };
+}
+
+function sanitizeWorkflowEvidenceUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    for (const key of Array.from(url.searchParams.keys())) {
+      url.searchParams.set(key, "[redacted]");
+    }
+    return url.toString().slice(0, 2_000);
+  } catch {
+    return value.split("#", 1)[0]?.slice(0, 2_000) ?? "";
+  }
 }
 
 function subtractConsoleSnapshot(before: unknown, after: unknown): unknown {
@@ -2057,6 +3033,57 @@ function subtractConsoleSnapshot(before: unknown, after: unknown): unknown {
     returned: messages.length,
     correlation: "entries not present in the pre-action bounded snapshot",
   };
+}
+
+async function readActionPostStateSnapshot(
+  pluginBridge: PluginWebSocketServer,
+  group: {
+    frameId?: number;
+    documentId?: string;
+  },
+): Promise<unknown> {
+  let lastError: unknown;
+  for (
+    let attempt = 0;
+    attempt <= POST_ACTION_OBSERVATION_RETRY_DELAYS_MS.length;
+    attempt += 1
+  ) {
+    try {
+      return await proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DOM_GET_PAGE_INFO,
+        args: {
+          limit: 100,
+          mode: "full",
+          sourceLimit: 10_000,
+          ...(group.frameId !== undefined
+            ? {
+                frameScope: "selected",
+                frameId: group.frameId,
+                ...(attempt === 0 && group.documentId
+                  ? { documentId: group.documentId }
+                  : {}),
+              }
+            : {}),
+        },
+      } as unknown as AnyToolCall);
+    } catch (error) {
+      if (!isTransientPostActionReadError(error)) {
+        throw error;
+      }
+      lastError = error;
+      const delayMs = POST_ACTION_OBSERVATION_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined) {
+        break;
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs);
+      });
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Post-action element state did not become ready.");
 }
 
 async function readActionPostStates(
@@ -2096,22 +3123,7 @@ async function readActionPostStates(
   await Promise.all(
     [...groups.values()].map(async (group) => {
       try {
-        const value = await proxyBrowserTool(pluginBridge, {
-          id: createMessageId(),
-          toolName: TOOL_NAMES.DOM_GET_PAGE_INFO,
-          args: {
-            limit: 100,
-            mode: "full",
-            sourceLimit: 10_000,
-            ...(group.frameId !== undefined
-              ? {
-                  frameScope: "selected",
-                  frameId: group.frameId,
-                  documentId: group.documentId,
-                }
-              : {}),
-          },
-        } as unknown as AnyToolCall);
+        const value = await readActionPostStateSnapshot(pluginBridge, group);
         if (!isSemanticPageSnapshot(value)) {
           throw new Error("post-action semantic snapshot unavailable");
         }
@@ -2966,6 +3978,52 @@ function createSnapshotFrameRef(
   return `fr1_${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
+function resolveDirectFrameReference(
+  toolName: McpToolName,
+  args: Record<string, unknown>,
+  sessionId?: string,
+): Record<string, unknown> {
+  const supported =
+    toolName === MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE ||
+    toolName === MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS ||
+    toolName === MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS ||
+    toolName === MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY;
+  if (!supported || typeof args.frameRef !== "string") {
+    return args;
+  }
+  const state = getBrowserStateSnapshot(sessionId);
+  const generation = snapshotReferencesBySession.get(state.sessionId);
+  const referenceSet = generation?.frames.get(args.frameRef);
+  if (!referenceSet) {
+    throw new Error(
+      "SNAPSHOT_FRAME_REF_UNKNOWN: observe the page again and use frameRef from that result.",
+    );
+  }
+  if (
+    typeof args.documentId !== "string" ||
+    args.documentId !== referenceSet.target.documentId
+  ) {
+    throw new Error(
+      "STALE_FRAME_REF: frameRef requires the exact documentId returned by browser_observe.",
+    );
+  }
+  if (
+    !state.activeTab ||
+    !sameTopLevelBrowserTarget(referenceSet.target, state.activeTab)
+  ) {
+    snapshotReferencesBySession.delete(state.sessionId);
+    throw new Error(
+      "STALE_SNAPSHOT_REF: the selected tab or navigation changed; observe the page again.",
+    );
+  }
+  const { frameRef: _frameRef, ...rest } = args;
+  return {
+    ...rest,
+    frameId: referenceSet.target.frameId,
+    documentId: referenceSet.target.documentId,
+  };
+}
+
 async function resolveSnapshotReferences(
   toolName: McpToolName,
   args: Record<string, unknown>,
@@ -3105,7 +4163,8 @@ function collectSnapshotRefs(
     toolName === MCP_TOOL_NAMES.BROWSER_TYPE ||
     toolName === MCP_TOOL_NAMES.BROWSER_PRESS_KEY ||
     toolName === MCP_TOOL_NAMES.BROWSER_SELECT_OPTION ||
-    toolName === MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT
+    toolName === MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT ||
+    toolName === MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE
   ) {
     return fromTarget(args);
   }
@@ -3224,7 +4283,8 @@ function replaceSnapshotRefs(
     toolName === MCP_TOOL_NAMES.BROWSER_TYPE ||
     toolName === MCP_TOOL_NAMES.BROWSER_PRESS_KEY ||
     toolName === MCP_TOOL_NAMES.BROWSER_SELECT_OPTION ||
-    toolName === MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT
+    toolName === MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT ||
+    toolName === MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE
   ) {
     return replaceTarget(args);
   }
@@ -3419,6 +4479,7 @@ async function executeActionStage(
         batch.push(action);
         cursor = index + 1;
       }
+      const batchStartedAtMs = Date.now();
       try {
         const data = await proxyBrowserTool(pluginBridge, {
           id: createMessageId(),
@@ -3442,6 +4503,8 @@ async function executeActionStage(
             id: entry.id,
             type: entry.type,
             status: "completed",
+            startedAtMs: batchStartedAtMs,
+            completedAtMs: Date.now(),
             expectedOutcome: entry.expectedOutcome,
           });
         }
@@ -3457,6 +4520,8 @@ async function executeActionStage(
             id: entry.id,
             type: entry.type,
             status: "failed",
+            startedAtMs: batchStartedAtMs,
+            completedAtMs: Date.now(),
             error: message,
           });
         }
@@ -3467,6 +4532,7 @@ async function executeActionStage(
       continue;
     }
 
+    const actionStartedAtMs = Date.now();
     try {
       let data: unknown;
       if (action.type === "click") {
@@ -3570,6 +4636,8 @@ async function executeActionStage(
         id: action.id,
         type: action.type,
         status: "completed",
+        startedAtMs: actionStartedAtMs,
+        completedAtMs: Date.now(),
         data,
         expectedOutcome: action.expectedOutcome,
       });
@@ -3583,6 +4651,8 @@ async function executeActionStage(
         id: action.id,
         type: action.type,
         status: "failed",
+        startedAtMs: actionStartedAtMs,
+        completedAtMs: Date.now(),
         error: actionFailureMessage(error),
       });
       stoppedAt = action.id;

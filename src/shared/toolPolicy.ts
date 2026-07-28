@@ -195,6 +195,10 @@ const POLICY_GROUPS = {
     MCP_TOOL_NAMES.BROWSER_SET_TARGET_FRAME,
   ],
   sensitive_read: [
+    MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+    MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS,
+    MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS,
+    MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
     MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
     MCP_TOOL_NAMES.BROWSER_GET_PLUGIN_CONVERSATION,
     MCP_TOOL_NAMES.BROWSER_GET_AUDIT_EVENTS,
@@ -212,6 +216,9 @@ const POLICY_GROUPS = {
     MCP_TOOL_NAMES.BROWSER_LIST_NETWORK_RULES,
   ],
   reversible_write: [
+    MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE,
+    MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
+    MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
     MCP_TOOL_NAMES.BROWSER_START_ELEMENT_PICKER,
     MCP_TOOL_NAMES.BROWSER_CANCEL_ELEMENT_PICKER,
     MCP_TOOL_NAMES.BROWSER_HIGHLIGHT_ELEMENT,
@@ -226,6 +233,8 @@ const POLICY_GROUPS = {
   ],
   page_action: [
     MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+    MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE,
+    MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
     MCP_TOOL_NAMES.BROWSER_ACT,
     MCP_TOOL_NAMES.BROWSER_CLICK,
     MCP_TOOL_NAMES.BROWSER_DRAG,
@@ -307,6 +316,44 @@ export function getToolPolicy(
   }
 
   if (
+    normalizedName === MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS ||
+    normalizedName === MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS ||
+    normalizedName === MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY
+  ) {
+    return overridePolicy(createPolicy(normalizedName, baseClass, true), {
+      sensitive: false,
+      dataSensitivity: "page_content",
+      approvalMode: "task_grant",
+      capability: "page.observe.sensitive",
+      reason:
+        "Reads bounded page diagnostics for the current task without returning message bodies, database values, or caller-evaluated script results.",
+    });
+  }
+
+  if (
+    normalizedName === MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE
+  ) {
+    return overridePolicy(createPolicy(normalizedName, baseClass, true), {
+      requiresApproval: false,
+      mutatesBrowser: false,
+      idempotent: false,
+      approvalMode: "none",
+      capability: undefined,
+      reason:
+        "Persists a session-bound local recipe artifact but does not execute or change the browser.",
+    });
+  }
+
+  if (normalizedName === MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE) {
+    return overridePolicy(createPolicy(normalizedName, baseClass, true), {
+      destructive: true,
+      approvalMode: "decision_barrier",
+      reason:
+        "A persisted recipe may contain page actions whose semantics are opaque until the artifact is loaded, so each run requires a decision barrier.",
+    });
+  }
+
+  if (
     normalizedName === MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG &&
     args.action === "accept"
   ) {
@@ -338,7 +385,8 @@ export function getToolPolicy(
 
   if (
     (normalizedName === MCP_TOOL_NAMES.BROWSER_EXECUTE_ACTION_STAGE ||
-      normalizedName === MCP_TOOL_NAMES.BROWSER_WORKFLOW) &&
+      normalizedName === MCP_TOOL_NAMES.BROWSER_WORKFLOW ||
+      normalizedName === MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE) &&
     containsCommitLikeStageAction(args)
   ) {
     return overridePolicy(createPolicy(normalizedName, baseClass, true), {

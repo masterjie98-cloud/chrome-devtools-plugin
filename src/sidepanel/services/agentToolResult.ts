@@ -17,6 +17,89 @@ export function isSuccessfulAgentToolResultContent(content: string): boolean {
   );
 }
 
+export type AgentToolPreExecutionFailureKind =
+  | "frame_unavailable"
+  | "invalid_arguments"
+  | "invalid_target"
+  | "target_occluded"
+  | "stale_context";
+
+export interface AgentToolPreExecutionFailure {
+  kind: AgentToolPreExecutionFailureKind;
+  message: string;
+  retryAfterProgress: boolean;
+}
+
+export function getAgentToolPreExecutionFailure(
+  content: string,
+): AgentToolPreExecutionFailure | null {
+  const parsed = parseAgentToolResult(content);
+  if (!parsed) {
+    return null;
+  }
+  if (parsed.matched === false) {
+    return {
+      kind: "invalid_target",
+      message: "The requested target did not match the current page.",
+      retryAfterProgress: true,
+    };
+  }
+  const error = typeof parsed.error === "string" ? parsed.error : "";
+  if (!error) {
+    return null;
+  }
+  if (
+    /\barguments? invalid\b|selector or target is required|field (?:ref, )?selector, target, element, or name is required/i.test(
+      error,
+    )
+  ) {
+    return {
+      kind: "invalid_arguments",
+      message: error,
+      retryAfterProgress: false,
+    };
+  }
+  const recovery = classifyAgentFailureRecovery(error);
+  if (recovery.kind === "frame_unavailable") {
+    return {
+      kind: "frame_unavailable",
+      message: error,
+      retryAfterProgress: true,
+    };
+  }
+  if (recovery.kind === "stale_target") {
+    return {
+      kind: "stale_context",
+      message: error,
+      retryAfterProgress: true,
+    };
+  }
+  if (
+    /\b(?:INVALID_NATIVE_CSS_SELECTOR|TRUSTED_INPUT_TARGET_NOT_FOUND|TRUSTED_INPUT_TARGET_NOT_VISIBLE)\b/i.test(
+      error,
+    ) ||
+    /is not a valid selector|target (?:was )?not found|no element matches|matched no element/i.test(
+      error,
+    )
+  ) {
+    return {
+      kind: "invalid_target",
+      message: error,
+      retryAfterProgress: !/INVALID_NATIVE_CSS_SELECTOR|is not a valid selector/i.test(
+        error,
+      ),
+    };
+  }
+  if (recovery.kind === "target_occluded") {
+    return {
+      kind: "target_occluded",
+      message: error,
+      retryAfterProgress: true,
+    };
+  }
+  return null;
+}
+
 export function isAgentToolResultDefinitelyNotExecuted(
   content: string,
 ): boolean {
@@ -27,21 +110,9 @@ export function isAgentToolResultDefinitelyNotExecuted(
         parsed.skipped === true ||
         parsed.blocked === true ||
         parsed.matched === false ||
-        isKnownPreExecutionFailure(parsed.error)),
-  );
-}
-
-function isKnownPreExecutionFailure(error: unknown): boolean {
-  if (typeof error !== "string") {
-    return false;
-  }
-  return (
-    /\b(?:STALE_CONTEXT|EXECUTION_GRANT_INVALID|APPROVAL_DENIED|INVALID_NATIVE_CSS_SELECTOR|TRUSTED_INPUT_TARGET_NOT_FOUND|TRUSTED_INPUT_TARGET_NOT_VISIBLE)\b/.test(
-      error,
-    ) ||
-    /is not a valid selector|target (?:was )?not found|no element matches|matched no element/i.test(
-      error,
-    )
+        (typeof parsed.error === "string" &&
+          /\bAPPROVAL_DENIED\b/i.test(parsed.error)) ||
+        getAgentToolPreExecutionFailure(content)),
   );
 }
 
@@ -57,3 +128,4 @@ function parseAgentToolResult(content: string): Record<string, unknown> | null {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+import { classifyAgentFailureRecovery } from "./agentFailureRecovery";

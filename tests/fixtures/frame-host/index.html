@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <title>Frame routing host</title>
+    <link rel="stylesheet" href="./mapped.css" />
     <style>
       body { margin: 0; font: 16px system-ui, sans-serif; }
       main { padding: 24px; }
@@ -84,10 +85,22 @@
         <button id="clear-sensitive-markers" type="button">Clear disposable markers</button>
         <output id="sensitive-result">markers not seeded</output>
       </section>
+      <section aria-labelledby="activity-heading">
+        <h2 id="activity-heading">Diagnostic activity fixture</h2>
+        <button id="activity-trigger" type="button">Generate diagnostic activity</button>
+        <output id="activity-result">activity not generated</output>
+        <button id="performance-trigger" type="button">Generate performance activity</button>
+        <output id="performance-result">performance not generated</output>
+      </section>
       <iframe
         id="cross-origin-frame"
         title="Cross-origin fixture"
         src="http://localhost:8766/child.html"
+      ></iframe>
+      <iframe
+        id="same-process-frame"
+        title="Same-process fixture"
+        src="/same-process-child.html"
       ></iframe>
     </main>
     <script>
@@ -163,6 +176,31 @@
         sessionStorage.removeItem(markerNames.session);
         document.cookie = `${markerNames.cookie}=; Max-Age=0; Path=/; SameSite=Lax`;
         document.querySelector("#sensitive-result").textContent = "disposable markers cleared";
+      });
+      document.querySelector("#activity-trigger").addEventListener("click", async () => {
+        console.info("diagnostic-activity-fixture-triggered");
+        const response = await fetch("/activity-fixture.json?trace=fixed-fixture", {
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error(`Activity fixture failed: ${response.status}`);
+        const payload = await response.json();
+        document.querySelector("#activity-result").textContent =
+          `activity complete: ${payload.fixture}`;
+      });
+      document.querySelector("#performance-trigger").addEventListener("click", () => {
+        const startedAt = performance.now();
+        while (performance.now() - startedAt < 120) {
+          Math.sqrt(Math.random());
+        }
+        const output = document.querySelector("#performance-result");
+        output.style.marginLeft = output.style.marginLeft ? "" : "48px";
+        output.textContent = "performance complete";
+      });
+      const fixtureDatabase = indexedDB.open("ai-devtools-diagnostic-fixture", 1);
+      fixtureDatabase.addEventListener("upgradeneeded", () => {
+        if (!fixtureDatabase.result.objectStoreNames.contains("events")) {
+          fixtureDatabase.result.createObjectStore("events");
+        }
       });
     </script>
   </body>

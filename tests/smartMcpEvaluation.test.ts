@@ -25,18 +25,32 @@ const target = {
   revision: 4,
 };
 
-test("[eval 01] smart profile exposes eleven task-oriented tools", () => {
+test("[eval 01] smart profile exposes twenty task-oriented tools", () => {
   const tools = runtimeToolsForProfile("smart");
-  assert.equal(tools.length, 11);
+  assert.equal(tools.length, 20);
   assert.deepEqual(
-    tools.slice(0, 6).map((tool) => tool.definition.name),
+    tools.map((tool) => tool.definition.name),
     [
       MCP_TOOL_NAMES.BROWSER_STATUS,
+      MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
+      MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
       MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+      MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
       MCP_TOOL_NAMES.BROWSER_OBSERVE,
+      MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+      MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS,
+      MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS,
+      MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE,
+      MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE,
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
       MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
+      MCP_TOOL_NAMES.BROWSER_LIST_TABS,
+      MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB,
+      MCP_TOOL_NAMES.BROWSER_LIST_FRAMES,
+      MCP_TOOL_NAMES.BROWSER_SET_TARGET_FRAME,
     ],
   );
 });
@@ -547,6 +561,283 @@ test("[eval 09b] browser_workflow returns action, verification, and correlated e
   assert.ok(workflow.evidence.console);
 });
 
+test("[eval 09b-conditions] browser_workflow skips actions when a fresh precondition fails", async () => {
+  const sessionId = "eval-workflow-condition";
+  browserStateHub.setCurrentTab(target, sessionId);
+  const calls: AnyToolCall[] = [];
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+    {
+      preconditions: {
+        checks: [
+          {
+            id: "wrong-title",
+            type: "title_contains",
+            value: "Not the fixture",
+          },
+        ],
+        onFailure: "skip_actions",
+      },
+      actions: [
+        { id: "name", type: "fill", selector: "#name", value: "Grace" },
+      ],
+      cleanupActions: [
+        { id: "cleanup", type: "fill", selector: "#name", value: "" },
+      ],
+    },
+    createBridge(calls),
+    { sessionId },
+  );
+
+  assert.equal(read(result, "status"), "condition_skipped");
+  assert.equal(
+    calls.some((call) => call.toolName === TOOL_NAMES.BROWSER_FILL_FORM),
+    false,
+  );
+});
+
+test("[eval 09b-cleanup] browser_workflow records bounded cleanup separately", async () => {
+  const sessionId = "eval-workflow-cleanup";
+  browserStateHub.setCurrentTab(target, sessionId);
+  const calls: AnyToolCall[] = [];
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+    {
+      preconditions: {
+        checks: [
+          { id: "fixture-title", type: "title_contains", value: "Fixture" },
+        ],
+      },
+      actions: [
+        { id: "name", type: "fill", selector: "#name", value: "Grace" },
+      ],
+      cleanupActions: [
+        { id: "cleanup", type: "fill", selector: "#name", value: "Ada" },
+      ],
+    },
+    createBridge(calls),
+    { sessionId },
+  );
+
+  assert.equal(read(result, "status"), "completed");
+  assert.equal(
+    calls.filter((call) => call.toolName === TOOL_NAMES.BROWSER_FILL_FORM)
+      .length,
+    2,
+  );
+  assert.equal(read(read(result, "cleanup"), "completed"), 1);
+});
+
+test("[eval 09b-act-nav] browser_act retries only its read-only post-state after navigation", async () => {
+  const sessionId = "eval-act-navigation";
+  const navigatedTarget = {
+    ...target,
+    url: "https://fixture.test/next",
+    documentId: "fixture-document-next",
+    navigationId: "fixture-navigation-next",
+    revision: target.revision + 1,
+  };
+  browserStateHub.setCurrentTab(target, sessionId);
+  let pageReads = 0;
+  let clicks = 0;
+  let navigated = false;
+  const readArgs: Array<Record<string, unknown>> = [];
+  const bridge = {
+    connectedPluginClients: () => 1,
+    callBrowserTool: async (call: AnyToolCall) => {
+      if (call.toolName === TOOL_NAMES.BROWSER_CLICK) {
+        clicks += 1;
+        navigated = true;
+        browserStateHub.setCurrentTab(navigatedTarget, sessionId);
+        return {
+          selector: "#save",
+          matched: true,
+          action: "click",
+          inputMode: "cdp",
+          x: 120,
+          y: 80,
+        };
+      }
+      if (call.toolName === TOOL_NAMES.DOM_GET_PAGE_INFO) {
+        if (!navigated) {
+          return pageSnapshot(target);
+        }
+        pageReads += 1;
+        readArgs.push(call.args as Record<string, unknown>);
+        if (pageReads === 1) {
+          throw new Error(
+            "TOOL_FAILED: STALE_FRAME: the referenced frame document is no longer registered; observe the page again.",
+          );
+        }
+        if (pageReads === 2) {
+          throw new Error(
+            "EXECUTION_GRANT_INVALID: Executor rejected browser call: execution grant target is stale or does not match (fields=documentId,navigationId).",
+          );
+        }
+        return pageSnapshot(navigatedTarget);
+      }
+      throw new Error(`Unexpected internal tool ${call.toolName}`);
+    },
+  } as unknown as PluginWebSocketServer;
+
+  const observed = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_OBSERVE,
+    { mode: "interactive", limit: 10 },
+    bridge,
+    { sessionId },
+  );
+  const saveRef = (
+    observed as {
+      snapshot: { nodes: Array<{ name: string; targetRef: string }> };
+    }
+  ).snapshot.nodes.find((node) => node.name === "Save")?.targetRef;
+  assert.ok(saveRef);
+
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_ACT,
+    {
+      actions: [
+        {
+          id: "save",
+          type: "click",
+          ref: saveRef,
+        },
+      ],
+    },
+    bridge,
+    { sessionId },
+  );
+
+  assert.equal(clicks, 1);
+  assert.equal(pageReads, 3);
+  assert.equal(readArgs[0]?.documentId, target.documentId);
+  assert.equal("documentId" in (readArgs[1] ?? {}), false);
+  assert.equal("documentId" in (readArgs[2] ?? {}), false);
+  const action = (
+    read(result, "results") as Array<Record<string, unknown>>
+  )[0];
+  assert.equal(read(action, "status"), "completed");
+  assert.equal(read(read(action, "postState"), "available"), true);
+  assert.equal(
+    read(read(action, "postState"), "documentId"),
+    navigatedTarget.documentId,
+  );
+});
+
+test("[eval 09b-nav] browser_workflow never replays a completed navigation while the new document registers", async () => {
+  const sessionId = "eval-workflow-navigation";
+  const navigatedTarget = {
+    ...target,
+    url: "https://fixture.test/next",
+    documentId: "fixture-document-next",
+    navigationId: "fixture-navigation-next",
+    revision: target.revision + 1,
+  };
+  browserStateHub.setCurrentTab(target, sessionId);
+  let pageReads = 0;
+  let clicks = 0;
+  const bridge = {
+    connectedPluginClients: () => 1,
+    callBrowserTool: async (call: AnyToolCall) => {
+      if (call.toolName === TOOL_NAMES.DOM_GET_PAGE_INFO) {
+        pageReads += 1;
+        if (pageReads === 1) {
+          return pageSnapshot(target);
+        }
+        if (pageReads <= 4) {
+          throw new Error(
+            "STALE_CONTEXT: Browser target changed after authorization and before executor dispatch (fields=url,documentId,navigationId).",
+          );
+        }
+        return pageSnapshot(navigatedTarget);
+      }
+      if (call.toolName === TOOL_NAMES.BROWSER_CLICK) {
+        clicks += 1;
+        browserStateHub.setCurrentTab(navigatedTarget, sessionId);
+        return {
+          selector: "#next",
+          matched: true,
+          action: "click",
+          inputMode: "cdp",
+          x: 120,
+          y: 80,
+        };
+      }
+      throw new Error(`Unexpected internal tool ${call.toolName}`);
+    },
+  } as unknown as PluginWebSocketServer;
+
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+    {
+      observation: { mode: "interactive" },
+      actions: [
+        {
+          id: "next",
+          type: "click",
+          selector: "#next",
+          expectedOutcome: "Navigate to the next document",
+        },
+      ],
+      evidence: { dom: true, url: true, network: false, console: false },
+    },
+    bridge,
+    { sessionId },
+  );
+
+  assert.equal(read(result, "status"), "completed");
+  assert.equal(clicks, 1);
+  assert.equal(pageReads, 6);
+  assert.equal(
+    read(read(read(result, "evidence"), "url"), "after"),
+    navigatedTarget.url,
+  );
+});
+
+test("[eval 09c] issue evidence stores a bounded manifest without inline screenshot bytes", async () => {
+  const sessionId = "eval-evidence";
+  browserStateHub.setCurrentTab(target, sessionId);
+  let storedManifest: unknown;
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
+    {
+      title: "Save button regression",
+      description: "Capture current state without mutating the fixture.",
+      evidence: { dom: true, url: true, network: false, console: false },
+    },
+    createBridge(),
+    {
+      sessionId,
+      storeJsonArtifact: async (value) => {
+        storedManifest = value;
+        return {
+          id: "art_evidence",
+          uri: "ai-devtools://artifact/art_evidence",
+          kind: "payload",
+          mimeType: "application/json",
+          byteLength: JSON.stringify(value).length,
+          sha256: "a".repeat(64),
+          createdAt: "2026-07-17T00:00:00.000Z",
+          expiresAt: "2026-07-18T00:00:00.000Z",
+        };
+      },
+    },
+  );
+  assert.equal(read(result, "version"), "browser-issue-evidence-v1");
+  assert.equal(
+    read(read(result, "artifact"), "uri"),
+    "ai-devtools://artifact/art_evidence",
+  );
+  assert.equal(JSON.stringify(storedManifest).includes("data:image/png;base64"), false);
+  assert.equal(
+    read(
+      read(read(storedManifest, "screenshots"), "after"),
+      "comparison",
+    ) !== undefined,
+    true,
+  );
+});
+
 test("[eval 10] audit output accepts bounded execution timing metrics", () => {
   const parsed = MCP_TOOL_OUTPUT_SCHEMAS[
     MCP_TOOL_NAMES.BROWSER_GET_AUDIT_EVENTS
@@ -672,6 +963,32 @@ function createBridge(
           total: 1,
           returned: 1,
           messages: [{ level: "info", text: "saved" }],
+        };
+      }
+      if (call.toolName === TOOL_NAMES.BROWSER_TAKE_SCREENSHOT) {
+        return {
+          capturedAt: "2026-07-17T00:00:00.000Z",
+          mimeType: "image/png",
+          dataUrl: "data:image/png;base64,cG5n",
+          method: "cdp",
+          width: 800,
+          height: 600,
+          comparison: {
+            baselineAvailable: true,
+            changed: false,
+            changedPixelRatio: 0,
+            threshold: 16,
+          },
+          artifact: {
+            id: "art_screen",
+            uri: "ai-devtools://artifact/art_screen",
+            kind: "screenshot",
+            mimeType: "image/png",
+            byteLength: 3,
+            sha256: "b".repeat(64),
+            createdAt: "2026-07-17T00:00:00.000Z",
+            expiresAt: "2026-07-18T00:00:00.000Z",
+          },
         };
       }
       throw new Error(`Unexpected internal tool ${call.toolName}`);

@@ -80,6 +80,25 @@ test("execution grant binds request, session, tool, arguments, and target", asyn
     ).reason,
     /target is stale.*fields=documentId/,
   );
+  assert.deepEqual(
+    await verifyExecutionGrant(KEY, grant, {
+      browserRequestId: "browser-request-1",
+      sessionId: "profile-1",
+      toolName: "browser.click",
+      args,
+      target: {
+        ...TARGET,
+        targetId: "tab-10",
+        tabId: 10,
+        windowId: 4,
+        documentId: "document-b",
+        navigationId: "navigation-b",
+      },
+      targetBinding: "none",
+      now: new Date("2026-07-13T01:00:10.000Z"),
+    }),
+    { ok: true },
+  );
 });
 
 test("execution grants reject signature tampering, expiry, and replay", async () => {

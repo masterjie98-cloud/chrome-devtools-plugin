@@ -148,6 +148,14 @@ export async function queryActiveTab(): Promise<chrome.tabs.Tab | undefined> {
   );
 }
 
+export async function queryForegroundTab(): Promise<chrome.tabs.Tab | undefined> {
+  const [lastFocused, currentWindow] = await Promise.all([
+    queryTabs({ active: true, lastFocusedWindow: true }),
+    queryTabs({ active: true, currentWindow: true }),
+  ]);
+  return [...lastFocused, ...currentWindow].find(isUsableBrowserTarget);
+}
+
 export async function listTargetTabs(): Promise<BrowserTargetListResult> {
   await loadTargetTabState();
   for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -216,6 +224,19 @@ export async function selectTargetTab(
   };
 }
 
+export async function focusBrowserTab(tabId: number): Promise<chrome.tabs.Tab> {
+  const tab = await getTab(tabId);
+  if (!isUsableBrowserTarget(tab)) {
+    throw new Error(
+      `不能返回这个页面 (${describeTabUrl(tab)}); 目标 Tab 已关闭或不再支持。`,
+    );
+  }
+  if (tab.windowId !== undefined) {
+    await updateWindow(tab.windowId, { focused: true });
+  }
+  return updateTab(tabId, { active: true });
+}
+
 export function registerContentFrame(
   sender: chrome.runtime.MessageSender,
   page: { url: string; title: string },
@@ -252,6 +273,36 @@ export function registerContentFrame(
       documentId: sender.documentId,
     });
   }
+}
+
+export function updateContentFrameLocation(
+  tabId: number,
+  frameId: number,
+  input: {
+    url: string;
+    documentId?: string;
+    title?: string;
+  },
+): void {
+  const frames = contentFramesByTab.get(tabId);
+  const current = frames?.get(frameId);
+  if (!frames || !current) {
+    return;
+  }
+  if (
+    input.documentId &&
+    current.documentId &&
+    input.documentId !== current.documentId
+  ) {
+    return;
+  }
+  frames.set(frameId, {
+    ...current,
+    url: input.url,
+    title: input.title ?? current.title,
+    documentId: input.documentId ?? current.documentId,
+    lastSeenAt: new Date().toISOString(),
+  });
 }
 
 export function clearContentFrames(tabId: number): void {
@@ -304,6 +355,30 @@ export function listRegisteredContentFrames(tabId: number): BrowserTargetFrame[]
       if (left.isTop !== right.isTop) return left.isTop ? -1 : 1;
       return left.frameId - right.frameId;
     });
+}
+
+export async function waitForRegisteredContentFrames(
+  tabId: number,
+  options: {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+  } = {},
+): Promise<BrowserTargetFrame[]> {
+  const timeoutMs = Math.min(5_000, Math.max(0, options.timeoutMs ?? 750));
+  const pollIntervalMs = Math.min(
+    250,
+    Math.max(10, options.pollIntervalMs ?? 25),
+  );
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const frames = listRegisteredContentFrames(tabId);
+    if (frames.length > 0 || Date.now() >= deadline) {
+      return frames;
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.min(pollIntervalMs, deadline - Date.now()));
+    });
+  }
 }
 
 export async function listTargetFrames(): Promise<BrowserTargetFrameListResult> {
@@ -602,18 +677,6 @@ export async function deleteCookie(
     name: input.name,
     url,
   };
-}
-
-export async function activateTabForDebugging(
-  tab: chrome.tabs.Tab,
-): Promise<chrome.tabs.Tab> {
-  if (tab.windowId !== undefined) {
-    await updateWindow(tab.windowId, { focused: true }).catch(() => undefined);
-  }
-  if (tab.id === undefined) {
-    return tab;
-  }
-  return updateTab(tab.id, { active: true }).catch(() => tab);
 }
 
 export function downloadDataUrl(
@@ -940,7 +1003,7 @@ function writeSessionStorage(key: string, value: unknown): Promise<void> {
   });
 }
 
-function toBrowserTargetTab(tab: chrome.tabs.Tab): BrowserTargetTab {
+export function toBrowserTargetTab(tab: chrome.tabs.Tab): BrowserTargetTab {
   return {
     id: tab.id ?? 0,
     windowId: tab.windowId,

@@ -114,6 +114,45 @@ test("one daemon serves multiple independent MCP adapter clients", async () => {
   }
 });
 
+test("daemon client reconnects and retries a safe read after daemon restart", async () => {
+  const sessionId = "daemon-reconnect-safe-read";
+  browserStateHub.setCurrentTab(
+    {
+      url: "https://example.test/reconnect",
+      title: "Reconnect",
+    },
+    sessionId,
+  );
+  const firstDaemon = startPluginWebSocketServer(0);
+  const address = await firstDaemon.ready();
+  const url = `ws://${address.host}:${address.port}`;
+  const client = new DaemonClient(url, sessionId, TEST_BRIDGE_TOKEN);
+  let secondDaemon: ReturnType<typeof startPluginWebSocketServer> | undefined;
+
+  try {
+    await client.readState("activeTab");
+    await firstDaemon.close();
+    const restart = new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        secondDaemon = startPluginWebSocketServer(address.port);
+        secondDaemon.ready().then(() => resolve(), reject);
+      }, 150);
+    });
+
+    const [state] = await Promise.all([
+      client.readState("activeTab"),
+      restart,
+    ]);
+    assert.equal(
+      readNestedString(state, "value", "url"),
+      "https://example.test/reconnect",
+    );
+  } finally {
+    client.close();
+    await secondDaemon?.close();
+  }
+});
+
 test("authenticated UI clients publish sidepanel state to their bound session", async () => {
   const daemon = startPluginWebSocketServer(0);
   const address = await daemon.ready();

@@ -252,6 +252,20 @@ Responsibilities:
   behavior or replaces `window.alert`, `window.confirm`, or `window.prompt`.
 - Read tools must not perform cleanup mutations. A debugger conflict is reported
   as an error with remediation, never fixed by deleting page frames.
+- Explicit activity monitoring publishes a bounded, sanitized incremental
+  `dom`/`network`/`console`/`navigation` stream. The daemon keeps only the latest
+  200 events per Profile session in memory; MCP clients subscribe to the stable
+  session activity resource and receive `resources/updated` notifications
+  instead of polling the page.
+- Framework source inspection executes one fixed build-owned MAIN-world
+  function. It may read React Fiber or Vue instance metadata and then resolve a
+  loaded script's flat Source Map v3 mapping without page credentials. It does
+  not execute MCP-supplied JavaScript, and unsupported/oversized/indexed maps
+  return an explicit unavailable reason.
+- Network records retain bounded initiator frames and wall-clock timing.
+  `browser_workflow` may correlate them with an action target, component, and
+  original source, but every link carries a confidence reason; timing
+  correlation is diagnostic evidence, not proof of causality.
 
 ### 5.6 Collaboration workspace and intelligent task kernel
 
@@ -402,32 +416,35 @@ decision record.
   `revision`, and the exact target. The legacy `updatedAt` output remains only
   as a compatibility alias for `stateUpdatedAt`.
 
-## 7. Protocol V6
+## 7. Protocol V8
 
 ### 7.1 Handshake
 
 Client hello:
 
 ```ts
-interface ClientHelloV6 {
-  protocolVersion: 6;
-  clientType: "chrome-extension" | "mcp-adapter" | "sidepanel-ui";
-  clientName: string;
+interface ClientHelloV8 {
+  protocolVersion: 8;
+  buildId: string;
+  schemaHash: string;
+  clientRole: "plugin" | "observer" | "browser" | "ui" | "mcp";
+  clientName?: string;
   installationId?: string;
-  bridgeToken: string;
-  capabilities: string[];
+  sessionId?: string;
+  bridgeToken?: string;
 }
 ```
 
 Daemon welcome:
 
 ```ts
-interface ServerWelcomeV6 {
-  protocolVersion: 6;
+interface ServerWelcomeV8 {
+  protocolVersion: 8;
+  buildId: string;
+  schemaHash: string;
   connectionId: string;
-  assignedRole: "browser" | "mcp" | "ui";
-  browserSessionId?: string;
-  serverCapabilities: string[];
+  assignedRole: "plugin" | "observer" | "browser" | "ui" | "mcp";
+  sessionId?: string;
   limits: ProtocolLimits;
 }
 ```
@@ -435,11 +452,11 @@ interface ServerWelcomeV6 {
 The daemon assigns the role from authenticated client type and connection
 origin. A client-supplied `role` is ignored and rejected during migration.
 
-Current implementation note: the wire shape retains the migration-era
-`clientRole` field, but requires numeric `protocolVersion: 6` in every hello.
-The daemon returns version 6 in `SERVER_WELCOME`, rejects other versions with
-`PROTOCOL_VERSION_UNSUPPORTED`, and the browser, UI, observer, and stdio adapter
-validate the welcome before treating the socket as authenticated.
+The wire shape retains the migration-era `clientRole` field and requires
+numeric `protocolVersion: 8`, `buildId`, and `schemaHash` in every hello. The
+daemon returns the same identity in `SERVER_WELCOME`; protocol or schema drift
+fails before state or tools are accepted and tells the user which process must
+be reloaded.
 
 V4 added a role-separated durable delegation surface on top of the existing
 collaboration workspace. MCP adapters may create and wait for delegated tasks;
@@ -457,11 +474,16 @@ requester principal/client, and egress destinations. It covers only declared
 low-risk capabilities; submit/send/delete actions, sensitive fields, arbitrary
 evaluation, rule changes, and open-world egress remain decision barriers.
 
+V7 added direct frame references, workflow evidence, screenshot diffs, and the
+shared build/schema handshake. V8 adds the transient browser-activity event and
+resource-update commands used by MCP resource subscriptions. It does not make
+activity history durable or broaden browser authority.
+
 ### 7.2 Message envelope
 
 ```ts
-interface ProtocolEnvelopeV6<T> {
-  protocolVersion: 6;
+interface ProtocolEnvelopeV8<T> {
+  protocolVersion: 8;
   requestId: string;
   connectionId: string;
   command: string;
@@ -589,19 +611,26 @@ task:
   to the capabilities this extension actually exposes; it does not grant
   arbitrary operating-system file or process access.
 
-Both automatic modes are memory-only and bind `conversationId`, normalized
-HTTP(S) scheme/host/port, authenticated Chrome Profile session, and current AI
-Provider destination. They apply consistently to embedded-Agent and MCP-origin
-requests; the daemon still records the concrete requester principal and issues a
-fresh single-use execution grant for every call. A missing target, non-HTTP(S)
-page, different Profile, or different origin cannot use either automatic mode.
+Both automatic modes are memory-only and bind `conversationId`, authenticated
+Chrome Profile session, and current AI Provider destination. `agent` additionally
+binds the normalized HTTP(S) scheme/host/port. `full` instead binds the exact
+user-selected Chrome Tab/target so one login flow may cross origins and return in
+that same Tab without resetting the user's choice. They apply consistently to
+embedded-Agent and MCP-origin requests; the daemon still records the concrete
+requester principal and issues a fresh single-use execution grant for every
+call. A missing target, non-HTTP(S) page, different Profile, or different
+Provider cannot use either automatic mode; a different origin rejects `agent`,
+while a different Tab/target rejects `full`.
 
 The mode resets to `ask` when the user chooses it, changes the active chat,
-changes origin, changes Provider, disconnects the browser hub, or when a later
-request presents another Profile session. A transparent reconnect must
-authenticate and re-establish the same scope before automation continues.
-A same-origin path, query, hash, document, or revision update does not revoke the
-decision; stale target and revision validation still fail closed independently.
+changes Provider, changes Chrome Profile, or crosses the mode-specific
+origin/Tab boundary. A transparent Hub reconnect pauses execution but does not
+silently discard the user's scoped choice; the same authenticated Profile and
+scope must be re-established before automation continues. Path, query, hash,
+document, or revision updates do not revoke either decision. Cross-origin
+navigation revokes `agent` but not `full` when the selected Tab/target is
+unchanged. Stale target, document, navigation and revision validation still fail
+closed independently.
 For a pending one-time approval, freshness is checked against the target fields
 that were known when the request was created (`url`, tab, window, frame,
 document and navigation identity). The browser may safely enrich a previously
@@ -625,11 +654,20 @@ background independently validates it after signature verification and before
 dispatch. Unknown mappings and any read-only-to-mutation transition fail closed.
 The sidepanel UI is not a browser executor.
 
-No cross-chat, cross-origin, cross-Profile, cross-Provider, unbound-target, or
-permanent global authorization is permitted. `full` deliberately covers
-destructive, arbitrary-execution, and open-world policies only after the user
-selects it, only inside the current scoped lifecycle, and still uses late target
-validation plus a new single-use execution grant per call.
+No cross-chat, cross-Profile, cross-Provider, cross-Tab, unbound-target, or
+permanent global authorization is permitted. `agent` never crosses origin;
+`full` may cross origins only inside its exact selected Tab/target. `full`
+deliberately covers destructive, arbitrary-execution, and open-world policies
+only after the user selects it, only inside the current scoped lifecycle, and
+still uses late document validation plus a new single-use execution grant per
+call.
+
+Inside one high-level action workflow, a dispatched page/browser effect may
+advance the selected Tab to a replacement document. Subsequent evidence calls
+may follow that transition only when they are read-only and the Profile,
+`tabId`, `targetId`, and window remain identical. A mismatched target or any
+second effectful call still fails closed, so successful navigation can be
+verified without widening or replaying the write authorization.
 
 ## 10. Untrusted context and sensitive-data egress
 
@@ -720,6 +758,14 @@ Required behavior:
   current-conversation snapshot before appending restored text.
 - Screenshot defaults are 24-hour TTL, 8 MiB per object, 50 objects/64 MiB per
   session, and 500 objects/256 MiB globally.
+- Incremental browser activity is deliberately not written to `state.json`.
+  Only the latest 200 sanitized events live in the session hub; reconnecting
+  clients resume from the retained sequence range and can detect dropped
+  sequences.
+- An issue evidence bundle stores one bounded JSON manifest plus separate
+  screenshot artifacts. The manifest contains action/post-state, DOM/URL,
+  Network/Console summaries, causal-link confidence, screenshot-diff metrics,
+  build identity, and exact target provenance, but never image data URLs.
 - Logs store references and redacted summaries, not secrets or base64 images.
 
 ## 12. MCP contract
@@ -737,6 +783,18 @@ Required behavior:
   `openWorldHint`.
 - Structured tools return `structuredContent` plus a concise text summary.
 - Screenshot tools return MCP image content or an artifact resource link.
+- `browser_activity_start` and `browser_activity_stop` control explicit
+  monitoring. The stable session URI
+  `ai-devtools://session/{sessionId}/activity-stream` is the only directly
+  subscribable browser activity resource; adapter disconnect or unsubscribe
+  removes notification delivery.
+- `browser_locate_source` returns a bounded React/Vue owner chain and optional
+  original source location for an exact document-bound element. Production
+  bundles that omit framework debug metadata or source maps return explicit
+  partial/unavailable results.
+- `browser_capture_issue_evidence` runs the bounded workflow and stores a
+  session-bound manifest with separate before/after screenshot artifacts; it
+  never downloads files to the user's Downloads directory.
 - Large DOM/network/conversation/audit collections use cursor pagination or
   artifact handles. Collection cursors bind kind, selected Profile/filter
   source, first-page snapshot length, and a content fingerprint. Append-only

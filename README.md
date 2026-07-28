@@ -22,6 +22,36 @@ Record only sanitized results in
 [`docs/browser-validation-results.md`](docs/browser-validation-results.md); it
 starts as `not-run` so unexecuted browser checks cannot be mistaken for proof.
 
+## Local distribution without Chrome Web Store
+
+Build a versioned local package for trusted macOS users:
+
+```bash
+npm run package:local
+```
+
+The command runs the full build, bundles the daemon, MCP adapter, status, token,
+and extension-allowlist tools into self-contained Node.js 20 entrypoints, and
+creates these ignored artifacts:
+
+```text
+release/ai-devtools-assistant-local-<version>/
+release/ai-devtools-assistant-local-<version>.zip
+release/ai-devtools-assistant-local-<version>.zip.sha256
+```
+
+Recipients unzip the archive and double-click
+`安装 AI DevTools Assistant.command`. The installer copies the runtime and
+extension to a stable user directory, installs the macOS LaunchAgent, verifies
+the daemon, and prints the local Chrome extension path plus the per-machine
+Bridge Token. Chrome still requires the user to enable developer mode and load
+that unpacked extension directory manually.
+
+See [`docs/local-install.zh-CN.md`](docs/local-install.zh-CN.md) for the
+shareable Chinese installation, update, Codex registration, and uninstall
+instructions. Do not include a developer machine's daemon config, Bridge Token,
+browser state, or Codex config in the release archive.
+
 ## Development startup
 
 Install and build the extension:
@@ -116,6 +146,8 @@ locations only when needed:
 - `AI_DEVTOOLS_DAEMON_PORT` — daemon listener port
 - `AI_DEVTOOLS_MCP_TOOL_PROFILE` — `smart` (default), `inspect`, `read`, or
   `full`
+- `AI_DEVTOOLS_WORKSPACE_ROOTS` — optional platform-delimited allowlist for
+  `browser_find_workspace_source`; defaults to the adapter working directory
 - `AI_DEVTOOLS_STATE_PATH` — sanitized daemon state JSON path
 - `AI_DEVTOOLS_ARTIFACT_DIR` — binary artifact directory
 
@@ -135,6 +167,13 @@ collaboration state never grants browser permissions and does not bypass normal
 approval for page, browser, cookie, storage, network-body, screenshot, or other
 sensitive operations.
 
+Durable delegation uses `browser_delegate_collaboration_task` followed by
+`browser_wait_for_collaboration_result`. V2 tasks can receive append-only
+progress, clarification, requirement and evidence events through
+`browser_update_collaboration_task`, and Codex can terminate pending work with
+`browser_cancel_collaboration_task`. Event IDs are idempotent, long IDs retain a
+collision-resistant suffix, and no event grants execution authority.
+
 `browser_observe` is the preferred fresh page entrypoint. `browser_act` executes
 one bounded current-page stage, and `browser_verify` checks the outcome from one
 fresh read. `browser_debug_activity` combines an approved compact Network digest
@@ -143,6 +182,35 @@ same selected tab; a target change or mixed-tab recorder fails closed instead of
 merging unrelated evidence. The default `smart` profile exposes these
 task-oriented tools plus routing and explicit screenshot tools; use `full` only
 when an expert workflow needs the primitive surface.
+
+The diagnostic workflow also exposes:
+
+- `browser_explain_css` for bounded matched rules, computed values, CSS
+  variables, box geometry, generated stylesheet hints, and same-origin
+  original source-map hints when the map is readable;
+- `browser_create_reproduction_recipe` and
+  `browser_run_reproduction_recipe` for session-bound, explicitly reauthorized
+  workflow replay;
+- adapter-local `browser_find_workspace_source` for bounded path/symbol matching
+  under configured workspace roots;
+- `browser_performance_diagnostics` for Navigation/Resource Timing, buffered
+  LCP, layout-shift and Long Task summaries, plus bounded interaction/INP and
+  trace summaries;
+- `browser_realtime_activity` for payload-free WebSocket/EventSource counters,
+  Service Worker metadata, and IndexedDB database/store schema;
+- ordered `scenarioSteps` on `browser_proxy_upsert_rule` for stateful API Mock
+  sequences with `hold-last` or `loop` progression and explicit reset.
+
+`browser_capture_issue_evidence` returns a readable action/DOM/URL/Network/
+Console/screenshot-diff timeline in Chat and explicit sanitized Markdown/JSON
+exports. Profile-local conversation history supports full-text search and
+explicit Markdown/JSON download; tool payloads and image bytes are not stored
+in those conversation exports.
+
+Recipe artifacts are bound to the selected Profile session. Replaying a recipe
+never reuses the old execution grant and remains approval-gated; a lost write
+result is not automatically replayed. The workspace tool never accepts a
+caller-supplied root and does not make arbitrary filesystem paths reachable.
 
 `browser_snapshot` remains the expert-compatible accessibility-oriented snapshot for the
 adapter's bound Chrome Profile and selected tab/frame/document. Nodes include a
@@ -328,6 +396,35 @@ npm run verify:browser-evidence:complete
 ```
 
 Neither command changes the worksheet or echoes its notes/environment values.
+
+Run the combined real-Chrome diagnostic regression against an already open
+loopback fixture after rebuilding, reloading the unpacked extension, and
+refreshing that fixture tab:
+
+```bash
+npm run verify:workflow-evidence -- \
+  --tab-url-prefix http://127.0.0.1:8765/
+```
+
+The verifier covers multi-frame workflow actions, post-state checks, screenshot
+diffs, activity subscriptions, source mapping, CSS explanation, workspace
+mapping, recipe replay, performance/realtime summaries, a two-step stateful
+Mock, and issue-evidence artifacts. It may wait indefinitely for the sidepanel
+approval cards required by the selected approval mode.
+
+After that command returns an `issueEvidence.artifactUri`, run the scoped P0-P2
+acceptance against the same fixture:
+
+```bash
+npm run verify:p0-p2-live -- \
+  --tab-url-prefix http://127.0.0.1:8765/ \
+  --artifact-uri ai-devtools://artifact/<artifact-id>
+```
+
+This verifies the positive CSS/source-map chain and collaboration V2 progress
+deduplication, requirement/evidence append, durable cancellation, and waiter
+recovery. It creates and cancels a real collaboration task but does not mutate
+the fixture page.
 
 Check daemon reachability without printing the bridge token, page URL, or page
 content:

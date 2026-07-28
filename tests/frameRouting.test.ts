@@ -8,6 +8,7 @@ import {
   listRegisteredContentFrames,
   registerContentFrame,
   selectRegisteredContentFrame,
+  waitForRegisteredContentFrames,
 } from "../src/background/chromeApi";
 
 function sender(
@@ -114,4 +115,37 @@ test("multi-frame reads keep the selected frame first without changing selection
     }),
     undefined,
   );
+});
+
+test("frame readiness wait resolves when a newly loaded document registers", async () => {
+  clearContentFrames(74);
+  const registration = setTimeout(() => {
+    registerContentFrame(sender(74, 0, "doc-ready"), {
+      url: "https://example.test/ready",
+      title: "Ready",
+    });
+  }, 15);
+
+  try {
+    const frames = await waitForRegisteredContentFrames(74, {
+      timeoutMs: 200,
+      pollIntervalMs: 5,
+    });
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0]?.documentId, "doc-ready");
+  } finally {
+    clearTimeout(registration);
+    clearContentFrames(74);
+  }
+});
+
+test("frame readiness wait remains bounded when no document registers", async () => {
+  clearContentFrames(75);
+  const startedAt = Date.now();
+  const frames = await waitForRegisteredContentFrames(75, {
+    timeoutMs: 20,
+    pollIntervalMs: 5,
+  });
+  assert.deepEqual(frames, []);
+  assert.ok(Date.now() - startedAt < 250);
 });

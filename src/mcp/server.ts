@@ -4,6 +4,10 @@ import {
 } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import {
   formatMcpToolResult,
   parseMcpToolProfile,
   registerProxyMcpTools,
@@ -18,13 +22,22 @@ import {
 import { registerStateResources } from "./stateResourceRegistry";
 import {
   COLLABORATION_TOOL_NAMES,
+  cancelCollaborationTaskInputSchema,
+  cancelCollaborationTaskOutputSchema,
   delegateCollaborationTaskInputSchema,
   delegateCollaborationTaskOutputSchema,
   publishCollaborationItemInputSchema,
   publishCollaborationItemOutputSchema,
+  updateCollaborationTaskInputSchema,
+  updateCollaborationTaskOutputSchema,
   waitForCollaborationResultInputSchema,
   waitForCollaborationResultOutputSchema,
 } from "./collaborationTools";
+import {
+  createSessionResourceUri,
+  RESOURCE_SESSION_ID_PATTERN,
+} from "./resourceRouting";
+import { registerWorkspaceSourceTool } from "./workspaceTools";
 
 const mcpServer = new McpServer({
   name: "ai-devtools-assistant",
@@ -38,6 +51,7 @@ const toolProfile = parseMcpToolProfile(
 let shuttingDown = false;
 
 registerResources(mcpServer);
+registerResourceSubscriptions(mcpServer);
 registerTools(mcpServer);
 registerPrompts(mcpServer);
 
@@ -142,8 +156,61 @@ function registerResources(server: McpServer): void {
   );
 }
 
+function registerResourceSubscriptions(server: McpServer): void {
+  const subscriptions = new Set<string>();
+  server.server.registerCapabilities({
+    resources: {
+      subscribe: true,
+      listChanged: true,
+    },
+  });
+  server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+    const uri = requireActivityStreamSubscriptionUri(request.params.uri);
+    subscriptions.add(uri);
+    return {};
+  });
+  server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+    subscriptions.delete(request.params.uri);
+    return {};
+  });
+  daemonClient.subscribeActivityUpdates((payload) => {
+    const uri = createSessionResourceUri(
+      payload.sessionId,
+      "activity-stream",
+    );
+    if (!subscriptions.has(uri)) {
+      return;
+    }
+    void server.server.sendResourceUpdated({ uri }).catch((error) => {
+      console.error(
+        `[ai-devtools-mcp] failed to send activity resource update: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  });
+}
+
+function requireActivityStreamSubscriptionUri(uri: string): string {
+  const match =
+    /^ai-devtools:\/\/session\/([^/]+)\/activity-stream$/.exec(uri);
+  const sessionId = match?.[1];
+  if (!sessionId || !RESOURCE_SESSION_ID_PATTERN.test(sessionId)) {
+    throw new Error(
+      "RESOURCE_URI_INVALID: only listed activity-stream resources support subscription.",
+    );
+  }
+  if (daemonClient.selectedSessionId() !== sessionId) {
+    throw new Error(
+      "ROLE_FORBIDDEN: activity subscription session does not match this MCP adapter.",
+    );
+  }
+  return uri;
+}
+
 function registerTools(server: McpServer): void {
   registerProxyMcpTools(server, daemonClient, { profile: toolProfile });
+  registerWorkspaceSourceTool(server);
   registerAdapterRoutingTool(
     server,
     ADAPTER_ROUTING_TOOL_NAMES.LIST_SESSIONS,
@@ -263,6 +330,86 @@ function registerTools(server: McpServer): void {
               error instanceof Error
                 ? error.message
                 : "Failed while waiting for the local collaboration task.",
+          },
+          true,
+        );
+      }
+    },
+  );
+  server.registerTool(
+    COLLABORATION_TOOL_NAMES.UPDATE_TASK,
+    {
+      title: "Update a delegated collaboration task",
+      description:
+        "Append one idempotent progress, clarification, requirement, or evidence event to a durable delegated task. eventId is immutable.",
+      inputSchema: updateCollaborationTaskInputSchema,
+      outputSchema: updateCollaborationTaskOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (args: Record<string, unknown>, extra) => {
+      try {
+        return formatMcpToolResult(
+          await daemonClient.callTool(
+            COLLABORATION_TOOL_NAMES.UPDATE_TASK,
+            args,
+            {
+              signal: extra.signal,
+              idempotencyKey: `mcp:${String(extra.requestId)}`,
+            },
+          ),
+        );
+      } catch (error) {
+        return formatMcpToolResult(
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Failed to update the collaboration task.",
+          },
+          true,
+        );
+      }
+    },
+  );
+  server.registerTool(
+    COLLABORATION_TOOL_NAMES.CANCEL_TASK,
+    {
+      title: "Cancel a delegated collaboration task",
+      description:
+        "Cancel one non-terminal delegated task without replaying or undoing browser writes.",
+      inputSchema: cancelCollaborationTaskInputSchema,
+      outputSchema: cancelCollaborationTaskOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (args: Record<string, unknown>, extra) => {
+      try {
+        return formatMcpToolResult(
+          await daemonClient.callTool(
+            COLLABORATION_TOOL_NAMES.CANCEL_TASK,
+            args,
+            {
+              signal: extra.signal,
+              idempotencyKey: `mcp:${String(extra.requestId)}`,
+            },
+          ),
+        );
+      } catch (error) {
+        return formatMcpToolResult(
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Failed to cancel the collaboration task.",
           },
           true,
         );

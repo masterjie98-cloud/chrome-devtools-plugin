@@ -79,3 +79,34 @@ test("blocked session remains distinct from completed work and keeps progress", 
   assert.deepEqual(blocked.taskState.observations, ["已完成前两步。"]);
   assert.doesNotThrow(() => sanitizeAgentTaskState(blocked.taskState));
 });
+
+test("agent session preserves task, conversation, and execution Tab binding", () => {
+  const session = createAgentSessionSnapshot(
+    "run-bound",
+    "后台填写页面",
+    "2026-07-28T08:00:00.000Z",
+    {
+      taskId: "task_bound_tab_10",
+      conversationId: "conversation-1",
+      target: {
+        tabId: 10,
+        windowId: 2,
+        targetId: "10",
+        title: "业务页面",
+        url: "https://app.example.test/form",
+      },
+    },
+  );
+
+  assert.deepEqual(session.executionBinding, {
+    taskId: "task_bound_tab_10",
+    conversationId: "conversation-1",
+    target: {
+      tabId: 10,
+      windowId: 2,
+      targetId: "10",
+      title: "业务页面",
+      url: "https://app.example.test/form",
+    },
+  });
+});

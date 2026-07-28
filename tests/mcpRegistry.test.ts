@@ -53,6 +53,21 @@ test("the bounded action-stage executor is exposed to MCP clients", () => {
   );
 });
 
+test("diagnostic activity, source, and evidence tools are exposed to MCP clients", () => {
+  const exposedNames = new Set(
+    MCP_EXPOSED_TOOL_DEFINITIONS.map((tool) => tool.name),
+  );
+
+  for (const toolName of [
+    MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
+    MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
+    MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+    MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
+  ]) {
+    assert.equal(exposedNames.has(toolName), true, `${toolName} must be exposed`);
+  }
+});
+
 test("every canonical MCP tool has a specific bounded output contract", () => {
   const allToolNames = Object.values(MCP_TOOL_NAMES);
   assert.deepEqual(
@@ -395,16 +410,30 @@ test("MCP tool profiles reduce model-visible capability without changing policy"
   );
   assert.equal(inspect.length < read.length, true);
   assert.equal(read.length < full.length, true);
-  assert.equal(smart.length, 11);
+  assert.equal(smart.length, 20);
   assert.deepEqual(
-    smart.slice(0, 6).map((tool) => tool.definition.name),
+    smart.map((tool) => tool.definition.name),
     [
       MCP_TOOL_NAMES.BROWSER_STATUS,
+      MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
+      MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
       MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+      MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
       MCP_TOOL_NAMES.BROWSER_OBSERVE,
+      MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+      MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS,
+      MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS,
+      MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE,
+      MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE,
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
       MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
+      MCP_TOOL_NAMES.BROWSER_LIST_TABS,
+      MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB,
+      MCP_TOOL_NAMES.BROWSER_LIST_FRAMES,
+      MCP_TOOL_NAMES.BROWSER_SET_TARGET_FRAME,
     ],
   );
   assert.equal(parseMcpToolProfile(undefined), "smart");
@@ -541,6 +570,24 @@ test("canonical MCP Zod inputs reject unknown properties", () => {
     ].safeParse({ cursor: "cp1_audit_deadbeef_50", limit: 101 }).success,
     false,
   );
+});
+
+test("element action schemas advertise a required target alternative", () => {
+  const advertised = new Map(
+    listRuntimeMcpTools().map((tool) => [tool.name, tool.inputSchema]),
+  );
+  for (const toolName of [
+    MCP_TOOL_NAMES.BROWSER_CLICK,
+    MCP_TOOL_NAMES.BROWSER_HOVER,
+    MCP_TOOL_NAMES.BROWSER_TYPE,
+  ]) {
+    const anyOf = advertised.get(toolName)?.anyOf;
+    assert.ok(Array.isArray(anyOf), `${toolName} must advertise target anyOf`);
+    assert.deepEqual(
+      anyOf.map((entry) => (entry as { required?: string[] }).required),
+      [["ref"], ["selector"], ["target"], ["element"]],
+    );
+  }
 });
 
 test("adapter-only Profile routing tools use strict bounded inputs", () => {
