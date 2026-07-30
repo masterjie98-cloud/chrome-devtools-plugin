@@ -182,7 +182,10 @@ export interface BrowserActivityEventPayload {
 
 export interface BrowserActivityUpdatedPayload {
   sessionId: string;
+  streamId: string;
+  active: boolean;
   latestSequence: number;
+  target: ActiveTabSnapshot | null;
 }
 
 export interface BrowserToolCallPayload {

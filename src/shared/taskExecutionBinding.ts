@@ -1,9 +1,24 @@
-import type { ActiveTabSnapshot, McpToolCallPayload } from "./wsProtocol";
+import type {
+  ActiveTabSnapshot,
+  McpToolCallPayload,
+  WsClientRole,
+} from "./wsProtocol";
 
 export type TaskExecutionBindingMismatch =
   | "conversationId"
   | "tabId"
   | "targetId";
+
+export function resolveTaskBindingConversationId(
+  requesterRole: WsClientRole,
+  connectionConversationId: string | undefined,
+  sessionConversationId: string,
+): string {
+  if (requesterRole === "ui" && connectionConversationId?.trim()) {
+    return connectionConversationId.trim();
+  }
+  return sessionConversationId;
+}
 
 export function getTaskExecutionBindingMismatch(
   taskContext: McpToolCallPayload["taskContext"],

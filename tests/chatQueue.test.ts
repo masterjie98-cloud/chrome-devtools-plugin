@@ -12,6 +12,7 @@ import type { QueuedChatSubmission } from "../src/sidepanel/types";
 function submission(id: string): QueuedChatSubmission {
   return {
     id,
+    conversationId: `conversation-${id}`,
     input: `message ${id}`,
     attachments: [],
     createdAt: "2026-07-14T00:00:00.000Z",

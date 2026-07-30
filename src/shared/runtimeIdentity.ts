@@ -44,6 +44,38 @@ export function runtimeIdentityMismatch(
   return undefined;
 }
 
+export function parseRuntimeHandshakeFailure(
+  raw: unknown,
+): string | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(String(raw));
+  } catch {
+    return undefined;
+  }
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    (value as { ok?: unknown }).ok !== false ||
+    typeof (value as { error?: unknown }).error !== "string"
+  ) {
+    return undefined;
+  }
+  const error = (value as { error: string }).error.trim();
+  if (!error) {
+    return undefined;
+  }
+  if (
+    /^(?:BUILD_ID_MISMATCH|SCHEMA_HASH_MISMATCH|PROTOCOL_VERSION_UNSUPPORTED):/i.test(
+      error,
+    )
+  ) {
+    return `RUNTIME_VERSION_MISMATCH: ${error} Stop any older daemon instance, start the daemon from this package, then reopen the MCP client and reload the Chrome extension.`;
+  }
+  return error;
+}
+
 function fnv1a32(value: string): string {
   let hash = 0x811c9dc5;
   for (let index = 0; index < value.length; index += 1) {

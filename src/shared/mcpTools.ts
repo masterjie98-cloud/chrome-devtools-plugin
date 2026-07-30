@@ -181,7 +181,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
     title: "Start browser activity stream",
     description:
-      "Start bounded incremental DOM, Network, and Console observation for the exact selected target. Subscribe to the listed activity-stream resource to receive MCP resource-updated notifications without polling.",
+      "Start bounded DOM, URL navigation, Network, and Console observation for the exact selected target. Event kinds have independent retention so Network noise cannot evict navigation, DOM, or Console evidence. Save activityCursor.streamId and activityCursor.sequence and pass both to browser_debug_activity to read only later changes.",
     parameters: {
       type: "object",
       properties: {
@@ -193,6 +193,8 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
           type: "number",
           minimum: 10,
           maximum: 2000,
+          description:
+            "Raw Network request capacity for the monitor. Defaults to 2000; lower-priority requests are evicted first when full.",
         },
       },
       additionalProperties: false,
@@ -733,14 +735,41 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
     title: "Read compact debug activity",
     description:
-      "Read a compact current Network activity digest and sanitized console messages in one approved call. Raw response bodies are never included.",
+      "Read compact debug activity once. When afterSequence is present, returns only the bounded incremental page-change digest and sets legacy Network/Console snapshots to null, regardless of includeNetwork/includeConsole. If cursorStatus=events_dropped, report missedEvents; if transportDroppedEvents contains non-zero counts, report the local transport gap. Never claim complete coverage after either condition. The client commits activity.nextCursor only after the final summary succeeds. Omitting afterSequence reads only a recent legacy snapshot, never full history. Raw response bodies are never included.",
     parameters: {
       type: "object",
       properties: {
-        includeNetwork: { type: "boolean" },
-        includeConsole: { type: "boolean" },
+        includeNetwork: {
+          type: "boolean",
+          description:
+            "Include the legacy current Network snapshot only when afterSequence is omitted.",
+        },
+        includeConsole: {
+          type: "boolean",
+          description:
+            "Include the legacy current Console snapshot only when afterSequence is omitted.",
+        },
+        includeActivity: { type: "boolean" },
         networkLimit: { type: "number", minimum: 1, maximum: 100 },
         consoleLimit: { type: "number", minimum: 1, maximum: 200 },
+        afterSequence: {
+          type: "number",
+          minimum: 0,
+          description:
+            "Return only activity observed after this sequence. Use activityCursor.sequence from browser_activity_start, summarize this single result, then save activity.nextCursor for the user's next request.",
+        },
+        afterStreamId: {
+          type: "string",
+          description:
+            "Stream identity paired with afterSequence. Use activityCursor.streamId so daemon restarts and explicit monitor restarts are detected instead of silently returning an empty window.",
+        },
+        activityLimit: {
+          type: "number",
+          minimum: 1,
+          maximum: 40,
+          description:
+            "Maximum notable navigation and error/warning events; DOM and Network noise is aggregated separately.",
+        },
       },
       additionalProperties: false,
     },
@@ -1765,7 +1794,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         maxEntries: {
           type: "number",
           description:
-            "Maximum collected request entries to keep. Defaults to 300.",
+            "Maximum collected request entries to keep. Defaults to 2000. When full, static successful GET noise is evicted before navigation, failures, mutations, and XHR/Fetch requests.",
         },
       },
       additionalProperties: false,

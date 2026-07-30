@@ -21,6 +21,7 @@ import { getToolPolicy } from "../shared/toolPolicy";
 import {
   RUNTIME_BUILD_ID,
   RUNTIME_SCHEMA_HASH,
+  parseRuntimeHandshakeFailure,
   runtimeIdentityMismatch,
 } from "../shared/runtimeIdentity";
 import { ADAPTER_ROUTING_TOOL_NAMES } from "./adapterRoutingTools";
@@ -406,7 +407,13 @@ export class DaemonClient {
 
       socket.once("open", async () => {
         socket.on("message", (raw) => {
-          const message = parseDaemonMessage(raw.toString());
+          const rawText = raw.toString();
+          const handshakeFailure = parseDaemonHandshakeFailure(rawText);
+          if (handshakeFailure) {
+            failConnection(new Error(handshakeFailure));
+            return;
+          }
+          const message = parseDaemonMessage(rawText);
           if (message?.command === WS_COMMANDS.SERVER_WELCOME) {
             if (message.payload.protocolVersion !== WS_PROTOCOL_VERSION) {
               failConnection(
@@ -447,7 +454,9 @@ export class DaemonClient {
           this.connecting = null;
           this.rejectPending("Local daemon disconnected before the response arrived.");
           failConnection(
-            new Error("Local daemon disconnected during protocol negotiation."),
+            new Error(
+              "DAEMON_PROTOCOL_MISMATCH_SUSPECTED: the local daemon closed before SERVER_WELCOME. Stop any older daemon instance, start the daemon from this package, then reopen the MCP client and reload the Chrome extension.",
+            ),
           );
         });
         socket.on("error", () => {
@@ -493,7 +502,7 @@ export class DaemonClient {
           handshakeTimeout = setTimeout(() => {
             failConnection(
               new Error(
-                `PROTOCOL_NEGOTIATION_TIMEOUT: daemon did not send SERVER_WELCOME for version ${WS_PROTOCOL_VERSION}.`,
+                `DAEMON_PROTOCOL_MISMATCH_SUSPECTED: daemon did not send SERVER_WELCOME for version ${WS_PROTOCOL_VERSION}. Stop any older daemon instance, start the daemon from this package, then reopen the MCP client and reload the Chrome extension.`,
               ),
             );
           }, 5_000);
@@ -590,6 +599,10 @@ function parseDaemonMessage(raw: string): McpToPluginMessage | null {
   }
 }
 
+export function parseDaemonHandshakeFailure(raw: string): string | undefined {
+  return parseRuntimeHandshakeFailure(raw);
+}
+
 function deadlineTimeoutMs(deadlineAt: string): number {
   const parsed = Date.parse(deadlineAt);
   if (!Number.isFinite(parsed)) {
@@ -627,7 +640,7 @@ function isDaemonConnectionError(error: Error): boolean {
 }
 
 function isBeforeDispatchDaemonError(error: Error): boolean {
-  return /(?:ECONNREFUSED|not connected|protocol negotiation|did not send SERVER_WELCOME|Failed to load local daemon credentials)/i.test(
+  return /(?:ECONNREFUSED|not connected|protocol negotiation|did not send SERVER_WELCOME|RUNTIME_VERSION_MISMATCH|DAEMON_PROTOCOL_MISMATCH_SUSPECTED|Failed to load local daemon credentials)/i.test(
     error.message,
   );
 }

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getTaskExecutionBindingMismatch } from "../src/shared/taskExecutionBinding";
+import {
+  getTaskExecutionBindingMismatch,
+  resolveTaskBindingConversationId,
+} from "../src/shared/taskExecutionBinding";
 
 const taskContext = {
   taskId: "task_tab_10",
@@ -45,5 +48,24 @@ test("task binding rejects cross-conversation and cross-Tab routing", () => {
       targetId: "other-target",
     }),
     "targetId",
+  );
+});
+
+test("UI task binding uses the conversation owned by its sidepanel connection", () => {
+  assert.equal(
+    resolveTaskBindingConversationId(
+      "ui",
+      "conversation-panel-b",
+      "conversation-session-a",
+    ),
+    "conversation-panel-b",
+  );
+  assert.equal(
+    resolveTaskBindingConversationId(
+      "mcp",
+      "conversation-panel-b",
+      "conversation-session-a",
+    ),
+    "conversation-session-a",
   );
 });

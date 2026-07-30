@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  DEFAULT_CHAT_GREETING,
   MAX_STORED_CONVERSATIONS,
   conversationSearchText,
   createStoredConversation,
   exportStoredConversation,
+  isEmptyStoredConversation,
   normalizeChatWorkspace,
+  upsertPersistableConversation,
   upsertStoredConversation,
 } from "../src/sidepanel/services/chatWorkspace";
 import type { ChatMessage } from "../src/sidepanel/types";
@@ -70,6 +73,73 @@ test("stored conversations omit tool results, attachments, and runtime status", 
   assert.equal(JSON.stringify(stored).includes("authorization"), false);
 });
 
+test("conversation target persists a fixed Tab without URL credentials or query data", () => {
+  const stored = createStoredConversation({
+    id: "conversation-target",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:01.000Z",
+    messages: [],
+    draft: "",
+    target: {
+      tabId: 17,
+      windowId: 4,
+      targetId: "17",
+      title: "Checkout",
+      url: "https://user:secret@example.test/checkout?token=secret#step",
+    },
+  });
+
+  assert.deepEqual(stored.target, {
+    tabId: 17,
+    windowId: 4,
+    targetId: "17",
+    title: "Checkout",
+    url: "https://example.test/checkout",
+  });
+  assert.deepEqual(
+    normalizeChatWorkspace({
+      version: 1,
+      conversations: [{ ...stored, target: { tabId: -1 } }],
+    }).conversations[0]?.target,
+    undefined,
+  );
+});
+
+test("conversation activity cursor persists a stream identity and sequence", () => {
+  const stored = createStoredConversation({
+    id: "conversation-activity",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:01.000Z",
+    messages: [],
+    draft: "",
+    activityCursor: { streamId: "activity-a", sequence: 57 },
+  });
+
+  assert.deepEqual(stored.activityCursor, {
+    streamId: "activity-a",
+    sequence: 57,
+  });
+  assert.equal(
+    normalizeChatWorkspace({
+      version: 1,
+      conversations: [
+        {
+          ...stored,
+          activityCursor: { streamId: "activity-a", sequence: -1 },
+        },
+      ],
+    }).conversations[0]?.activityCursor,
+    undefined,
+  );
+  assert.equal(
+    normalizeChatWorkspace({
+      version: 1,
+      conversations: [{ ...stored, activityCursor: 57 }],
+    }).conversations[0]?.activityCursor,
+    undefined,
+  );
+});
+
 test("workspace normalization deduplicates, sorts, and bounds conversations", () => {
   const conversations = Array.from(
     { length: MAX_STORED_CONVERSATIONS + 3 },
@@ -113,6 +183,62 @@ test("upsert derives a compact title from the first user message", () => {
   const next = upsertStoredConversation([], conversation);
 
   assert.equal(next[0]?.title, "Explain the current page controls in detail");
+});
+
+test("a greeting-only conversation remains ephemeral until it has real state", () => {
+  const empty = createStoredConversation({
+    id: "conversation-empty",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:01.000Z",
+    messages: [
+      {
+        id: "assistant-ready",
+        role: "assistant",
+        source: "extension_ai",
+        content: DEFAULT_CHAT_GREETING,
+        createdAt: "2026-07-14T00:00:00.000Z",
+      },
+    ],
+    draft: "",
+  });
+
+  assert.equal(isEmptyStoredConversation(empty), true);
+  assert.deepEqual(upsertPersistableConversation([empty], empty), []);
+  assert.deepEqual(
+    normalizeChatWorkspace({
+      version: 1,
+      activeConversationId: empty.id,
+      conversations: [empty],
+    }),
+    { version: 1, conversations: [] },
+  );
+
+  const withDraft = createStoredConversation({
+    ...empty,
+    draft: "准备检查当前页面",
+    messages: empty.messages as ChatMessage[],
+  });
+  const withTarget = createStoredConversation({
+    ...empty,
+    messages: empty.messages as ChatMessage[],
+    target: { tabId: 17, url: "https://example.test/reports" },
+  });
+  const withUserMessage = createStoredConversation({
+    ...empty,
+    messages: [
+      ...empty.messages,
+      {
+        id: "user-real",
+        role: "user",
+        content: "检查当前页面",
+        createdAt: "2026-07-14T00:00:02.000Z",
+      },
+    ] as ChatMessage[],
+  });
+
+  assert.equal(isEmptyStoredConversation(withDraft), false);
+  assert.equal(isEmptyStoredConversation(withTarget), false);
+  assert.equal(isEmptyStoredConversation(withUserMessage), false);
 });
 
 test("tool-heavy runs do not evict the bounded user and assistant history", () => {

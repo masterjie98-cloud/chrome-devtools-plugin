@@ -56,6 +56,12 @@ interface DomMutationJournalEntry {
   removed: number;
   attributes: number;
   characterData: number;
+  domSamples: Array<{
+    changeType: "added" | "removed" | "attribute" | "text";
+    selector?: string;
+    text?: string;
+  }>;
+  domSamplesOmitted: number;
 }
 
 const DOM_MUTATION_JOURNAL_LIMIT = 100;
@@ -245,14 +251,42 @@ function ensureDomMutationObserver(): void {
     let removed = 0;
     let attributes = 0;
     let characterData = 0;
+    const domSamples: DomMutationJournalEntry["domSamples"] = [];
+    let domSamplesOmitted = 0;
     for (const record of records) {
       if (record.type === "childList") {
         added += record.addedNodes.length;
         removed += record.removedNodes.length;
+        for (const node of Array.from(record.addedNodes)) {
+          if (domSamples.length < 12) {
+            domSamples.push(toDomActivitySample("added", node));
+          } else {
+            domSamplesOmitted += 1;
+          }
+        }
+        for (const node of Array.from(record.removedNodes)) {
+          if (domSamples.length < 12) {
+            domSamples.push(toDomActivitySample("removed", node));
+          } else {
+            domSamplesOmitted += 1;
+          }
+        }
       } else if (record.type === "attributes") {
         attributes += 1;
+        if (domSamples.length < 12) {
+          domSamples.push(
+            toDomActivitySample("attribute", record.target, record.attributeName),
+          );
+        } else {
+          domSamplesOmitted += 1;
+        }
       } else {
         characterData += 1;
+        if (domSamples.length < 12) {
+          domSamples.push(toDomActivitySample("text", record.target));
+        } else {
+          domSamplesOmitted += 1;
+        }
       }
     }
     domRevision += 1;
@@ -262,6 +296,8 @@ function ensureDomMutationObserver(): void {
       removed,
       attributes,
       characterData,
+      domSamples,
+      domSamplesOmitted,
     });
     if (domMutationJournal.length > DOM_MUTATION_JOURNAL_LIMIT) {
       domMutationJournal.splice(
@@ -276,6 +312,19 @@ function ensureDomMutationObserver(): void {
         attributes: (domActivityPending?.attributes ?? 0) + attributes,
         characterData:
           (domActivityPending?.characterData ?? 0) + characterData,
+        domSamples: [
+          ...(domActivityPending?.domSamples ?? []),
+          ...domSamples,
+        ].slice(0, 12),
+        domSamplesOmitted:
+          (domActivityPending?.domSamplesOmitted ?? 0) +
+          domSamplesOmitted +
+          Math.max(
+            0,
+            (domActivityPending?.domSamples.length ?? 0) +
+              domSamples.length -
+              12,
+          ),
       };
       if (!domActivityTimer) {
         domActivityTimer = setTimeout(flushDomActivity, DOM_ACTIVITY_BATCH_MS);
@@ -288,6 +337,28 @@ function ensureDomMutationObserver(): void {
     attributes: true,
     characterData: true,
   });
+}
+
+function toDomActivitySample(
+  changeType: "added" | "removed" | "attribute" | "text",
+  node: Node,
+  attributeName?: string | null,
+): DomMutationJournalEntry["domSamples"][number] {
+  const element =
+    node instanceof Element
+      ? node
+      : node.parentElement;
+  const selector = element ? getCssSelector(element) : undefined;
+  const rawText =
+    changeType === "attribute" && element && attributeName
+      ? `${attributeName}=${element.getAttribute(attributeName) ?? ""}`
+      : node.textContent ?? element?.textContent ?? "";
+  const text = sanitizeText(rawText.replace(/\s+/g, " ").trim(), 240);
+  return {
+    changeType,
+    ...(selector ? { selector: sanitizeText(selector, 500) } : {}),
+    ...(text ? { text } : {}),
+  };
 }
 
 function flushDomActivity(): void {

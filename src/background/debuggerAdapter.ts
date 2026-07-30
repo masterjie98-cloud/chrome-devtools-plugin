@@ -68,6 +68,7 @@ import {
   buildNetworkActivityDigest,
   normalizeNetworkResultPagination,
 } from "../shared/networkActivity";
+import { selectNetworkRequestToEvict } from "../shared/networkRetention";
 import { paginateCollection } from "../shared/collectionPagination";
 import { MESSAGE_TYPES } from "../shared/messages";
 import { makeEvent, sendRuntimeEvent } from "../shared/messaging";
@@ -102,7 +103,7 @@ import {
 } from "./debuggerTargetRouting";
 
 const PROTOCOL_VERSION = "1.3";
-const DEFAULT_MAX_NETWORK_ENTRIES = 300;
+const DEFAULT_MAX_NETWORK_ENTRIES = 2_000;
 const MAX_RESPONSE_BODY_CHARS = 120_000;
 const MAX_PROXY_HITS = 300;
 const MAX_CONSOLE_MESSAGES = 500;
@@ -264,6 +265,7 @@ interface NetworkSession {
   preservedLog: boolean;
   observationSessionId?: string;
   observationStartedAt?: string;
+  droppedRequestCount: number;
   requests: Map<string, NetworkRequestRecord>;
   requestOrder: string[];
   consoleMessages: ConsoleMessageRecord[];
@@ -317,6 +319,7 @@ const debuggerActivityListeners = new Set<
   (event: BrowserActivityEventInput) => void
 >();
 let debuggerActivityMonitoringActive = false;
+let debuggerActivityMonitorTabId: number | undefined;
 
 export function subscribeDebuggerActivity(
   listener: (event: BrowserActivityEventInput) => void,
@@ -325,11 +328,18 @@ export function subscribeDebuggerActivity(
   return () => debuggerActivityListeners.delete(listener);
 }
 
-export function emitDebuggerActivityLifecycle(active: boolean): void {
+export function emitDebuggerActivityLifecycle(
+  active: boolean,
+  target?: BrowserActivityEventInput["target"],
+  locksDebugger = false,
+): void {
   debuggerActivityMonitoringActive = active;
+  debuggerActivityMonitorTabId =
+    active && locksDebugger ? target?.tabId : undefined;
   const event: BrowserActivityEventInput = {
     kind: "navigation",
     observedAt: new Date().toISOString(),
+    target,
     summary: {
       reason: active ? "monitoring-started" : "monitoring-stopped",
     },
@@ -337,6 +347,15 @@ export function emitDebuggerActivityLifecycle(active: boolean): void {
   for (const listener of debuggerActivityListeners) {
     listener(event);
   }
+}
+
+export function emitDebuggerNavigationActivity(
+  event: Omit<BrowserActivityEventInput, "kind">,
+): void {
+  emitDebuggerActivity({
+    ...event,
+    kind: "navigation",
+  });
 }
 
 export async function resolveGeneratedSourceLocation(
@@ -1036,6 +1055,8 @@ export function listNetworkRequests(
       returned: 0,
       requests: [],
       activityDigest: buildNetworkActivityDigest([]),
+      droppedRequestCount: 0,
+      capacityReached: false,
       pagination: normalizeNetworkResultPagination(page.pagination, digestOnly),
       observationSessionId: undefined,
       observationStartedAt: undefined,
@@ -1070,6 +1091,8 @@ export function listNetworkRequests(
     returned: digestOnly ? 0 : page.items.length,
     requests: digestOnly ? [] : page.items,
     activityDigest: buildNetworkActivityDigest(filteredRequests),
+    droppedRequestCount: activeSession.droppedRequestCount,
+    capacityReached: activeSession.droppedRequestCount > 0,
     pagination: normalizeNetworkResultPagination(page.pagination, digestOnly),
     observationSessionId: activeSession.observationSessionId,
     observationStartedAt: activeSession.observationStartedAt,
@@ -1682,6 +1705,11 @@ async function ensureDebuggerSessionForTab(
   const resolvedTarget = await resolveDebuggerTarget(tab.id, tabUrl);
 
   if (activeSession && activeSession.tabId !== tab.id) {
+    if (debuggerActivityMonitorTabId !== undefined) {
+      throw new Error(
+        `ACTIVITY_MONITOR_CONFLICT: Tab ${debuggerActivityMonitorTabId} owns the active Network/Console monitor. Stop that monitor before attaching Chrome debugger to Tab ${tab.id}.`,
+      );
+    }
     await debuggerDetach(activeSession.target).catch(() => undefined);
     clearChildDebuggerSessions();
     activeSession = null;
@@ -1704,6 +1732,7 @@ async function ensureDebuggerSessionForTab(
       preservedLog: true,
       observationSessionId: undefined,
       observationStartedAt: undefined,
+      droppedRequestCount: 0,
       requests: new Map(),
       requestOrder: [],
       consoleMessages: [],
@@ -3201,18 +3230,20 @@ function handleResponseReceived(event: NetworkResponseReceivedEvent): void {
   existing.remoteAddress = event.response.remoteIPAddress
     ? `${event.response.remoteIPAddress}:${event.response.remotePort ?? ""}`
     : undefined;
-  emitDebuggerActivity({
-    kind: "network",
-    observedAt: new Date().toISOString(),
-    summary: {
-      method: existing.method,
-      url: existing.url,
-      resourceType: existing.resourceType,
-      status: existing.status,
-      requestId: existing.requestId,
-      initiatorType: existing.initiatorType,
-    },
-  });
+  if (shouldEmitNetworkActivity(existing)) {
+    emitDebuggerActivity({
+      kind: "network",
+      observedAt: new Date().toISOString(),
+      summary: {
+        method: existing.method,
+        url: existing.url,
+        resourceType: existing.resourceType,
+        status: existing.status,
+        requestId: existing.requestId,
+        initiatorType: existing.initiatorType,
+      },
+    });
+  }
 }
 
 function handleLoadingFinished(event: NetworkLoadingFinishedEvent): void {
@@ -3332,8 +3363,20 @@ function emitDebuggerActivity(event: BrowserActivityEventInput): void {
   if (!debuggerActivityMonitoringActive) {
     return;
   }
+  const normalizedEvent =
+    event.target || !activeSession
+      ? event
+      : {
+          ...event,
+          target: {
+            url: activeSession.targetInfo?.url ?? "",
+            title: activeSession.targetInfo?.title ?? "",
+            targetId: String(activeSession.tabId),
+            tabId: activeSession.tabId,
+          },
+        };
   for (const listener of debuggerActivityListeners) {
-    listener(event);
+    listener(normalizedEvent);
   }
 }
 
@@ -3441,6 +3484,7 @@ function clearNetworkRequests(): void {
   activeSession?.requests.clear();
   if (activeSession) {
     activeSession.requestOrder = [];
+    activeSession.droppedRequestCount = 0;
     activeSession.webSockets.clear();
     activeSession.eventSources.clear();
   }
@@ -3448,10 +3492,30 @@ function clearNetworkRequests(): void {
 
 function trimNetworkRequests(session: NetworkSession): void {
   while (session.requestOrder.length > session.maxEntries) {
-    const requestId = session.requestOrder.shift();
-    if (requestId) {
-      session.requests.delete(requestId);
+    const requestId = selectNetworkRequestToEvict(
+      session.requestOrder
+        .map((candidateId) => session.requests.get(candidateId))
+        .filter(
+          (request): request is NetworkRequestRecord => request !== undefined,
+        )
+        .map((request) => ({
+          requestId: request.requestId,
+          method: request.method,
+          resourceType: request.resourceType,
+          status: request.status,
+          failed: request.failed,
+          finished: request.finishedAt !== undefined,
+        })),
+    );
+    if (!requestId) {
+      break;
     }
+    const orderIndex = session.requestOrder.indexOf(requestId);
+    if (orderIndex >= 0) {
+      session.requestOrder.splice(orderIndex, 1);
+    }
+    session.requests.delete(requestId);
+    session.droppedRequestCount += 1;
   }
 }
 
@@ -3463,10 +3527,26 @@ function networkStatus(): DebuggerNetworkStatus {
     protocolVersion: PROTOCOL_VERSION,
     requestCount: activeSession?.requests.size ?? 0,
     maxEntries: activeSession?.maxEntries ?? DEFAULT_MAX_NETWORK_ENTRIES,
+    droppedRequestCount: activeSession?.droppedRequestCount ?? 0,
+    capacityReached: (activeSession?.droppedRequestCount ?? 0) > 0,
     preservedLog: activeSession?.preservedLog ?? true,
     observationSessionId: activeSession?.observationSessionId,
     observationStartedAt: activeSession?.observationStartedAt,
   };
+}
+
+function shouldEmitNetworkActivity(
+  request: NetworkRequestRecord,
+): boolean {
+  const method = request.method.toUpperCase();
+  return (
+    request.resourceType === "Document" ||
+    request.resourceType === "XHR" ||
+    request.resourceType === "Fetch" ||
+    method !== "GET" ||
+    request.failed === true ||
+    (request.status ?? 0) >= 300
+  );
 }
 
 function requireNetworkSession(): NetworkSession {

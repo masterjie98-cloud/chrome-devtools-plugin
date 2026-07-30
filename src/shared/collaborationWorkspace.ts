@@ -110,6 +110,14 @@ export interface CollaborationWorkspaceMutationResult {
 export const MAX_COLLABORATION_ITEMS = 100;
 export const MAX_COLLABORATION_CONTENT_BYTES = 32 * 1024;
 export const MAX_COLLABORATION_WORKSPACE_BYTES = 256 * 1024;
+// Keep room for one maximum inline payload plus its bounded metadata. The hard
+// ceiling protects Profile persistence and replay; compaction should happen
+// before a normal publication reaches that ceiling.
+const COLLABORATION_WORKSPACE_HEADROOM_BYTES =
+  MAX_COLLABORATION_CONTENT_BYTES + 16 * 1024;
+const RETAINED_COLLABORATION_WORKSPACE_BYTES =
+  MAX_COLLABORATION_WORKSPACE_BYTES -
+  COLLABORATION_WORKSPACE_HEADROOM_BYTES;
 
 const ITEM_ID_PATTERN = /^ctx_[A-Za-z0-9_-]{8,200}$/;
 const MAX_JSON_DEPTH = 6;
@@ -131,7 +139,7 @@ export function upsertCollaborationItem(
   now = new Date().toISOString(),
   options: { allowOwnerLastWriteWithoutRevision?: boolean } = {},
 ): CollaborationWorkspaceMutationResult {
-  assertWorkspaceSnapshot(workspace);
+  assertWorkspaceSnapshot(workspace, now);
   const normalizedSource = sanitizeSource(source);
   const itemId = normalizeItemId(input.id ?? `ctx_${createMessageId()}`);
   const existingIndex = workspace.items.findIndex((item) => item.id === itemId);
@@ -191,13 +199,82 @@ export function upsertCollaborationItem(
   const nextWorkspace = {
     version: COLLABORATION_WORKSPACE_VERSION,
     revision: workspace.revision + 1,
-    items: retainBoundedItems(items, now),
+    items: retainBoundedItems(items, now, item.id),
   } satisfies CollaborationWorkspaceSnapshot;
   assertWorkspaceByteLimit(nextWorkspace);
 
   return {
     workspace: nextWorkspace,
     item,
+  };
+}
+
+export function sanitizeCollaborationItemInput(
+  input: CollaborationItemInput,
+): CollaborationItemInput {
+  if (!isCollaborationItemKind(input.kind)) {
+    throw new Error(`Unsupported collaboration item kind: ${String(input.kind)}`);
+  }
+  if (
+    input.visibility !== undefined &&
+    !isCollaborationVisibility(input.visibility)
+  ) {
+    throw new Error("Collaboration item visibility is invalid.");
+  }
+  if (
+    input.sensitivity !== undefined &&
+    !isCollaborationSensitivity(input.sensitivity)
+  ) {
+    throw new Error("Collaboration item sensitivity is invalid.");
+  }
+  if (input.status !== undefined && !isCollaborationItemStatus(input.status)) {
+    throw new Error("Collaboration item status is invalid.");
+  }
+  if (
+    input.expectedRevision !== undefined &&
+    (!Number.isSafeInteger(input.expectedRevision) ||
+      input.expectedRevision < 1)
+  ) {
+    throw new Error("Collaboration item expectedRevision is invalid.");
+  }
+  if (
+    input.expiresAt !== undefined &&
+    (!isIsoTimestamp(input.expiresAt) || input.expiresAt.length > 64)
+  ) {
+    throw new Error("Collaboration item expiresAt is invalid.");
+  }
+  const content = input.content === undefined
+    ? undefined
+    : sanitizeJsonValue(redactSensitiveData(input.content), 0);
+  if (
+    content !== undefined &&
+    new TextEncoder().encode(JSON.stringify(content)).byteLength >
+      MAX_COLLABORATION_CONTENT_BYTES
+  ) {
+    throw new Error(
+      `PAYLOAD_TOO_LARGE: collaboration item content exceeds ${MAX_COLLABORATION_CONTENT_BYTES} bytes. Publish a smaller summary or an artifact reference.`,
+    );
+  }
+  return {
+    id: input.id === undefined ? undefined : normalizeItemId(input.id),
+    kind: input.kind,
+    title: sanitizeRequiredText(input.title, 240, "title"),
+    summary: sanitizeRequiredText(input.summary, 2000, "summary"),
+    content,
+    tags: input.tags === undefined ? undefined : sanitizeTags(input.tags),
+    visibility: input.visibility,
+    sensitivity: input.sensitivity,
+    status: input.status,
+    target:
+      input.target === undefined
+        ? undefined
+        : toCollaborationTargetBinding(input.target),
+    parentId:
+      input.parentId === undefined
+        ? undefined
+        : normalizeItemId(input.parentId),
+    expectedRevision: input.expectedRevision,
+    expiresAt: input.expiresAt,
   };
 }
 
@@ -343,10 +420,14 @@ function sanitizeJsonValue(value: unknown, depth: number): CollaborationJsonValu
         `COLLABORATION_CONTENT_INVALID: arrays are limited to ${MAX_ARRAY_ITEMS} entries.`,
       );
     }
-    return value.map((entry) => sanitizeJsonValue(entry, depth + 1));
+    return value.map((entry) =>
+      entry === undefined ? null : sanitizeJsonValue(entry, depth + 1)
+    );
   }
   if (isRecord(value)) {
-    const entries = Object.entries(value);
+    const entries = Object.entries(value).filter(
+      ([, entry]) => entry !== undefined,
+    );
     if (entries.length > MAX_OBJECT_KEYS) {
       throw new Error(
         `COLLABORATION_CONTENT_INVALID: objects are limited to ${MAX_OBJECT_KEYS} keys.`,
@@ -418,19 +499,134 @@ function sanitizeTags(value: unknown): string[] {
 function retainBoundedItems(
   items: CollaborationItem[],
   now: string,
+  preferredItemId?: string,
 ): CollaborationItem[] {
   const nowMs = Date.parse(now);
   const unexpired = items.filter(
     (item) => !item.expiresAt || Date.parse(item.expiresAt) > nowMs,
   );
-  return unexpired
-    .sort(
-      (left, right) =>
-        Number(left.status === "active") - Number(right.status === "active") ||
-        left.updatedAt.localeCompare(right.updatedAt),
-    )
-    .slice(-MAX_COLLABORATION_ITEMS)
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const itemById = new Map(unexpired.map((item) => [item.id, item]));
+  const groups = new Map<string, CollaborationItem[]>();
+  for (const item of unexpired) {
+    const rootId = collaborationGroupRootId(item, itemById);
+    if (!rootId) {
+      continue;
+    }
+    groups.set(rootId, [...(groups.get(rootId) ?? []), item]);
+  }
+
+  let preferredRootId: string | undefined;
+  if (preferredItemId) {
+    const preferredItem = itemById.get(preferredItemId);
+    if (!preferredItem) {
+      throw new Error(
+        `COLLABORATION_ITEM_MISSING: item ${preferredItemId} was not available for persistence.`,
+      );
+    }
+    preferredRootId = collaborationGroupRootId(preferredItem, itemById);
+    if (!preferredRootId) {
+      throw new Error(
+        `COLLABORATION_PARENT_MISSING: item ${preferredItemId} must reference a retained parent chain.`,
+      );
+    }
+  }
+  const prioritizedGroups = [...groups.entries()].sort((left, right) => {
+    if (left[0] === preferredRootId) {
+      return -1;
+    }
+    if (right[0] === preferredRootId) {
+      return 1;
+    }
+    const priorityDifference =
+      collaborationGroupPriority(right[1]) -
+      collaborationGroupPriority(left[1]);
+    if (priorityDifference !== 0) {
+      return priorityDifference;
+    }
+    return collaborationGroupUpdatedAt(right[1]).localeCompare(
+      collaborationGroupUpdatedAt(left[1]),
+    );
+  });
+  const retained: CollaborationItem[] = [];
+  for (const [rootId, group] of prioritizedGroups) {
+    const candidate = [...retained, ...group];
+    const byteBudget =
+      rootId === preferredRootId
+        ? MAX_COLLABORATION_WORKSPACE_BYTES
+        : RETAINED_COLLABORATION_WORKSPACE_BYTES;
+    if (
+      candidate.length > MAX_COLLABORATION_ITEMS ||
+      collaborationItemsByteLength(candidate) > byteBudget
+    ) {
+      if (rootId === preferredRootId) {
+        throw new Error(
+          `PAYLOAD_TOO_LARGE: collaboration task group containing ${preferredItemId} cannot fit within ${MAX_COLLABORATION_WORKSPACE_BYTES} bytes. Publish large outputs as artifact references instead of inline task events.`,
+        );
+      }
+      continue;
+    }
+    retained.push(...group);
+  }
+
+  return retained.sort((left, right) =>
+    left.createdAt.localeCompare(right.createdAt),
+  );
+}
+
+function collaborationGroupRootId(
+  item: CollaborationItem,
+  itemById: ReadonlyMap<string, CollaborationItem>,
+): string | undefined {
+  let current = item;
+  const visited = new Set<string>();
+  while (true) {
+    if (visited.has(current.id)) {
+      return undefined;
+    }
+    visited.add(current.id);
+    if (!current.parentId) {
+      return current.id;
+    }
+    const parent = itemById.get(current.parentId);
+    if (!parent) {
+      return undefined;
+    }
+    current = parent;
+  }
+}
+
+function collaborationGroupPriority(items: CollaborationItem[]): number {
+  const delegatedRequest = items.some((item) => item.kind === "task.request");
+  const delegatedResult = items.some((item) => item.kind === "task.result");
+  if (delegatedRequest && !delegatedResult) {
+    return 3;
+  }
+  if (delegatedRequest && delegatedResult) {
+    return 2;
+  }
+  if (
+    items.some((item) => item.status === "active")
+  ) {
+    return 1;
+  }
+  return 0;
+}
+
+function collaborationGroupUpdatedAt(items: CollaborationItem[]): string {
+  return items.reduce(
+    (latest, item) => (item.updatedAt > latest ? item.updatedAt : latest),
+    "",
+  );
+}
+
+function collaborationItemsByteLength(items: CollaborationItem[]): number {
+  return new TextEncoder().encode(
+    JSON.stringify({
+      version: COLLABORATION_WORKSPACE_VERSION,
+      revision: 0,
+      items,
+    }),
+  ).byteLength;
 }
 
 function normalizeItemId(value: unknown): string {
@@ -513,8 +709,9 @@ function isCollaborationItemStatus(value: unknown): value is CollaborationItemSt
 
 function assertWorkspaceSnapshot(
   value: CollaborationWorkspaceSnapshot,
+  now: string,
 ): void {
-  sanitizeCollaborationWorkspace(value);
+  sanitizeCollaborationWorkspace(value, now);
 }
 
 function assertWorkspaceByteLimit(

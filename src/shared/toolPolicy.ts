@@ -379,7 +379,7 @@ export function getToolPolicy(
       approvalMode: "task_grant",
       capability: "page.observe.network_digest",
       reason:
-        "Reads only a bounded aggregated Network digest and sanitized console messages; raw request rows, headers, and bodies remain separately protected.",
+        "Reads only a bounded aggregated Network digest, sanitized console messages, and a sequence-based page activity summary; raw request rows, headers, and bodies remain separately protected.",
     });
   }
 

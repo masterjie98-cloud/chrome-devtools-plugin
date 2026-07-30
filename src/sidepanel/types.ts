@@ -45,6 +45,7 @@ export interface ChatImageAttachment {
 
 export interface QueuedChatSubmission {
   id: string;
+  conversationId: string;
   input: string;
   attachments: ChatImageAttachment[];
   createdAt: string;
@@ -90,6 +91,7 @@ export interface ChatConversationSummary {
 
 export interface PendingToolApproval {
   id: string;
+  conversationId: string;
   toolName: string;
   arguments: Record<string, unknown>;
   policyClass: string;

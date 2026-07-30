@@ -12,6 +12,7 @@ import {
 } from "../src/mcp/collaborationTaskRuntime";
 import {
   DELEGATED_TASK_VERSION,
+  decodeDelegatedTaskConversationKey,
   delegatedTaskClaimItemId,
   delegatedTaskConversationKey,
   delegatedTaskEventItemId,
@@ -19,9 +20,17 @@ import {
   isDelegatedTaskBoundToConversation,
   isDelegatedTaskConversationId,
   isDelegatedTaskInboxActionable,
+  isDelegatedTaskOrphaned,
 } from "../src/shared/collaborationTasks";
 
 const SESSION_ID = "profile-collaboration";
+
+test("delegated conversation keys round-trip without creating a second identity", () => {
+  const conversationId = "chat-中文-🧪";
+  const key = delegatedTaskConversationKey(conversationId);
+  assert.equal(decodeDelegatedTaskConversationKey(key), conversationId);
+  assert.equal(decodeDelegatedTaskConversationKey("conv_invalid"), undefined);
+});
 
 test("long delegated task event IDs remain bounded and collision resistant", () => {
   const taskId = `task_${"a".repeat(120)}`;
@@ -184,6 +193,8 @@ test("acceptance binds a task to one conversation and rejects cross-conversation
   assert.equal(isDelegatedTaskBoundToConversation(claimed, "chat-one"), true);
   assert.equal(isDelegatedTaskBoundToConversation(claimed, "chat-two"), false);
   assert.equal(isDelegatedTaskInboxActionable(claimed), false);
+  assert.equal(isDelegatedTaskInboxActionable(claimed, ["chat-one"]), false);
+  assert.equal(isDelegatedTaskInboxActionable(claimed, []), true);
   assert.equal(JSON.stringify(claimed.claimItem).includes("REDACTED"), false);
 
   assert.throws(
@@ -213,6 +224,154 @@ test("acceptance binds a task to one conversation and rejects cross-conversation
       ),
     (error: unknown) =>
       error instanceof ExecutionBrokerError && error.code === "STALE_CONTEXT",
+  );
+});
+
+test("a task whose local conversation was deleted can be restored into a clean conversation", () => {
+  const hub = createHubWithTarget();
+  delegateCollaborationTask(delegateArgs(), SESSION_ID, "codex", hub);
+  claimCollaborationTask(
+    { taskId: "task_abcdefgh", resume: false, conversationId: "chat-old" },
+    SESSION_ID,
+    "sidepanel",
+    hub,
+  );
+  const orphaned = findDelegatedTask(
+    hub.snapshot(SESSION_ID).collaborationWorkspace,
+    "task_abcdefgh",
+  );
+  assert.ok(orphaned);
+  assert.equal(
+    isDelegatedTaskOrphaned(orphaned, ["chat-current"]),
+    true,
+  );
+  assert.equal(
+    isDelegatedTaskInboxActionable(orphaned, ["chat-current"]),
+    true,
+  );
+
+  const rebound = claimCollaborationTask(
+    {
+      taskId: "task_abcdefgh",
+      resume: true,
+      rebind: true,
+      conversationId: "chat-clean",
+    },
+    SESSION_ID,
+    "sidepanel",
+    hub,
+  );
+  assert.equal(rebound.data.rebound, true);
+  const restored = findDelegatedTask(
+    hub.snapshot(SESSION_ID).collaborationWorkspace,
+    "task_abcdefgh",
+  );
+  assert.ok(restored);
+  assert.equal(
+    isDelegatedTaskBoundToConversation(restored, "chat-clean"),
+    true,
+  );
+  assert.equal(
+    isDelegatedTaskOrphaned(restored, ["chat-clean"]),
+    false,
+  );
+  assert.equal(restored.claim?.requiresReobservation, true);
+  assert.equal(
+    restored.claim?.previousConversationKey,
+    delegatedTaskConversationKey("chat-old"),
+  );
+});
+
+test("restoring into a clean conversation tolerates a refreshed document in the same Tab", () => {
+  const hub = createHubWithTarget();
+  delegateCollaborationTask(delegateArgs(), SESSION_ID, "codex", hub);
+  claimCollaborationTask(
+    { taskId: "task_abcdefgh", resume: false, conversationId: "chat-old" },
+    SESSION_ID,
+    "sidepanel-before-refresh",
+    hub,
+  );
+  hub.setCurrentTab(
+    {
+      url: "https://example.test/form",
+      title: "Form",
+      targetId: "target-1",
+      tabId: 7,
+      windowId: 3,
+      frameId: 0,
+      documentId: "document-2",
+      navigationId: "navigation-2",
+    },
+    SESSION_ID,
+  );
+
+  const rebound = claimCollaborationTask(
+    {
+      taskId: "task_abcdefgh",
+      resume: true,
+      rebind: true,
+      conversationId: "chat-clean",
+    },
+    SESSION_ID,
+    "sidepanel-after-refresh",
+    hub,
+  );
+
+  assert.equal(rebound.data.claimed, true);
+  assert.equal(rebound.data.rebound, true);
+  const restored = findDelegatedTask(
+    hub.snapshot(SESSION_ID).collaborationWorkspace,
+    "task_abcdefgh",
+  );
+  assert.ok(restored?.claimItem);
+  assert.equal(restored.claimItem.target?.documentId, "document-2");
+  assert.equal(restored.claimItem.target?.navigationId, "navigation-2");
+});
+
+test("an orphaned claimed task can be cancelled through its original conversation binding", async () => {
+  const hub = createHubWithTarget();
+  delegateCollaborationTask(delegateArgs(), SESSION_ID, "codex", hub);
+  claimCollaborationTask(
+    { taskId: "task_abcdefgh", resume: false, conversationId: "chat-old" },
+    SESSION_ID,
+    "sidepanel",
+    hub,
+  );
+  const task = findDelegatedTask(
+    hub.snapshot(SESSION_ID).collaborationWorkspace,
+    "task_abcdefgh",
+  );
+  assert.ok(task?.claim?.conversationKey);
+  const boundConversationId = decodeDelegatedTaskConversationKey(
+    task.claim.conversationKey,
+  );
+  assert.equal(boundConversationId, "chat-old");
+  const waiting = waitForCollaborationTaskResult(
+    "task_abcdefgh",
+    SESSION_ID,
+    new AbortController().signal,
+    hub,
+  );
+
+  completeCollaborationTask(
+    {
+      taskId: "task_abcdefgh",
+      status: "cancelled",
+      summary: "The user closed the orphaned task from the extension inbox.",
+      conversationId: boundConversationId,
+    },
+    SESSION_ID,
+    "sidepanel",
+    hub,
+  );
+
+  assert.equal((await waiting).status, "cancelled");
+  assert.equal(
+    findDelegatedTask(
+      hub.snapshot(SESSION_ID).collaborationWorkspace,
+      "task_abcdefgh",
+    )?.phase,
+    "cancelled",
   );
 });
 

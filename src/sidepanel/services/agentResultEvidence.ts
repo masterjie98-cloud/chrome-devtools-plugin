@@ -4,6 +4,7 @@ import {
   isAgentToolResultDefinitelyNotExecuted,
   isSuccessfulAgentToolResultContent,
 } from "./agentToolResult";
+import { isIncrementalActivitySummaryRequest } from "./activityToolCall";
 
 const BROWSER_EFFECT_INTENT =
   /(?:点击|双击|填写|输入|选择|勾选|取消勾选|拖拽|滚动|提交|保存|更新|删除|移除|关闭|打开|跳转|导航|返回|刷新|上传|下载|修改|设置|启用|停用|mock|拦截|代理|click|type|fill|select|check|uncheck|drag|scroll|submit|save|update|delete|remove|close|open|navigate|go back|refresh|upload|modify|set|enable|disable)/i;
@@ -36,7 +37,9 @@ export function createAgentResultEvidenceState(
 ): AgentResultEvidenceState {
   return {
     requestedBrowserEffect:
-      BROWSER_EFFECT_INTENT.test(input) && BROWSER_EFFECT_CONTEXT.test(input),
+      !isIncrementalActivitySummaryRequest(input) &&
+      BROWSER_EFFECT_INTENT.test(input) &&
+      BROWSER_EFFECT_CONTEXT.test(input),
     successfulMutationCount: 0,
     mutationAttemptCount: 0,
     independentlyVerified: false,

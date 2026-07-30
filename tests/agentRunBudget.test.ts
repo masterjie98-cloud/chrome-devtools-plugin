@@ -64,6 +64,188 @@ test("Agent run budget classifies known mutations and unknown tools as effectful
   assert.equal(budget.snapshot().usage.effectfulToolCalls, 1);
 });
 
+test("approval denial ends the Agent without another model request or transport recovery copy", async () => {
+  let requestCount = 0;
+  const restore = installBrowserGlobals(
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-denied-css",
+                type: "function",
+                function: {
+                  name: "browser_apply_css_patch",
+                  arguments: JSON.stringify({
+                    selector: "body",
+                    css: "outline: 1px solid red",
+                  }),
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    () => {
+      requestCount += 1;
+    },
+  );
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 2 },
+      messages: [],
+      input: "Apply a temporary CSS outline.",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-approval-denied",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_apply_css_patch",
+            description: "Apply a reversible CSS patch.",
+            parameters: {
+              type: "object",
+              properties: {
+                selector: { type: "string" },
+                css: { type: "string" },
+              },
+              required: ["selector", "css"],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) =>
+        calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            error:
+              "APPROVAL_DENIED: user denied tool approval: browser_apply_css_patch",
+          }),
+        })),
+      onVisibleContent: () => undefined,
+    });
+
+    assert.equal(requestCount, 1);
+    assert.equal(result.status, "cancelled");
+    assert.match(
+      result.finalContent,
+      /用户已拒绝工具 browser_apply_css_patch，.*操作未执行/,
+    );
+    assert.doesNotMatch(result.finalContent, /连接中断|恢复本地 daemon/);
+  } finally {
+    restore();
+  }
+});
+
+test("activity data loss is always disclosed in the final Agent summary", async () => {
+  let requestCount = 0;
+  const restore = installBrowserGlobals(
+    (requestIndex) =>
+      requestIndex === 0
+        ? {
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "call-activity-loss",
+                      type: "function",
+                      function: {
+                        name: "browser_debug_activity",
+                        arguments: JSON.stringify({
+                          afterSequence: 0,
+                          afterStreamId: "activity-loss",
+                        }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }
+        : {
+            choices: [
+              {
+                message: {
+                  content: "仍保留的窗口内只看到登录页导航。",
+                  tool_calls: [],
+                },
+              },
+            ],
+          },
+    () => {
+      requestCount += 1;
+    },
+  );
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 2 },
+      messages: [],
+      input: "监听开始后发生了什么变化？",
+      attachments: [],
+      context: {
+        activityCursor: {
+          streamId: "activity-loss",
+          sequence: 0,
+        },
+      },
+      assistantMessageId: "assistant-activity-loss",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_debug_activity",
+            description: "Read incremental browser activity.",
+            parameters: {
+              type: "object",
+              properties: {
+                afterSequence: { type: "integer" },
+                afterStreamId: { type: "string" },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) =>
+        calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            activity: {
+              streamId: "activity-loss",
+              cursorStatus: "events_dropped",
+              missedEvents: 350,
+              observedEvents: 200,
+              nextCursor: {
+                streamId: "activity-loss",
+                sequence: 550,
+              },
+            },
+          }),
+        })),
+      onVisibleContent: () => undefined,
+    });
+
+    assert.equal(requestCount, 2);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /350 条事件未保留/);
+    assert.match(result.finalContent, /不能声称覆盖完整历史/);
+    assert.match(result.finalContent, /只看到登录页导航/);
+  } finally {
+    restore();
+  }
+});
+
 test("Agent run budget independently caps approved sensitive reads", () => {
   const budget = new AgentRunBudget({
     maxModelRequests: 5,
@@ -845,6 +1027,417 @@ test("Agent blocks a third identical read-only batch after two identical semanti
         event.summary.includes("无进展循环"),
       ),
     );
+  } finally {
+    restore();
+  }
+});
+
+test("Agent executes at most one incremental activity read per user turn", async () => {
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-activity-first",
+                type: "function",
+                function: {
+                  name: "browser_debug_activity",
+                  arguments: JSON.stringify({ afterSequence: 0 }),
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-activity-repeat",
+                type: "function",
+                function: {
+                  name: "browser_debug_activity",
+                  arguments: JSON.stringify({ afterSequence: 57 }),
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content: "已总结第一次增量窗口，并保存下一游标供用户下次查询。",
+          },
+        },
+      ],
+    },
+  ];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+  );
+  const executedCallIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 4,
+      },
+      messages: [],
+      input: "刚才页面发生了什么变化？",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-incremental-activity",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_debug_activity",
+            description: "Read incremental page activity.",
+            parameters: {
+              type: "object",
+              properties: {
+                afterSequence: { type: "number" },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedCallIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            activity: {
+              requestedAfterSequence: 0,
+              nextSequence: 57,
+              observedEvents: 57,
+            },
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedCallIds, ["call-activity-first"]);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /已总结第一次增量窗口/);
+  } finally {
+    restore();
+  }
+});
+
+test("monitoring-only requests stop immediately after one successful activity start", async () => {
+  const response = {
+    choices: [
+      {
+        message: {
+          content: "",
+          tool_calls: [
+            {
+              id: "call-monitor-start",
+              type: "function",
+              function: {
+                name: "browser_activity_start",
+                arguments: "{}",
+              },
+            },
+            {
+              id: "call-monitor-status",
+              type: "function",
+              function: {
+                name: "browser_status",
+                arguments: "{}",
+              },
+            },
+            {
+              id: "call-monitor-observe",
+              type: "function",
+              function: {
+                name: "browser_observe",
+                arguments: "{}",
+              },
+            },
+            {
+              id: "call-monitor-reload",
+              type: "function",
+              function: {
+                name: "browser_reload",
+                arguments: "{}",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+  let requestCount = 0;
+  const restore = installBrowserGlobals(response, () => {
+    requestCount += 1;
+  });
+  const executedCallIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 4,
+      },
+      messages: [],
+      input: "开始监听当前页面后续的 URL、Network、DOM 和 Console 变化。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-monitor-start",
+      tools: [
+        "browser_activity_start",
+        "browser_status",
+        "browser_observe",
+        "browser_reload",
+      ].map((name) => ({
+        type: "function" as const,
+        function: {
+          name,
+          description: name,
+          parameters: {
+            type: "object" as const,
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      })),
+      executeToolCalls: async (calls) => {
+        executedCallIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            active: true,
+            activityCursor: {
+              streamId: "activity-budget",
+              sequence: 0,
+            },
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedCallIds, ["call-monitor-start"]);
+    assert.equal(requestCount, 1);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /监听已启动并固定/);
+  } finally {
+    restore();
+  }
+});
+
+test("incremental monitoring follow-ups recover from planning prose and enforce the saved cursor", async () => {
+  const restore = installBrowserGlobals((requestIndex) => {
+    if (requestIndex === 0) {
+      return {
+        choices: [
+          {
+            message: {
+              content: "当前上下文没有可用游标，请重新启动监听。",
+              tool_calls: [],
+            },
+          },
+        ],
+      };
+    }
+    if (requestIndex === 1) {
+      return {
+        choices: [
+          {
+            message: {
+              content: "",
+              tool_calls: [
+                {
+                  id: "call-incremental-activity",
+                  type: "function",
+                  function: {
+                    name: "browser_debug_activity",
+                    arguments: "{}",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    }
+    return {
+      choices: [
+        {
+          message: {
+            content: "监听窗口内发生了 24 个增量事件。",
+            tool_calls: [],
+          },
+        },
+      ],
+    };
+  });
+  const executedArguments: Array<Record<string, unknown>> = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 4,
+      },
+      messages: [],
+      input:
+        "刚才这个页面发生了什么变化？只读取监听开始后保存游标之后的增量摘要，不要全量读取 Network。",
+      attachments: [],
+      context: {
+        activityCursor: {
+          streamId: "activity-incremental",
+          sequence: 57,
+        },
+      },
+      assistantMessageId: "assistant-incremental-activity",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_debug_activity",
+            description: "Read one bounded incremental activity window.",
+            parameters: {
+              type: "object",
+              properties: {
+                afterSequence: { type: "integer", minimum: 0 },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedArguments.push(...calls.map((call) => call.arguments));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            version: "browser-debug-activity-v1",
+            activity: {
+              requestedAfterSequence: 57,
+              nextSequence: 81,
+              observedEvents: 24,
+            },
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedArguments, [
+      {
+        afterSequence: 57,
+        afterStreamId: "activity-incremental",
+      },
+    ]);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /24 个增量事件/);
+  } finally {
+    restore();
+  }
+});
+
+test("task binding stale errors stop before the Agent switches tools", async () => {
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-stale-monitor",
+                type: "function",
+                function: {
+                  name: "browser_activity_start",
+                  arguments: "{}",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content: "绑定尚未同步，已停止本轮，不会刷新或切换页面。",
+          },
+        },
+      ],
+    },
+  ];
+  let requestCount = 0;
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => {
+      requestCount += 1;
+    },
+  );
+  const executedCallIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 4,
+      },
+      messages: [],
+      input: "开始监听当前页面变化。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-stale-binding",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_activity_start",
+            description: "Start monitoring.",
+            parameters: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedCallIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            error:
+              "STALE_CONTEXT: Tool task binding no longer matches the active browser context (field=conversationId).",
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedCallIds, ["call-stale-monitor"]);
+    assert.equal(requestCount, 2);
+    assert.equal(result.status, "blocked");
+    assert.match(result.finalContent, /已停止本轮/);
   } finally {
     restore();
   }

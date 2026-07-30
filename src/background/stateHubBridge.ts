@@ -41,7 +41,11 @@ import {
   type ScreenshotSnapshot,
   type ServerWelcomePayload,
 } from "../shared/wsProtocol";
-import type { BrowserActivityEventInput } from "../shared/browserActivity";
+import {
+  sanitizeBrowserActivityEventInput,
+  type BrowserActivityEventInput,
+  type BrowserActivityKind,
+} from "../shared/browserActivity";
 import { WS_CLIENT_IDENTITIES } from "../shared/wsClientIdentity";
 import {
   RUNTIME_BUILD_ID,
@@ -49,6 +53,7 @@ import {
   runtimeIdentityMismatch,
 } from "../shared/runtimeIdentity";
 
+const MAX_QUEUED_STATE_HUB_MESSAGES = 500;
 
 class BackgroundStateHubBridge {
   private socket: WebSocket | null = null;
@@ -60,6 +65,12 @@ class BackgroundStateHubBridge {
   private readonly activeToolRequests = new Map<string, AbortController>();
   private readonly consumedExecutionGrants = new ExecutionGrantReplayCache();
   private latestActiveTab: ActiveTabSnapshot | undefined;
+  private droppedQueuedActivityEvents: Record<BrowserActivityKind, number> = {
+    dom: 0,
+    network: 0,
+    console: 0,
+    navigation: 0,
+  };
 
   constructor() {
     subscribeBridgeTokenChanges(() => {
@@ -211,15 +222,16 @@ class BackgroundStateHubBridge {
   }
 
   sendBrowserActivity(event: BrowserActivityEventInput): void {
+    const sanitized = sanitizeBrowserActivityEventInput({
+      ...event,
+      target: event.target ?? this.latestActiveTab,
+    });
     this.send({
       requestId: createMessageId(),
       command: WS_COMMANDS.BROWSER_ACTIVITY_EVENT,
       sentAt: new Date().toISOString(),
       payload: {
-        event: {
-          ...event,
-          target: event.target ?? this.latestActiveTab,
-        },
+        event: sanitized,
       },
     });
   }
@@ -440,17 +452,82 @@ class BackgroundStateHubBridge {
       return;
     }
 
+    if (
+      message.command === WS_COMMANDS.HEARTBEAT ||
+      message.command === WS_COMMANDS.ACTIVE_TAB_UPDATED ||
+      message.command === WS_COMMANDS.PAGE_CONTEXT_UPDATED
+    ) {
+      this.queue = this.queue.filter(
+        (queued) => queued.command !== message.command,
+      );
+    }
     this.queue.push(message);
-    this.queue = this.queue.slice(-100);
+    while (this.queue.length > MAX_QUEUED_STATE_HUB_MESSAGES) {
+      const activityIndex = this.queue.findIndex(
+        (queued) =>
+          queued.command === WS_COMMANDS.BROWSER_ACTIVITY_EVENT &&
+          queued.payload.event.summary.reason !== "monitoring-started" &&
+          queued.payload.event.summary.reason !== "monitoring-stopped",
+      );
+      const [dropped] = this.queue.splice(
+        activityIndex >= 0 ? activityIndex : 0,
+        1,
+      );
+      if (dropped?.command === WS_COMMANDS.BROWSER_ACTIVITY_EVENT) {
+        this.droppedQueuedActivityEvents[dropped.payload.event.kind] += 1;
+      }
+    }
     this.connect();
   }
 
   private flushQueue(): void {
     const queued = [...this.queue];
     this.queue = [];
+    const droppedActivityEvents = this.droppedQueuedActivityEvents;
+    this.droppedQueuedActivityEvents = {
+      dom: 0,
+      network: 0,
+      console: 0,
+      navigation: 0,
+    };
+    let lossNoticesSent = false;
+    const sendLossNotices = () => {
+      if (lossNoticesSent) {
+        return;
+      }
+      lossNoticesSent = true;
+      for (const kind of [
+        "dom",
+        "network",
+        "console",
+        "navigation",
+      ] as const) {
+        const dropped = droppedActivityEvents[kind];
+        if (dropped === 0) {
+          continue;
+        }
+        this.sendBrowserActivity({
+          kind,
+          target: this.latestActiveTab,
+          summary: {
+            reason: "transport-queue-overflow",
+            transportDroppedEvents: dropped,
+            message:
+              `Local daemon connection was unavailable; ${dropped} queued ${kind} activity event(s) could not be retained.`,
+          },
+        });
+      }
+    };
     for (const message of queued) {
+      if (
+        message.command === WS_COMMANDS.BROWSER_ACTIVITY_EVENT &&
+        message.payload.event.summary.reason === "monitoring-stopped"
+      ) {
+        sendLossNotices();
+      }
       this.send(message);
     }
+    sendLossNotices();
   }
 
   private startHeartbeat(sessionId: string): void {

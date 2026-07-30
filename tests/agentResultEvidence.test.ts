@@ -72,3 +72,17 @@ test("result arbiter does not turn ordinary factual answers into browser tasks",
     { accepted: true },
   );
 });
+
+test("result arbiter treats a saved-cursor activity summary as read-only evidence", () => {
+  const state = createAgentResultEvidenceState(
+    "刚才页面发生了什么变化？只读取监听开始后保存游标之后的增量摘要，不要全量读取 Network。",
+  );
+  assert.equal(state.requestedBrowserEffect, false);
+  assert.deepEqual(
+    arbitrateAgentFinalResult(
+      state,
+      "页面停留在登录页，期间已刷新 5 次，共观察到 25 条 Network 请求。",
+    ),
+    { accepted: true },
+  );
+});

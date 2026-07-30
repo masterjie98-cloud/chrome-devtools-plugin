@@ -15,6 +15,7 @@ import {
   WS_HEARTBEAT_INTERVAL_MS,
   WS_PROTOCOL_VERSION,
   type ActiveTabSnapshot,
+  type BrowserActivityUpdatedPayload,
 } from "../../shared/wsProtocol";
 import { WS_CLIENT_IDENTITIES } from "../../shared/wsClientIdentity";
 import {
@@ -32,6 +33,7 @@ interface BrowserStateHubState {
   lastScreenshot?: ScreenshotCaptureResult;
   activeAgentSession?: AgentSessionSnapshot;
   collaborationWorkspace?: CollaborationWorkspaceSnapshot;
+  activityStream?: BrowserActivityUpdatedPayload;
 }
 
 export function useBrowserStateHub(): BrowserStateHubState {
@@ -191,6 +193,13 @@ export function useBrowserStateHub(): BrowserStateHubState {
             ...current,
             collaborationWorkspace: parsed.payload
               ?.workspace as CollaborationWorkspaceSnapshot,
+          }));
+          break;
+        case WS_COMMANDS.BROWSER_ACTIVITY_UPDATED:
+          setState((current) => ({
+            ...current,
+            activityStream:
+              parsed.payload as unknown as BrowserActivityUpdatedPayload,
           }));
           break;
         default:

@@ -1,6 +1,7 @@
 import {
   clearAgentPointerForCurrentTargetBestEffort,
   executeToolCall,
+  restoreBrowserActivityForContentFrame,
 } from "./toolDispatcher";
 import {
   clearContentFrames,
@@ -15,6 +16,7 @@ import {
   updateContentFrameLocation,
 } from "./chromeApi";
 import {
+  emitDebuggerNavigationActivity,
   requestProxyRestore,
   subscribeDebuggerActivity,
 } from "./debuggerAdapter";
@@ -97,11 +99,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
-  handleSameDocumentNavigation(details);
+  handleSameDocumentNavigation(details, "history-state-updated");
 });
 
 chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
-  handleSameDocumentNavigation(details);
+  handleSameDocumentNavigation(details, "fragment-updated");
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -155,6 +157,12 @@ async function handleMessage(
   if (message.source === "content") {
     if (message.type === MESSAGE_TYPES.CONTENT_TARGET_AVAILABLE) {
       registerContentFrame(sender, message.payload);
+      if (sender.tab?.id !== undefined) {
+        void restoreBrowserActivityForContentFrame(sender.tab.id, {
+          frameId: sender.frameId ?? 0,
+          documentId: sender.documentId,
+        }).catch(() => undefined);
+      }
     } else if (message.type === MESSAGE_TYPES.CONTENT_ELEMENT_PICKED) {
       registerContentFrame(sender, message.payload.page);
     }
@@ -241,6 +249,9 @@ async function rememberAndSyncTargetTab(
     );
   }
   syncTabToStateHub(target);
+  if (navigationChanged && target && target.id === tab?.id) {
+    emitTargetNavigationActivity(target, "document-loading");
+  }
   return target;
 }
 
@@ -254,11 +265,15 @@ async function syncSelectedTargetTabLifecycle(
   }
   getTargetNavigationState(tabId, navigationChanged);
   syncTabToStateHub(target);
+  if (navigationChanged) {
+    emitTargetNavigationActivity(target, "document-loading");
+  }
   return target;
 }
 
 function handleSameDocumentNavigation(
   details: chrome.webNavigation.WebNavigationTransitionCallbackDetails,
+  reason: "history-state-updated" | "fragment-updated",
 ): void {
   if (details.frameId !== 0) {
     return;
@@ -273,7 +288,41 @@ function handleSameDocumentNavigation(
       title: target.title,
     });
     getTargetNavigationState(details.tabId, true);
-    syncTabToStateHub({ ...target, url: details.url });
+    const updatedTarget = { ...target, url: details.url };
+    syncTabToStateHub(updatedTarget);
+    emitTargetNavigationActivity(updatedTarget, reason);
+  });
+}
+
+function emitTargetNavigationActivity(
+  tab: chrome.tabs.Tab,
+  reason: string,
+): void {
+  const url = tab.pendingUrl ?? tab.url;
+  if (tab.id === undefined || !url) {
+    return;
+  }
+  const navigation = getTargetNavigationState(tab.id, false);
+  const selectedFrame = getSelectedContentFrameSnapshot(tab.id);
+  emitDebuggerNavigationActivity({
+    observedAt: new Date().toISOString(),
+    target: {
+      url: selectedFrame?.url || url,
+      title: selectedFrame?.title || tab.title || "",
+      targetId: String(tab.id),
+      tabId: tab.id,
+      windowId: tab.windowId,
+      frameId:
+        selectedFrame?.frameId ?? getSelectedContentFrame(tab.id).frameId,
+      documentId: selectedFrame?.documentId,
+      navigationId: navigation.navigationId,
+      revision: navigation.revision,
+    },
+    summary: {
+      url,
+      resourceType: "Document",
+      reason,
+    },
   });
 }
 

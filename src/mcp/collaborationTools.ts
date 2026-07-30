@@ -177,15 +177,20 @@ export const claimCollaborationTaskInputSchema = z
   .object({
     taskId: z.string().regex(DELEGATED_TASK_ID_PATTERN),
     resume: z.boolean().default(false),
+    rebind: z.boolean().default(false),
     conversationId: delegatedTaskConversationIdSchema,
   })
-  .strict();
+  .strict()
+  .refine((value) => !value.rebind || value.resume, {
+    message: "rebind requires resume=true",
+  });
 
 export const claimCollaborationTaskOutputSchema = z
   .object({
     taskId: z.string().regex(DELEGATED_TASK_ID_PATTERN),
     claimed: z.boolean(),
     resumed: z.boolean(),
+    rebound: z.boolean(),
     attempt: z.number().int().positive(),
     workspaceRevision: z.number().int().nonnegative(),
     claimItem: collaborationItemOutputSchema,

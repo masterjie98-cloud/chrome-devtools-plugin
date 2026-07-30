@@ -1,5 +1,6 @@
 import type { DomElementInfo, PageSnapshot } from "../../shared/dom";
 import type { CollaborationWorkspaceSnapshot } from "../../shared/collaborationWorkspace";
+import type { BrowserActivityCursor } from "../../shared/browserActivity";
 import type { AgentTaskStatePatch } from "../../shared/agentTaskState";
 import {
   appendAgentSessionEvent,
@@ -54,7 +55,9 @@ import {
   MAX_AGENT_TOOL_BATCH_SIZE,
 } from "./agentExecutionStrategy";
 import {
+  getAgentToolDataLossNotice,
   getAgentToolPreExecutionFailure,
+  isAgentToolApprovalDenied,
   isAgentToolResultDefinitelyNotExecuted,
   isSuccessfulAgentToolResultContent,
   type AgentToolPreExecutionFailure,
@@ -65,6 +68,10 @@ import {
   recordAgentResultEvidence,
 } from "./agentResultEvidence";
 import { isMcpToolTransportError } from "./mcpTransport";
+import {
+  applyIncrementalActivityCursor,
+  isIncrementalActivitySummaryRequest,
+} from "./activityToolCall";
 import {
   acceptFastAgentVisualCheckpoint,
   createFastAgentVisualCheckpointState,
@@ -77,11 +84,14 @@ export interface AgentContext {
   pageSnapshot?: PageSnapshot;
   selectedElement?: DomElementInfo;
   collaborationWorkspace?: CollaborationWorkspaceSnapshot;
+  activityCursor?: BrowserActivityCursor;
   contextReadError?: string;
 }
 
 const READ_ONLY_NO_PROGRESS_NOTICE =
   "检测到相同只读工具和参数已连续两次返回相同的语义结果。为避免无进展循环，Agent 已停止重复调用；请基于已有结果总结，或调整工具、参数后再继续。";
+const INCREMENTAL_ACTIVITY_REPEAT_NOTICE =
+  "本轮已经读取过一次增量页面活动。请完整总结第一次返回的事件窗口，并把 activity.nextCursor 留给用户下一次询问；不要在同一轮继续轮询。";
 const CROSS_ROUND_NO_PROGRESS_THRESHOLD = 3;
 
 interface RepeatedReadOnlyObservation {
@@ -264,6 +274,7 @@ export async function runAutonomousAgentSession(
     const maxToolRounds = params.config.maxToolRounds;
     const seenToolSignatures = new Map<string, number>();
     const toolNameCounts = new Map<string, number>();
+    let incrementalActivityReadCount = 0;
     let lastReadOnlyBatchCallSignature = "";
     let lastReadOnlyBatchResultFingerprint = "";
     let consecutiveIdenticalReadOnlyBatches = 0;
@@ -275,13 +286,19 @@ export async function runAutonomousAgentSession(
     let executionProgressVersion = 0;
     let postMutationVerificationRequired = false;
     let blockedReason = "";
+    const evidenceLossNotices = new Set<string>();
     let resultEvidence = createAgentResultEvidenceState(params.input);
     let resultArbiterRetryUsed = false;
+    const monitoringSetupOnly = isMonitoringSetupOnlyRequest(params.input);
+    const incrementalActivitySummaryRequested =
+      isIncrementalActivitySummaryRequest(params.input);
 
     if (
       toolExecutionEnabled &&
       aiResult.toolCalls.length === 0 &&
-      !arbitrateAgentFinalResult(resultEvidence, initialAssistantContent).accepted
+      (incrementalActivitySummaryRequested ||
+        !arbitrateAgentFinalResult(resultEvidence, initialAssistantContent)
+          .accepted)
     ) {
       resultArbiterRetryUsed = true;
       visibleContent = "";
@@ -307,8 +324,9 @@ export async function runAutonomousAgentSession(
         onStatusUpdate: params.onStatusUpdate,
         runBudget,
         reserveBudget,
-        continuationInstruction:
-          "You claimed that a browser action completed, but no browser mutation tool was executed. Emit the required tool call now. Do not claim success in prose. If the target is unknown, observe the page first.",
+        continuationInstruction: incrementalActivitySummaryRequested
+          ? `The user explicitly requested the monitored incremental activity window. Call browser_debug_activity exactly once with afterSequence=${context.activityCursor?.sequence ?? 0}${context.activityCursor ? ` and afterStreamId=${context.activityCursor.streamId}` : ""}. Do not restart monitoring, use a legacy no-argument read, or answer from prior prose.`
+          : "You claimed that a browser action completed, but no browser mutation tool was executed. Emit the required tool call now. Do not claim success in prose. If the target is unknown, observe the page first.",
       });
       aiResult = continuation.result;
       currentAssistantContent = sanitizeAssistantVisibleContent(
@@ -335,13 +353,17 @@ export async function runAutonomousAgentSession(
       round += 1
     ) {
       throwIfAborted(params.abortSignal);
-      const requestedToolCalls = aiResult.toolCalls.slice(
-        0,
-        MAX_AGENT_TOOL_BATCH_SIZE,
+      const requestedToolCalls = applyIncrementalActivityCursor(
+        aiResult.toolCalls.slice(0, MAX_AGENT_TOOL_BATCH_SIZE),
+        params.input,
+        context.activityCursor,
       );
       const requestedBatchCallSignature = getToolBatchCallSignature(
         requestedToolCalls,
       );
+      const requestedMonitoringStart =
+        monitoringSetupOnly &&
+        requestedToolCalls.some(isActivityMonitorStart);
       const blockNoProgressReadOnlyBatch =
         consecutiveIdenticalReadOnlyBatches >= 2 &&
         requestedBatchCallSignature === lastReadOnlyBatchCallSignature &&
@@ -367,6 +389,45 @@ export async function runAutonomousAgentSession(
             ),
           });
           return false;
+        }
+
+        if (
+          requestedMonitoringStart &&
+          !isActivityMonitorStart(toolCall)
+        ) {
+          blockedRepeatResults.push({
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            content: JSON.stringify(
+              {
+                blocked: true,
+                reason:
+                  "本轮用户只要求开始监听；browser_activity_start 成功即可结束，不执行额外观察、Tab 切换或页面修改。",
+              },
+              null,
+              2,
+            ),
+          });
+          return false;
+        }
+
+        if (isIncrementalActivityRead(toolCall)) {
+          if (incrementalActivityReadCount >= 1) {
+            blockedRepeatResults.push({
+              toolCallId: toolCall.id,
+              name: toolCall.name,
+              content: JSON.stringify(
+                {
+                  blocked: true,
+                  reason: INCREMENTAL_ACTIVITY_REPEAT_NOTICE,
+                },
+                null,
+                2,
+              ),
+            });
+            return false;
+          }
+          incrementalActivityReadCount += 1;
         }
 
         const priorRepeatCount = getReadOnlyObservationRepeatCount(
@@ -528,6 +589,26 @@ export async function runAutonomousAgentSession(
             )
           : [];
       throwIfAborted(params.abortSignal);
+      const taskBindingFailure = executedToolResults.find(
+        isTaskBindingStaleResult,
+      );
+      if (taskBindingFailure) {
+        blockedReason =
+          "聊天与目标 Tab 的绑定尚未同步，本轮已立即停止。不要换工具、切换 Tab 或刷新页面；请先同步原聊天的 conversationId、tabId 和 targetId 后重试。";
+        blockedRepeatResults.push({
+          toolCallId: taskBindingFailure.toolCallId,
+          name: taskBindingFailure.name,
+          content: JSON.stringify(
+            {
+              blocked: true,
+              errorCode: "STALE_TASK_BINDING",
+              reason: blockedReason,
+            },
+            null,
+            2,
+          ),
+        });
+      }
       const toolResults = mergeToolResultsInRequestOrder(
         requestedToolCalls,
         executedToolResults,
@@ -737,6 +818,71 @@ export async function runAutonomousAgentSession(
             : "当前操作结果已有只读证据，或本轮未发生页面修改。",
         },
       });
+
+      for (const result of executedToolResults) {
+        const lossNotice = getAgentToolDataLossNotice(result.content);
+        if (!lossNotice || evidenceLossNotices.has(lossNotice)) {
+          continue;
+        }
+        evidenceLossNotices.add(lossNotice);
+        visibleContent = appendParagraph(visibleContent, lossNotice);
+        params.onVisibleContent(
+          sanitizeAssistantVisibleContent(visibleContent),
+        );
+        session = publishEvent(
+          session,
+          params.onSessionUpdate,
+          "context",
+          lossNotice,
+        );
+      }
+
+      const deniedToolResult = executedToolResults.find((result) =>
+        isAgentToolApprovalDenied(result.content),
+      );
+      if (deniedToolResult) {
+        const denialNotice = `用户已拒绝工具 ${deniedToolResult.name}，该操作未执行。本轮任务已停止。`;
+        const finalContent = appendParagraph(visibleContent, denialNotice);
+        params.onVisibleContent(finalContent);
+        session = finalizeWithEvent(
+          session,
+          params.onSessionUpdate,
+          "cancelled",
+          finalContent,
+          `用户拒绝了工具 ${deniedToolResult.name}，操作未执行。`,
+        );
+        return {
+          finalContent,
+          session,
+          status: "cancelled",
+        };
+      }
+
+      const monitoringSetupCompleted =
+        monitoringSetupOnly &&
+        !taskBindingFailure &&
+        executableToolCalls.some((toolCall) => {
+          if (!isActivityMonitorStart(toolCall)) {
+            return false;
+          }
+          const result = executedResultsById.get(toolCall.id);
+          return Boolean(result && isSuccessfulToolResult(result));
+        });
+      if (monitoringSetupCompleted) {
+        const completedMessage =
+          "监听已启动并固定到当前聊天绑定的 Tab。后续页面发生变化后再询问一次，Agent 会按保存的游标只读取一段增量摘要。";
+        visibleContent = appendParagraph(visibleContent, completedMessage);
+        params.onVisibleContent(
+          sanitizeAssistantVisibleContent(visibleContent),
+        );
+        currentAssistantContent = completedMessage;
+        aiResult = {
+          content: completedMessage,
+          rawContent: completedMessage,
+          toolCalls: [],
+        };
+        break;
+      }
 
       if (blockNoProgressReadOnlyBatch) {
         blockedReason = READ_ONLY_NO_PROGRESS_NOTICE;
@@ -1831,6 +1977,47 @@ function isScreenshotToolCall(toolCall: AiRequestedToolCall): boolean {
   return (
     toolCall.name === "browser_take_screenshot" ||
     toolCall.name === "browser.takeScreenshot"
+  );
+}
+
+function isIncrementalActivityRead(
+  toolCall: AiRequestedToolCall,
+): boolean {
+  return (
+    normalizeMcpToolName(toolCall.name) ===
+      MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY &&
+    typeof toolCall.arguments.afterSequence === "number"
+  );
+}
+
+function isActivityMonitorStart(toolCall: AiRequestedToolCall): boolean {
+  return (
+    normalizeMcpToolName(toolCall.name) ===
+    MCP_TOOL_NAMES.BROWSER_ACTIVITY_START
+  );
+}
+
+function isMonitoringSetupOnlyRequest(input: string): boolean {
+  const normalized = input.trim().toLowerCase();
+  const requestsMonitoring =
+    /(?:开始|开启|启动).{0,12}(?:监听|监控)/.test(normalized) ||
+    /(?:start|begin|enable).{0,24}(?:monitor|watch|track)/.test(normalized);
+  if (!requestsMonitoring) {
+    return false;
+  }
+  return !/(?:点击|刷新|重载|输入|填写|提交|跳转|导航|修改|删除|新增|\bclick\b|\breload\b|\brefresh\b|\btype\b|\bfill\b|\bsubmit\b|\bnavigate\b|\bdelete\b|\bcreate\b)/i.test(
+    normalized,
+  );
+}
+
+function isTaskBindingStaleResult(result: AiToolResultMessage): boolean {
+  const parsed = parseToolResultJson(result.content);
+  const error = typeof parsed?.error === "string" ? parsed.error : "";
+  return (
+    /\bSTALE_CONTEXT\b/i.test(error) &&
+    /task binding no longer matches|conversation and target binding did not synchronize/i.test(
+      error,
+    )
   );
 }
 

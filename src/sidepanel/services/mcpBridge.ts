@@ -1,7 +1,7 @@
 import type { PageSnapshot } from "../../shared/dom";
 import type { AgentSessionSnapshot } from "../../shared/agentSession";
 import {
-  toCollaborationTargetBinding,
+  sanitizeCollaborationItemInput,
   type CollaborationItemInput,
 } from "../../shared/collaborationWorkspace";
 import { createMessageId } from "../../shared/messaging";
@@ -39,6 +39,7 @@ import { WS_CLIENT_IDENTITIES } from "../../shared/wsClientIdentity";
 import {
   RUNTIME_BUILD_ID,
   RUNTIME_SCHEMA_HASH,
+  parseRuntimeHandshakeFailure,
   runtimeIdentityMismatch,
 } from "../../shared/runtimeIdentity";
 import { toAbortError } from "./abortError";
@@ -52,11 +53,15 @@ type ApprovalCancellationHandler = (
   cancellation: ApprovalCancelledPayload,
 ) => void;
 
+const MCP_CONNECT_WAIT_MS = 6_000;
+
 interface McpCallOptions {
   signal?: AbortSignal;
   idempotencyKey?: string;
   deadlineAt?: string;
   waitForApproval?: boolean;
+  skipTaskContext?: boolean;
+  taskContext?: McpToolCallPayload["taskContext"];
 }
 
 class McpBridge {
@@ -66,6 +71,7 @@ class McpBridge {
   private queue: PluginToMcpMessage[] = [];
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
+  private lastConnectionFailure: string | null = null;
   private heartbeatTimer: number | null = null;
   private approvalHandler: ApprovalHandler | null = null;
   private approvalCancellationHandler: ApprovalCancellationHandler | null = null;
@@ -276,7 +282,10 @@ class McpBridge {
           toolName,
           args,
         },
-        ...(this.taskContext ? { taskContext: this.taskContext } : {}),
+        ...(!options.skipTaskContext &&
+        (options.taskContext ?? this.taskContext)
+          ? { taskContext: options.taskContext ?? this.taskContext ?? undefined }
+          : {}),
       },
     };
 
@@ -412,15 +421,11 @@ class McpBridge {
   }
 
   sendCollaborationItem(item: CollaborationItemInput): void {
-    const target =
-      item.target === undefined
-        ? undefined
-        : toCollaborationTargetBinding(item.target);
     this.send({
       requestId: createMessageId(),
       command: WS_COMMANDS.COLLABORATION_ITEM_UPSERT,
       sentAt: new Date().toISOString(),
-      payload: { item: { ...item, target } },
+      payload: { item: sanitizeCollaborationItemInput(item) },
     });
   }
 
@@ -498,6 +503,11 @@ class McpBridge {
     raw: unknown,
     socket: WebSocket,
   ): Promise<void> {
+    const handshakeFailure = parseRuntimeHandshakeFailure(raw);
+    if (handshakeFailure) {
+      this.lastConnectionFailure = handshakeFailure;
+      return;
+    }
     const message = parseServerMessage(raw);
     if (!message) {
       return;
@@ -515,6 +525,7 @@ class McpBridge {
         return;
       }
       this.reconnectAttempt = 0;
+      this.lastConnectionFailure = null;
       this.authenticatedSocket = socket;
       this.connectionId = message.payload.connectionId;
       this.startHeartbeat(socket, message.payload.sessionId);
@@ -673,9 +684,11 @@ class McpBridge {
           return;
         }
 
-        if (Date.now() - startedAt > 1800) {
+        if (Date.now() - startedAt > MCP_CONNECT_WAIT_MS) {
           reject(
-            toolName
+            this.lastConnectionFailure
+              ? new Error(this.lastConnectionFailure)
+              : toolName
               ? new McpToolTransportError({ toolName, phase: "connect" })
               : new Error(
                   "MCP Server 未连接，请先启动 ws://127.0.0.1:17321。",

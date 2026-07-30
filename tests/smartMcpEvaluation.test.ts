@@ -469,6 +469,27 @@ test("[eval 07] browser_debug_activity excludes raw response bodies", async () =
   assert.equal(JSON.stringify(result).includes("responseBody"), false);
 });
 
+test("[eval 07a] incremental debug activity omits legacy Network and Console snapshots", async () => {
+  const sessionId = "eval-debug-incremental";
+  const calls: AnyToolCall[] = [];
+  browserStateHub.setCurrentTab(target, sessionId);
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+    {
+      afterSequence: 0,
+      includeNetwork: true,
+      includeConsole: true,
+    },
+    createBridge(calls),
+    { sessionId },
+  );
+
+  assert.equal(read(result, "network"), null);
+  assert.equal(read(result, "console"), null);
+  assert.equal(typeof read(result, "activity"), "object");
+  assert.deepEqual(calls, []);
+});
+
 test("[eval 07b] browser_debug_activity rejects mixed-tab evidence", async () => {
   const sessionId = "eval-debug-mixed-target";
   browserStateHub.setCurrentTab(target, sessionId);
@@ -920,6 +941,8 @@ function createBridge(
           total: 1,
           returned: 0,
           requests: [],
+          droppedRequestCount: 0,
+          capacityReached: false,
           activityDigest: {
             observedRequests: 1,
             totalGroups: 1,
@@ -946,6 +969,11 @@ function createBridge(
           networkEnabled: true,
           tabId: target.tabId,
           requestCount: 0,
+          maxEntries: 2_000,
+          droppedRequestCount: 0,
+          capacityReached: false,
+          preservedLog: false,
+          protocolVersion: "1.3",
         };
       }
       if (call.toolName === TOOL_NAMES.DEBUGGER_NETWORK_STOP) {
@@ -954,6 +982,11 @@ function createBridge(
           networkEnabled: false,
           tabId: target.tabId,
           requestCount: 1,
+          maxEntries: 2_000,
+          droppedRequestCount: 0,
+          capacityReached: false,
+          preservedLog: false,
+          protocolVersion: "1.3",
         };
       }
       if (call.toolName === TOOL_NAMES.BROWSER_CONSOLE_MESSAGES) {

@@ -142,6 +142,8 @@ test("representative MCP output schemas reject shape drift", () => {
     total: 4,
     returned: 0,
     requests: [],
+    droppedRequestCount: 0,
+    capacityReached: false,
     activityDigest: {
       observedRequests: 4,
       totalGroups: 1,

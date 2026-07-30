@@ -40,12 +40,16 @@ import Tag from "antd/es/tag";
 import Tooltip from "antd/es/tooltip";
 import Typography from "antd/es/typography";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createMessageId } from "../../shared/messaging";
 import type { ToolName } from "../../shared/tools";
 import type { BrowserTargetTab } from "../../shared/dom";
-import type { DelegatedTaskSnapshot } from "../../shared/collaborationTasks";
+import {
+  isDelegatedTaskOrphaned,
+  type DelegatedTaskSnapshot,
+} from "../../shared/collaborationTasks";
 import type { ActiveTabSnapshot } from "../../shared/wsProtocol";
+import type { BrowserActivityCursor } from "../../shared/browserActivity";
 import {
   formatAgentRunBudgetAmount,
   type AgentRunBudgetExtensionDecision,
@@ -57,6 +61,7 @@ import type {
 } from "../agentRunApprovals";
 import { getChatShortcutState } from "../chatShortcutState";
 import { getAssistantDisplayContent } from "../services/assistantContent";
+import type { BackgroundConversationWork } from "../services/backgroundConversationWork";
 import type {
   ChatImageAttachment,
   ChatConversationSummary,
@@ -88,8 +93,20 @@ interface ChatPanelProps {
   executionApprovalMode: ExecutionApprovalMode;
   executionApprovalScopeLabel?: string;
   activeExecutionBinding?: ExecutionTaskBinding;
+  backgroundConversationWork?: BackgroundConversationWork;
   selectedToolTarget?: ActiveTabSnapshot;
   foregroundTab?: BrowserTargetTab;
+  activityMonitor?: {
+    cursor: BrowserActivityCursor;
+    target?: {
+      tabId: number;
+      title?: string;
+      url?: string;
+    };
+    health: "active" | "offline" | "stopped" | "restarted";
+    latestSequence?: number;
+    action?: "restart" | "stop";
+  };
   queuedMessages: QueuedChatSubmission[];
   delegatedTasks: DelegatedTaskSnapshot[];
   delegatedInboxTasks: DelegatedTaskSnapshot[];
@@ -110,6 +127,7 @@ interface ChatPanelProps {
   onClearQueuedMessages: () => void;
   onRunQueuedMessageNow: (submissionId: string) => void;
   onAcceptDelegatedTask: (taskId: string, resume: boolean) => void;
+  onRestoreDelegatedTask: (taskId: string) => void;
   onRejectDelegatedTask: (taskId: string) => void;
   onOpenConversation: (conversationId: string) => boolean;
   onDeleteConversation: (conversationId: string) => boolean;
@@ -130,6 +148,8 @@ interface ChatPanelProps {
   ) => void;
   onChangeExecutionApprovalMode: (mode: ExecutionApprovalMode) => void;
   onFocusExecutionTarget: (tabId: number) => void;
+  onRestartActivityMonitor: () => void;
+  onStopActivityMonitor: () => void;
   onReadPage: () => void;
   onPickElement: () => void;
   onCancelElementPick: () => void;
@@ -159,8 +179,10 @@ export function ChatPanel({
   executionApprovalMode,
   executionApprovalScopeLabel,
   activeExecutionBinding,
+  backgroundConversationWork,
   selectedToolTarget,
   foregroundTab,
+  activityMonitor,
   queuedMessages,
   delegatedTasks,
   delegatedInboxTasks,
@@ -177,6 +199,7 @@ export function ChatPanel({
   onClearQueuedMessages,
   onRunQueuedMessageNow,
   onAcceptDelegatedTask,
+  onRestoreDelegatedTask,
   onRejectDelegatedTask,
   onOpenConversation,
   onDeleteConversation,
@@ -187,6 +210,8 @@ export function ChatPanel({
   onResolveBudgetExtension,
   onChangeExecutionApprovalMode,
   onFocusExecutionTarget,
+  onRestartActivityMonitor,
+  onStopActivityMonitor,
   onReadPage,
   onPickElement,
   onCancelElementPick,
@@ -204,6 +229,7 @@ export function ChatPanel({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
   const [delegatedInboxOpen, setDelegatedInboxOpen] = useState(false);
+  const [backgroundWorkOpen, setBackgroundWorkOpen] = useState(false);
   const [activeApprovalId, setActiveApprovalId] = useState<string>();
   const [editingMessageId, setEditingMessageId] = useState<string>();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -220,12 +246,15 @@ export function ChatPanel({
     [],
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!autoScroll) {
       return;
     }
 
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    const container = scrollRef.current;
+    if (container) {
+      container.scrollTop = container.scrollHeight;
+    }
   }, [autoScroll, messages]);
 
   useEffect(() => {
@@ -233,6 +262,7 @@ export function ChatPanel({
     setAttachments([]);
     setHistoryOpen(false);
     setDelegatedInboxOpen(false);
+    setBackgroundWorkOpen(false);
     draftBeforeEditRef.current = "";
   }, [activeConversationId]);
 
@@ -241,6 +271,12 @@ export function ChatPanel({
       setDelegatedInboxOpen(false);
     }
   }, [delegatedInboxTasks.length]);
+
+  useEffect(() => {
+    if (!backgroundConversationWork) {
+      setBackgroundWorkOpen(false);
+    }
+  }, [backgroundConversationWork]);
 
   const latestApprovalId =
     pendingToolApprovals[pendingToolApprovals.length - 1]?.id;
@@ -269,7 +305,7 @@ export function ChatPanel({
   const scrollToBottom = () => {
     const container = scrollRef.current;
     if (container) {
-      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+      container.scrollTop = container.scrollHeight;
     }
     setAutoScroll(true);
   };
@@ -338,6 +374,16 @@ export function ChatPanel({
       return;
     }
     const next = draftValue.trim();
+    const container = scrollRef.current;
+    const wasAtBottom =
+      autoScroll ||
+      Boolean(
+        container &&
+          container.scrollHeight -
+            container.scrollTop -
+            container.clientHeight <
+            64,
+      );
     if (!next && attachments.length === 0) {
       return;
     }
@@ -367,7 +413,12 @@ export function ChatPanel({
     }
     onDraftChange("");
     setAttachments([]);
-    setAutoScroll(true);
+    if (wasAtBottom) {
+      setAutoScroll(true);
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(scrollToBottom);
+      });
+    }
   };
 
   const beginMessageEdit = (message: ChatMessage) => {
@@ -526,6 +577,17 @@ export function ChatPanel({
             )}
           </div>
         ) : null}
+        {activityMonitor ? (
+          <ActivityMonitorBar
+            cursor={activityMonitor.cursor}
+            target={activityMonitor.target}
+            health={activityMonitor.health}
+            latestSequence={activityMonitor.latestSequence}
+            action={activityMonitor.action}
+            onRestart={onRestartActivityMonitor}
+            onStop={onStopActivityMonitor}
+          />
+        ) : null}
       </div>
     );
   };
@@ -544,6 +606,34 @@ export function ChatPanel({
         <Tag className="context-status-tag">{contextLabel}</Tag>
         {!hubConnected ? <Tag>Hub 离线</Tag> : null}
         <div className="chat-status-actions">
+          {backgroundConversationWork ? (
+            <Tooltip
+              title={
+                backgroundConversationWork.pendingApprovalCount
+                  ? `其他对话有 ${backgroundConversationWork.pendingApprovalCount} 条待审批`
+                  : "其他对话正在后台执行"
+              }
+            >
+              <Button
+                className={`background-work-trigger ${
+                  backgroundConversationWork.pendingApprovalCount
+                    ? "is-attention"
+                    : ""
+                }`}
+                size="small"
+                type="text"
+                icon={<ClockCircleOutlined />}
+                onClick={() => setBackgroundWorkOpen(true)}
+                aria-label={
+                  backgroundConversationWork.pendingApprovalCount
+                    ? `打开后台任务，${backgroundConversationWork.pendingApprovalCount} 条待审批`
+                    : "打开后台任务，1 个对话正在执行"
+                }
+              >
+                {backgroundConversationWork.pendingApprovalCount || 1}
+              </Button>
+            </Tooltip>
+          ) : null}
           {delegatedInboxTasks.length ? (
             <Tooltip
               title={`Codex 收件箱 · ${delegatedInboxTasks.length} 条待处理`}
@@ -578,19 +668,12 @@ export function ChatPanel({
               aria-label="打开 AI 配置"
             />
           </Tooltip>
-          <Tooltip
-            title={
-              agentBusy || queuedMessages.length
-                ? "运行中或存在待发送消息，暂不能新建对话"
-                : "新对话"
-            }
-          >
+          <Tooltip title="新建干净对话；当前任务会继续留在原对话和 Tab">
             <Button
               size="small"
               type="text"
               icon={<ClearOutlined />}
               onClick={onClearChat}
-              disabled={agentBusy || queuedMessages.length > 0}
               aria-label="新对话"
             />
           </Tooltip>
@@ -686,6 +769,7 @@ export function ChatPanel({
                   copied={copiedMessageId === message.id}
                   onCopy={() => void copyMessage(message)}
                   onAccept={onAcceptDelegatedTask}
+                  onRestore={onRestoreDelegatedTask}
                   onReject={onRejectDelegatedTask}
                 />
               ) : (
@@ -1063,6 +1147,114 @@ export function ChatPanel({
         onChange={(event) => void addFiles(event.target.files)}
       />
       <Drawer
+        className="background-work-drawer"
+        title="后台任务"
+        placement="right"
+        width="min(400px, calc(100vw - 20px))"
+        open={backgroundWorkOpen}
+        onClose={() => setBackgroundWorkOpen(false)}
+      >
+        {backgroundConversationWork ? (
+          <>
+            <Typography.Paragraph
+              type="secondary"
+              className="background-work-note"
+            >
+              其他聊天上下文可以继续运行，但执行状态和审批不会混入当前对话。
+            </Typography.Paragraph>
+            <section
+              className="background-work-card"
+              aria-label={`后台任务：${backgroundConversationWork.conversationTitle}`}
+            >
+              <div className="background-work-card-header">
+                <div className="background-work-card-heading">
+                  <span className="background-work-card-label">
+                    其他聊天上下文
+                  </span>
+                  <strong title={backgroundConversationWork.conversationTitle}>
+                    {backgroundConversationWork.conversationTitle}
+                  </strong>
+                </div>
+                <Tag
+                  color={
+                    backgroundConversationWork.pendingApprovalCount
+                      ? "orange"
+                      : "processing"
+                  }
+                >
+                  {backgroundConversationWork.pendingApprovalCount
+                    ? `待审批 ${backgroundConversationWork.pendingApprovalCount}`
+                    : "执行中"}
+                </Tag>
+              </div>
+              <div className="background-work-card-body">
+                <span>
+                  目标 Tab：{" "}
+                  {backgroundConversationWork.target.title?.trim() ||
+                    formatTaskTargetHost(
+                      backgroundConversationWork.target.url,
+                    ) ||
+                    backgroundConversationWork.target.tabId}
+                </span>
+                {backgroundConversationWork.queuedCount ? (
+                  <span>
+                    同一对话还有 {backgroundConversationWork.queuedCount} 条待发送
+                  </span>
+                ) : null}
+                {backgroundConversationWork.pendingApprovalCount ? (
+                  <div className="background-work-attention">
+                    任务正在原对话等待你的决定，未批准的操作不会执行。
+                  </div>
+                ) : null}
+              </div>
+              <div className="background-work-card-actions">
+                <Popconfirm
+                  title="停止并删除这个后台对话？"
+                  description={
+                    backgroundConversationWork.recoverableDelegatedTask
+                      ? "本地 Agent 会停止；未结束的 MCP 任务将移入 Codex 收件箱等待恢复。"
+                      : "本地 Agent 会停止，当前对话和排队消息会从本地删除。"
+                  }
+                  okText="停止并删除"
+                  cancelText="返回"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={() => {
+                    if (
+                      onDeleteConversation(
+                        backgroundConversationWork.conversationId,
+                      )
+                    ) {
+                      setBackgroundWorkOpen(false);
+                    }
+                  }}
+                >
+                  <Button danger>停止并删除</Button>
+                </Popconfirm>
+                <Button
+                  type="primary"
+                  onClick={() => {
+                    if (
+                      onOpenConversation(
+                        backgroundConversationWork.conversationId,
+                      )
+                    ) {
+                      setBackgroundWorkOpen(false);
+                    }
+                  }}
+                >
+                  进入处理
+                </Button>
+              </div>
+            </section>
+          </>
+        ) : (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description="当前没有其他对话在后台执行"
+          />
+        )}
+      </Drawer>
+      <Drawer
         className="delegated-inbox-drawer"
         title="Codex 收件箱"
         placement="right"
@@ -1071,13 +1263,17 @@ export function ChatPanel({
         onClose={() => setDelegatedInboxOpen(false)}
       >
         <Typography.Paragraph type="secondary" className="delegated-inbox-note">
-          未接受的委托跨对话保留。接受后会绑定当前对话；切换对话不会移动或自动执行任务。
+          每个 MCP 任务按 taskId 独立保留。原对话删除后可恢复到新的干净对话，后续更新不会串入别的聊天。
         </Typography.Paragraph>
         <div className="delegated-inbox-list">
           {delegatedInboxTasks.map((task) => (
             <div className="delegated-inbox-item" key={task.taskId}>
               <DelegatedTaskCard
                 task={task}
+                orphaned={isDelegatedTaskOrphaned(
+                  task,
+                  conversations.map((conversation) => conversation.id),
+                )}
                 active={activeDelegatedTaskId === task.taskId}
                 queued={queuedMessages.some(
                   (submission) =>
@@ -1087,6 +1283,7 @@ export function ChatPanel({
                 copied={copiedMessageId === task.requestItem.id}
                 onCopy={() => void copyDelegatedTask(task)}
                 onAccept={onAcceptDelegatedTask}
+                onRestore={onRestoreDelegatedTask}
                 onReject={onRejectDelegatedTask}
               />
             </div>
@@ -1124,7 +1321,7 @@ export function ChatPanel({
                   <button
                     className="chat-history-main"
                     type="button"
-                    disabled={active || busy || queuedMessages.length > 0}
+                    disabled={active}
                     onClick={() => {
                       if (onOpenConversation(conversation.id)) {
                         setHistoryOpen(false);
@@ -1184,7 +1381,6 @@ export function ChatPanel({
                         type="text"
                         danger
                         icon={<DeleteOutlined />}
-                        disabled={busy || queuedMessages.length > 0}
                         aria-label={`删除对话 ${conversation.title}`}
                       />
                     </Popconfirm>
@@ -1578,6 +1774,77 @@ function ExecutionTargetBar({
   );
 }
 
+function ActivityMonitorBar({
+  cursor,
+  target,
+  health,
+  latestSequence,
+  action,
+  onRestart,
+  onStop,
+}: {
+  cursor: BrowserActivityCursor;
+  target?: { tabId: number; title?: string; url?: string };
+  health: "active" | "offline" | "stopped" | "restarted";
+  latestSequence?: number;
+  action?: "restart" | "stop";
+  onRestart: () => void;
+  onStop: () => void;
+}) {
+  const targetLabel =
+    target?.title?.trim() ||
+    formatTaskTargetHost(target?.url) ||
+    (target ? `Tab ${target.tabId}` : "已绑定页面");
+  const streamLabel = cursor.streamId.slice(-8);
+  const statusLabel =
+    health === "active"
+      ? "页面监听中"
+      : health === "offline"
+        ? "Hub 离线，监听待恢复"
+        : health === "restarted"
+          ? "监听流已变化，需要重启"
+          : "页面监听已停止";
+
+  return (
+    <section
+      className={`activity-monitor-bar${health === "active" ? "" : " is-warning"}`}
+      aria-label="页面变化监听状态"
+    >
+      <span className="activity-monitor-dot" aria-hidden="true" />
+      <span className="activity-monitor-copy">
+        <strong>{statusLabel}</strong>
+        <span title={targetLabel}>
+          {targetLabel} · seq {latestSequence ?? cursor.sequence} · {streamLabel}
+        </span>
+      </span>
+      <div className="activity-monitor-actions">
+        <Tooltip title="在当前绑定 Tab 上重新建立一条干净监听流">
+          <Button
+            size="small"
+            type="text"
+            icon={<RedoOutlined />}
+            loading={action === "restart"}
+            disabled={Boolean(action)}
+            onClick={onRestart}
+            aria-label="重启页面变化监听"
+          />
+        </Tooltip>
+        <Tooltip title="停止这条页面变化监听">
+          <Button
+            size="small"
+            type="text"
+            icon={<StopOutlined />}
+            loading={action === "stop"}
+            disabled={Boolean(action)}
+            onClick={onStop}
+            aria-label="停止页面变化监听"
+          />
+        </Tooltip>
+      </div>
+    </section>
+  );
+}
+
 function formatTaskTargetHost(url: string | undefined): string | undefined {
   if (!url) {
     return undefined;
@@ -1957,21 +2224,25 @@ function parseJsonObject(content: string): Record<string, unknown> | null {
 
 function DelegatedTaskCard({
   task,
+  orphaned = false,
   active,
   queued,
   loading,
   copied,
   onCopy,
   onAccept,
+  onRestore,
   onReject,
 }: {
   task: DelegatedTaskSnapshot;
+  orphaned?: boolean;
   active: boolean;
   queued: boolean;
   loading: boolean;
   copied: boolean;
   onCopy: () => void;
   onAccept: (taskId: string, resume: boolean) => void;
+  onRestore: (taskId: string) => void;
   onReject: (taskId: string) => void;
 }) {
   const phaseLabels = {
@@ -1983,7 +2254,8 @@ function DelegatedTaskCard({
     cancelled: "已取消",
   } as const;
   const requestTypeLabel = task.request.requestType === "question" ? "问题" : "任务";
-  const isInterrupted = task.phase === "claimed" && !active && !queued;
+  const isInterrupted =
+    task.phase === "claimed" && !active && !queued && !orphaned;
 
   return (
     <div className={`delegated-task-card is-${task.phase}`}>
@@ -2061,6 +2333,11 @@ function DelegatedTaskCard({
             上次运行已中断。恢复时会先重新观察页面，不会自动重放结果未知的写操作。
           </div>
         ) : null}
+        {orphaned ? (
+          <div className="delegated-task-notice is-warning">
+            原本地对话已删除。MCP 任务和后续更新仍按 taskId 保留；可恢复到新的干净对话，也可直接关闭任务。
+          </div>
+        ) : null}
         {task.result?.summary ? (
           <div
             className={`delegated-task-notice is-${task.phase === "completed" ? "success" : "neutral"}`}
@@ -2099,7 +2376,29 @@ function DelegatedTaskCard({
             </Button>
           </div>
         ) : null}
-        {isInterrupted ? (
+        {orphaned ? (
+          <div className="delegated-task-buttons">
+            <Popconfirm
+              title="关闭这个任务？"
+              description="任务会标记为已取消并通知 Codex，不会删除已产生的浏览器操作。"
+              okText="关闭任务"
+              cancelText="返回"
+              okButtonProps={{ danger: true }}
+              onConfirm={() => onReject(task.taskId)}
+            >
+              <Button danger disabled={loading} icon={<DeleteOutlined />}>
+                关闭任务
+              </Button>
+            </Popconfirm>
+            <Button
+              type="primary"
+              loading={loading}
+              onClick={() => onRestore(task.taskId)}
+            >
+              恢复到新对话
+            </Button>
+          </div>
+        ) : isInterrupted ? (
           <Button
             loading={loading}
             onClick={() => onAccept(task.taskId, true)}

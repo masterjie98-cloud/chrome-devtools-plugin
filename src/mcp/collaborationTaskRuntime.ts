@@ -4,6 +4,7 @@ import type {
   CollaborationItem,
   CollaborationWorkspaceMutationResult,
 } from "../shared/collaborationWorkspace";
+import { toCollaborationTargetBinding } from "../shared/collaborationWorkspace";
 import {
   DELEGATED_TASK_VERSION,
   delegatedTaskConversationKey,
@@ -29,7 +30,10 @@ import { ExecutionBrokerError } from "../daemon/executionBroker";
 import type { z } from "zod";
 
 type DelegateArgs = z.infer<typeof delegateCollaborationTaskInputSchema>;
-type ClaimArgs = z.infer<typeof claimCollaborationTaskInputSchema>;
+type ClaimArgs = Omit<
+  z.infer<typeof claimCollaborationTaskInputSchema>,
+  "rebind"
+> & { rebind?: boolean };
 type CompleteArgs = z.infer<typeof completeCollaborationTaskInputSchema>;
 type UpdateArgs = z.infer<typeof updateCollaborationTaskInputSchema>;
 type CancelArgs = z.infer<typeof cancelCollaborationTaskInputSchema>;
@@ -138,15 +142,26 @@ export function claimCollaborationTask(
       `Delegated task ${args.taskId} is already ${task.result.status}.`,
     );
   }
-  assertTaskTargetFresh(task.requestItem.target, snapshot.currentTab);
+  const refreshingRecoveredTarget = Boolean(
+    task.claim && args.resume && args.rebind,
+  );
+  assertTaskTargetFresh(
+    task.requestItem.target,
+    snapshot.currentTab,
+    refreshingRecoveredTarget,
+  );
   const conversationKey = delegatedTaskConversationKey(args.conversationId);
+  const previousConversationKey = task.claim?.conversationKey;
+  const rebound = Boolean(
+    previousConversationKey && previousConversationKey !== conversationKey,
+  );
   if (
-    task.claim?.conversationKey &&
-    task.claim.conversationKey !== conversationKey
+    rebound &&
+    !args.rebind
   ) {
     throw new ExecutionBrokerError(
       "STALE_CONTEXT",
-      `Delegated task ${args.taskId} is bound to another plugin conversation. Open that conversation before resuming it.`,
+      `Delegated task ${args.taskId} is bound to another plugin conversation. Restore it into a clean conversation with resume=true and rebind=true.`,
     );
   }
 
@@ -156,6 +171,7 @@ export function claimCollaborationTask(
         taskId: args.taskId,
         claimed: false,
         resumed: task.claim.resumed,
+        rebound: false,
         attempt: task.claim.attempt,
         workspaceRevision: snapshot.collaborationWorkspace.revision,
         claimItem: task.claimItem,
@@ -171,7 +187,9 @@ export function claimCollaborationTask(
       kind: "task.state",
       title: `Accepted: ${task.requestItem.title}`,
       summary: resumed
-        ? "The user explicitly resumed this task after a previous sidepanel run stopped or disconnected. Re-observe before any write."
+        ? rebound
+          ? "The user explicitly restored this task into a new clean plugin conversation because its previous local conversation was removed. Re-observe before any write."
+          : "The user explicitly resumed this task after a previous sidepanel run stopped or disconnected. Re-observe before any write."
         : "The user accepted this delegated task in the extension inbox.",
       content: {
         version: DELEGATED_TASK_VERSION,
@@ -181,14 +199,26 @@ export function claimCollaborationTask(
         resumed,
         requiresReobservation: resumed,
         conversationKey,
+        rebound,
+        ...(rebound && previousConversationKey
+          ? {
+              previousConversationKey,
+            }
+          : {}),
       },
-      tags: ["delegated-task", resumed ? "resume" : "accepted"],
+      tags: [
+        "delegated-task",
+        rebound ? "rebound" : resumed ? "resume" : "accepted",
+      ],
       visibility: "shared",
       sensitivity: task.requestItem.sensitivity,
       status: "active",
       parentId: task.requestItem.id,
       expectedRevision: task.claimItem?.revision,
-      target: task.requestItem.target,
+      target:
+        refreshingRecoveredTarget && snapshot.currentTab
+          ? toCollaborationTargetBinding(snapshot.currentTab)
+          : task.requestItem.target,
     },
     { actor: "extension_agent", clientId },
     sessionId,
@@ -199,6 +229,7 @@ export function claimCollaborationTask(
       taskId: args.taskId,
       claimed: true,
       resumed,
+      rebound,
       attempt,
       workspaceRevision: mutation.workspace.revision,
       claimItem: mutation.item,
@@ -547,11 +578,16 @@ function requireDelegatedTask(
 function assertTaskTargetFresh(
   expected: CollaborationItem["target"],
   current: ActiveTabSnapshot | undefined,
+  allowDocumentRefresh = false,
 ): void {
   if (!expected) {
     return;
   }
-  const mismatches = getTaskTargetMismatches(expected, current);
+  const mismatches = getTaskTargetMismatches(expected, current).filter(
+    (field) =>
+      !allowDocumentRefresh ||
+      (field !== "documentId" && field !== "navigationId"),
+  );
   if (mismatches.includes("currentTarget")) {
     throw new ExecutionBrokerError(
       "STALE_CONTEXT",

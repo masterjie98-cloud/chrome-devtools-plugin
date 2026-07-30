@@ -129,7 +129,10 @@ import {
   normalizeStrings,
   type TaskCapabilityGrant,
 } from "../shared/taskCapabilityGrant";
-import { getTaskExecutionBindingMismatch } from "../shared/taskExecutionBinding";
+import {
+  getTaskExecutionBindingMismatch,
+  resolveTaskBindingConversationId,
+} from "../shared/taskExecutionBinding";
 
 export interface PluginWebSocketServer {
   close: () => Promise<void>;
@@ -271,6 +274,7 @@ export function startPluginWebSocketServer(
   const clients = new Set<WebSocket>();
   const clientRoles = new Map<WebSocket, WsClientRole | "unknown">();
   const clientSessionIds = new Map<WebSocket, string>();
+  const clientConversationIds = new Map<WebSocket, string>();
   const connectionIds = new Map<WebSocket, string>();
   const connectionRates = new Map<
     WebSocket,
@@ -394,6 +398,7 @@ export function startPluginWebSocketServer(
         raw.toString(),
         clientRoles,
         clientSessionIds,
+        (conversationId) => clientConversationIds.set(socket, conversationId),
         () => registerPluginSocket(socket),
         (sessionId) => registerBrowserSocket(socket, sessionId),
         () => replayStateToObserver(socket),
@@ -426,6 +431,7 @@ export function startPluginWebSocketServer(
         "requester connection closed before execution completed.",
       );
       connectionIds.delete(socket);
+      clientConversationIds.delete(socket);
       connectionRates.delete(socket);
       protocolViolations.delete(socket);
       connectionLastActivity.delete(socket);
@@ -752,9 +758,14 @@ export function startPluginWebSocketServer(
       taskId: requestedSnapshot.currentConversationId,
       egressDestinations: defaultTaskEgressDestinations(role, clientName),
     };
+    const taskBindingConversationId = resolveTaskBindingConversationId(
+      role,
+      clientConversationIds.get(requester),
+      requestedSnapshot.currentConversationId,
+    );
     const taskBindingMismatch = getTaskExecutionBindingMismatch(
       taskContext,
-      requestedSnapshot.currentConversationId,
+      taskBindingConversationId,
       requestedTarget,
     );
     if (taskBindingMismatch) {
@@ -1176,6 +1187,18 @@ export function startPluginWebSocketServer(
         workspace: state.collaborationWorkspace,
       },
     });
+    sendRawMessage(socket, {
+      requestId: createMessageId(),
+      command: WS_COMMANDS.BROWSER_ACTIVITY_UPDATED,
+      sentAt: new Date().toISOString(),
+      payload: {
+        sessionId: state.sessionId,
+        streamId: state.activityStream.streamId,
+        active: state.activityStream.active,
+        latestSequence: state.activityStream.latestSequence,
+        target: state.activityStream.target,
+      },
+    });
   }
 
   function broadcastToObservers(
@@ -1184,21 +1207,26 @@ export function startPluginWebSocketServer(
   ): void {
     const sourceSessionId = clientSessionIds.get(sourceSocket);
     if (message.command === WS_COMMANDS.BROWSER_ACTIVITY_EVENT) {
-      const latestSequence =
-        browserStateHub.activityStreamPayload(sourceSessionId).latestSequence;
+      const activityStream =
+        browserStateHub.activityStreamPayload(sourceSessionId);
       const update: McpToPluginMessage = {
         requestId: createMessageId(),
         command: WS_COMMANDS.BROWSER_ACTIVITY_UPDATED,
         sentAt: new Date().toISOString(),
         payload: {
           sessionId: sourceSessionId ?? "default",
-          latestSequence,
+          streamId: activityStream.streamId,
+          active: activityStream.active,
+          latestSequence: activityStream.latestSequence,
+          target: activityStream.target,
         },
       };
       const payload = JSON.stringify(update);
       for (const socket of clients) {
         if (
-          clientRoles.get(socket) === "mcp" &&
+          (clientRoles.get(socket) === "mcp" ||
+            clientRoles.get(socket) === "observer" ||
+            clientRoles.get(socket) === "ui") &&
           clientSessionIds.get(socket) === sourceSessionId &&
           socket.readyState === socket.OPEN
         ) {
@@ -1230,6 +1258,7 @@ function handleRawMessage(
   raw: string,
   clientRoles: Map<WebSocket, WsClientRole | "unknown">,
   clientSessionIds: Map<WebSocket, string>,
+  setClientConversationId: (conversationId: string) => void,
   registerPluginSocket: () => void,
   registerBrowserSocket: (sessionId?: string) => void,
   replayStateToObserver: () => void,
@@ -1388,6 +1417,19 @@ function handleRawMessage(
       `ROLE_FORBIDDEN: ${currentRole} clients cannot send ${parsed.data.command}.`,
     );
     return;
+  }
+
+  if (
+    currentRole === "ui" &&
+    parsed.data.command === WS_COMMANDS.PLUGIN_CONVERSATION_STARTED
+  ) {
+    setClientConversationId(parsed.data.payload.conversationId.trim());
+  } else if (
+    currentRole === "ui" &&
+    parsed.data.command === WS_COMMANDS.PLUGIN_CHAT_MESSAGE_CREATED &&
+    parsed.data.payload.message.conversationId
+  ) {
+    setClientConversationId(parsed.data.payload.message.conversationId.trim());
   }
 
   void handlePluginMessage(
@@ -1812,13 +1854,28 @@ async function handlePublishedStateMessage(
       return true;
     case WS_COMMANDS.BROWSER_ACTIVITY_EVENT:
       if (message.payload.event.summary.reason === "monitoring-started") {
-        browserStateHub.setActivityActive(true, sessionId);
+        browserStateHub.setActivityActive(
+          true,
+          sessionId,
+          message.payload.event.target,
+        );
       } else if (
         message.payload.event.summary.reason === "monitoring-stopped"
       ) {
-        browserStateHub.setActivityActive(false, sessionId);
+        browserStateHub.setActivityActive(
+          false,
+          sessionId,
+          message.payload.event.target,
+        );
       }
-      browserStateHub.addBrowserActivityEvent(message.payload.event, sessionId);
+      if (
+        !browserStateHub.addBrowserActivityEvent(
+          message.payload.event,
+          sessionId,
+        )
+      ) {
+        return true;
+      }
       broadcastToObservers(message);
       return true;
     case WS_COMMANDS.COLLABORATION_ITEM_UPSERT: {

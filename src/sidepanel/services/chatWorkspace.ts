@@ -1,10 +1,12 @@
 import type { ChatMessage } from "../types";
+import type { BrowserActivityCursor } from "../../shared/browserActivity";
 
 export const CHAT_WORKSPACE_STORAGE_KEY = "aiDevtools.chatWorkspaceV1";
 export const MAX_STORED_CONVERSATIONS = 20;
 export const MAX_STORED_MESSAGES = 80;
 export const MAX_STORED_MESSAGE_CHARS = 12_000;
 export const MAX_STORED_DRAFT_CHARS = 12_000;
+export const DEFAULT_CHAT_GREETING = "AI DevTools Assistant 已就绪。";
 const MAX_CONVERSATION_CHARS = 240_000;
 const FALLBACK_STORAGE_KEY = "ai-devtools-assistant.chat-workspace-v1";
 let workspaceSaveQueue: Promise<void> = Promise.resolve();
@@ -17,6 +19,14 @@ export interface StoredChatMessage {
   source?: "user" | "extension_ai" | "system";
 }
 
+export interface StoredConversationTarget {
+  tabId: number;
+  windowId?: number;
+  targetId?: string;
+  title?: string;
+  url?: string;
+}
+
 export interface StoredChatConversation {
   id: string;
   title: string;
@@ -24,6 +34,8 @@ export interface StoredChatConversation {
   updatedAt: string;
   messages: StoredChatMessage[];
   draft: string;
+  target?: StoredConversationTarget;
+  activityCursor?: BrowserActivityCursor;
   forkedFromConversationId?: string;
   forkedFromMessageId?: string;
 }
@@ -93,10 +105,14 @@ export function createStoredConversation(params: {
   updatedAt: string;
   messages: ChatMessage[];
   draft: string;
+  target?: StoredConversationTarget;
+  activityCursor?: BrowserActivityCursor;
   forkedFromConversationId?: string;
   forkedFromMessageId?: string;
 }): StoredChatConversation {
   const messages = sanitizeMessages(params.messages);
+  const target = sanitizeConversationTarget(params.target);
+  const activityCursor = sanitizeActivityCursor(params.activityCursor);
   return {
     id: sanitizeIdentifier(params.id),
     title: deriveConversationTitle(messages),
@@ -104,6 +120,8 @@ export function createStoredConversation(params: {
     updatedAt: sanitizeTimestamp(params.updatedAt),
     messages,
     draft: sanitizeText(params.draft, MAX_STORED_DRAFT_CHARS),
+    ...(target ? { target } : {}),
+    ...(activityCursor !== undefined ? { activityCursor } : {}),
     ...(params.forkedFromConversationId
       ? {
           forkedFromConversationId: sanitizeIdentifier(
@@ -130,6 +148,44 @@ export function upsertStoredConversation(
   }).conversations;
 }
 
+export function isEmptyStoredConversation(
+  conversation: StoredChatConversation,
+): boolean {
+  if (
+    conversation.draft.trim() ||
+    conversation.target ||
+    conversation.activityCursor ||
+    conversation.forkedFromConversationId ||
+    conversation.forkedFromMessageId
+  ) {
+    return false;
+  }
+  if (conversation.messages.length === 0) {
+    return true;
+  }
+  if (conversation.messages.length !== 1) {
+    return false;
+  }
+  const message = conversation.messages[0];
+  return (
+    message?.role === "assistant" &&
+    (message.source === undefined || message.source === "extension_ai") &&
+    message.content === DEFAULT_CHAT_GREETING
+  );
+}
+
+export function upsertPersistableConversation(
+  conversations: StoredChatConversation[],
+  conversation: StoredChatConversation,
+): StoredChatConversation[] {
+  if (isEmptyStoredConversation(conversation)) {
+    return conversations.filter(
+      (candidate) => candidate.id !== conversation.id,
+    );
+  }
+  return upsertStoredConversation(conversations, conversation);
+}
+
 export function normalizeChatWorkspace(value: unknown): ChatWorkspaceState {
   if (!isRecord(value) || !Array.isArray(value.conversations)) {
     return createEmptyChatWorkspace();
@@ -139,7 +195,11 @@ export function normalizeChatWorkspace(value: unknown): ChatWorkspaceState {
   const conversations = value.conversations
     .map(normalizeStoredConversation)
     .filter((conversation): conversation is StoredChatConversation => {
-      if (!conversation || seenIds.has(conversation.id)) {
+      if (
+        !conversation ||
+        isEmptyStoredConversation(conversation) ||
+        seenIds.has(conversation.id)
+      ) {
         return false;
       }
       seenIds.add(conversation.id);
@@ -212,6 +272,8 @@ function normalizeStoredConversation(
   const messages = sanitizeMessages(value.messages);
   const createdAt = sanitizeTimestamp(value.createdAt);
   const updatedAt = sanitizeTimestamp(value.updatedAt, createdAt);
+  const target = sanitizeConversationTarget(value.target);
+  const activityCursor = sanitizeActivityCursor(value.activityCursor);
   return {
     id,
     title: deriveConversationTitle(messages),
@@ -219,6 +281,8 @@ function normalizeStoredConversation(
     updatedAt,
     messages,
     draft: sanitizeText(value.draft, MAX_STORED_DRAFT_CHARS),
+    ...(target ? { target } : {}),
+    ...(activityCursor !== undefined ? { activityCursor } : {}),
     ...(sanitizeOptionalIdentifier(value.forkedFromConversationId)
       ? {
           forkedFromConversationId: sanitizeIdentifier(
@@ -230,6 +294,76 @@ function normalizeStoredConversation(
       ? { forkedFromMessageId: sanitizeIdentifier(value.forkedFromMessageId) }
       : {}),
   };
+}
+
+function sanitizeConversationTarget(
+  value: unknown,
+): StoredConversationTarget | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const tabId =
+    typeof value.tabId === "number" &&
+    Number.isSafeInteger(value.tabId) &&
+    value.tabId > 0
+      ? value.tabId
+      : undefined;
+  if (!tabId) {
+    return undefined;
+  }
+  const windowId =
+    typeof value.windowId === "number" &&
+    Number.isSafeInteger(value.windowId) &&
+    value.windowId >= 0
+      ? value.windowId
+      : undefined;
+  const targetId = sanitizeOptionalIdentifier(value.targetId);
+  const title = sanitizeText(value.title, 1_000).trim() || undefined;
+  const url = sanitizeStoredTargetUrl(value.url);
+  return {
+    tabId,
+    ...(windowId !== undefined ? { windowId } : {}),
+    ...(targetId ? { targetId } : {}),
+    ...(title ? { title } : {}),
+    ...(url ? { url } : {}),
+  };
+}
+
+function sanitizeActivityCursor(
+  value: unknown,
+): BrowserActivityCursor | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.streamId !== "string" ||
+    !value.streamId.trim() ||
+    value.streamId.length > 200 ||
+    typeof value.sequence !== "number" ||
+    !Number.isSafeInteger(value.sequence) ||
+    value.sequence < 0
+  ) {
+    return undefined;
+  }
+  return {
+    streamId: value.streamId,
+    sequence: value.sequence,
+  };
+}
+
+function sanitizeStoredTargetUrl(value: unknown): string | undefined {
+  const raw = sanitizeText(value, 4_000).trim();
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const url = new URL(raw);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return raw.split(/[?#]/, 1)[0] || undefined;
+  }
 }
 
 function sanitizeMessages(values: unknown[]): StoredChatMessage[] {

@@ -141,6 +141,8 @@ export interface DebuggerNetworkStatus {
   protocolVersion: string;
   requestCount: number;
   maxEntries: number;
+  droppedRequestCount: number;
+  capacityReached: boolean;
   preservedLog: boolean;
   observationSessionId?: string;
   observationStartedAt?: string;
@@ -224,6 +226,8 @@ export interface DebuggerNetworkListResult {
   returned: number;
   requests: DebuggerNetworkRequestSummary[];
   activityDigest: NetworkActivityDigest;
+  droppedRequestCount: number;
+  capacityReached: boolean;
   pagination: CollectionPagination;
   observationSessionId?: string;
   observationStartedAt?: string;

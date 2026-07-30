@@ -158,6 +158,9 @@ let activityStatus = {
   includeNetwork: false,
   includeConsole: false,
 } as import("../shared/browserActivity").BrowserActivityStatus;
+let activityTarget:
+  | import("../shared/wsProtocol").ActiveTabSnapshot
+  | undefined;
 
 export interface ToolExecutionAuthorization {
   approvalRequired: boolean;
@@ -700,7 +703,7 @@ async function startBrowserActivity(
   if (includeNetwork) {
     const network = await startNetworkDebugger({
       preserveLog: input.preserveLog === true,
-      maxEntries: input.maxNetworkEntries ?? 300,
+      maxEntries: input.maxNetworkEntries ?? 2_000,
     });
     networkObservationSessionId = network.observationSessionId;
   }
@@ -708,10 +711,7 @@ async function startBrowserActivity(
     await listConsoleMessages({ limit: 1 });
   }
   if (includeDom) {
-    await forwardContentRequest(
-      MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR,
-      { enabled: true },
-    );
+    await setDomActivityMonitoringForTab(tab.id, true);
   }
   activityStatus = {
     active: true,
@@ -723,7 +723,12 @@ async function startBrowserActivity(
     documentId: frame?.documentId,
     networkObservationSessionId,
   };
-  emitDebuggerActivityLifecycle(true);
+  activityTarget = toBrowserActivityTarget(tab);
+  emitDebuggerActivityLifecycle(
+    true,
+    activityTarget,
+    includeNetwork || includeConsole,
+  );
   return { ...activityStatus };
 }
 
@@ -731,10 +736,12 @@ async function stopBrowserActivity(): Promise<
   import("../shared/browserActivity").BrowserActivityStatus
 > {
   if (activityStatus.includeDom) {
-    await forwardContentRequest(
-      MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR,
-      { enabled: false },
-    ).catch(() => undefined);
+    if (activityStatus.tabId !== undefined) {
+      await setDomActivityMonitoringForTab(
+        activityStatus.tabId,
+        false,
+      ).catch(() => undefined);
+    }
   }
   if (activityStatus.includeNetwork) {
     await stopNetworkDebugger().catch(() => undefined);
@@ -743,8 +750,96 @@ async function stopBrowserActivity(): Promise<
     ...activityStatus,
     active: false,
   };
-  emitDebuggerActivityLifecycle(false);
+  emitDebuggerActivityLifecycle(false, activityTarget);
   return { ...activityStatus };
+}
+
+function toBrowserActivityTarget(
+  tab: chrome.tabs.Tab,
+): import("../shared/wsProtocol").ActiveTabSnapshot | undefined {
+  if (tab.id === undefined) {
+    return undefined;
+  }
+  const frameSnapshot = getSelectedContentFrameSnapshot(tab.id);
+  const frame = frameSnapshot ?? getSelectedContentFrame(tab.id);
+  const navigation = getTargetNavigationState(tab.id, false);
+  return {
+    url: frameSnapshot?.url || tab.url || "",
+    title: frameSnapshot?.title || tab.title || "",
+    targetId: String(tab.id),
+    tabId: tab.id,
+    windowId: tab.windowId,
+    frameId: frame.frameId,
+    documentId: frame.documentId,
+    navigationId: navigation.navigationId,
+    revision: navigation.revision,
+  };
+}
+
+export async function restoreBrowserActivityForContentFrame(
+  tabId: number,
+  frame: ContentFrameAddress,
+): Promise<void> {
+  if (
+    !activityStatus.active ||
+    !activityStatus.includeDom ||
+    activityStatus.tabId !== tabId
+  ) {
+    return;
+  }
+  await sendActivityMonitorRequest(tabId, frame, true);
+}
+
+async function setDomActivityMonitoringForTab(
+  tabId: number,
+  enabled: boolean,
+): Promise<void> {
+  let frames = listRegisteredContentFrames(tabId);
+  if (frames.length === 0) {
+    frames = await waitForRegisteredContentFrames(tabId, { timeoutMs: 750 });
+  }
+  if (frames.length === 0) {
+    const frame = getSelectedContentFrame(tabId);
+    if (enabled && !frame.documentId) {
+      await injectContentScript(tabId, frame);
+    }
+    await sendActivityMonitorRequest(tabId, frame, enabled);
+    return;
+  }
+  const results = await Promise.allSettled(
+    frames.map((frame) =>
+      sendActivityMonitorRequest(
+        tabId,
+        { frameId: frame.frameId, documentId: frame.documentId },
+        enabled,
+      ),
+    ),
+  );
+  if (
+    enabled &&
+    results.every((result) => result.status === "rejected")
+  ) {
+    throw new Error(
+      "FRAME_UNAVAILABLE: DOM activity monitoring could not attach to any accessible frame in the selected Tab.",
+    );
+  }
+}
+
+async function sendActivityMonitorRequest(
+  tabId: number,
+  frame: ContentFrameAddress,
+  enabled: boolean,
+): Promise<void> {
+  const request = {
+    id: createMessageId(),
+    source: "background",
+    type: MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR,
+    payload: { enabled },
+  } as RequestOf<typeof MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR>;
+  const response = await sendTabRequest(tabId, request, frame);
+  if (!response.ok) {
+    throw new Error(response.error.message);
+  }
 }
 
 async function readMultiFramePageSnapshot(

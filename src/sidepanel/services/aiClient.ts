@@ -4,6 +4,7 @@ import type {
   CollaborationItem,
   CollaborationWorkspaceSnapshot,
 } from "../../shared/collaborationWorkspace";
+import type { BrowserActivityCursor } from "../../shared/browserActivity";
 import { buildCompressedPageContext } from "../../shared/contextDigest";
 import {
   MCP_AI_TOOL_DEFINITIONS,
@@ -22,6 +23,7 @@ interface AiChatContext {
   pageSnapshot?: PageSnapshot;
   selectedElement?: DomElementInfo;
   collaborationWorkspace?: CollaborationWorkspaceSnapshot;
+  activityCursor?: BrowserActivityCursor;
   contextReadError?: string;
 }
 
@@ -402,6 +404,130 @@ export function toAiToolDefinitions(
   }));
 }
 
+/**
+ * Some OpenAI-compatible providers compile function schemas into a restricted
+ * grammar and reject valid JSON Schema keywords such as `uniqueItems`.
+ * Keep the canonical MCP schema intact and remove only the unsupported keyword
+ * from the provider-bound copy.
+ */
+export function toProviderCompatibleToolSchema(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(toProviderCompatibleToolSchema);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== "uniqueItems")
+      .map(([key, entry]) => [
+        key,
+        toProviderCompatibleToolSchema(entry),
+      ]),
+  );
+}
+
+/**
+ * Last-resort provider projection for OpenAI-compatible endpoints that expose
+ * only a small grammar-safe JSON Schema subset. The canonical MCP schema and
+ * the local Zod validator remain unchanged; this projection only broadens the
+ * model-facing grammar after the provider explicitly rejects the normal copy.
+ */
+export function toConservativeProviderToolSchema(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(toConservativeProviderToolSchema);
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+  if (typeof value.type === "string" && isRecord(value.function)) {
+    return {
+      type: value.type,
+      function: {
+        ...(typeof value.function.name === "string"
+          ? { name: value.function.name }
+          : {}),
+        ...(typeof value.function.description === "string"
+          ? { description: value.function.description }
+          : {}),
+        ...(value.function.parameters !== undefined
+          ? {
+              parameters: toConservativeJsonSchema(
+                value.function.parameters,
+              ),
+            }
+          : {}),
+      },
+    };
+  }
+  return toConservativeJsonSchema(value);
+}
+
+export function isProviderToolSchemaCompatibilityError(
+  message: string,
+): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    /grammar error|unimplemented keys?|unsupported (?:json )?schema/.test(
+      normalized,
+    ) ||
+    /(?:tool|function).{0,40}(?:schema|parameters).{0,40}(?:invalid|unsupported|unimplemented)/.test(
+      normalized,
+    ) ||
+    /(?:invalid|unsupported|unimplemented).{0,40}(?:tool|function).{0,40}(?:schema|parameters)/.test(
+      normalized,
+    )
+  );
+}
+
+function toConservativeJsonSchema(value: unknown): unknown {
+  if (!isRecord(value)) {
+    return value;
+  }
+  const result: Record<string, unknown> = {};
+  if (
+    typeof value.type === "string" ||
+    (Array.isArray(value.type) &&
+      value.type.every((entry) => typeof entry === "string"))
+  ) {
+    result.type = value.type;
+  }
+  if (typeof value.description === "string") {
+    result.description = value.description;
+  }
+  if (Array.isArray(value.enum)) {
+    result.enum = value.enum;
+  }
+  if (isRecord(value.properties)) {
+    result.properties = Object.fromEntries(
+      Object.entries(value.properties).map(([key, schema]) => [
+        key,
+        toConservativeJsonSchema(schema),
+      ]),
+    );
+  }
+  if (
+    Array.isArray(value.required) &&
+    value.required.every((entry) => typeof entry === "string")
+  ) {
+    result.required = value.required;
+  }
+  if (value.items !== undefined) {
+    result.items = Array.isArray(value.items)
+      ? value.items.map(toConservativeJsonSchema)
+      : toConservativeJsonSchema(value.items);
+  }
+  if (typeof value.additionalProperties === "boolean") {
+    result.additionalProperties = value.additionalProperties;
+  }
+  return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function isAssistantTaskComplete(content: string): boolean {
   return /<task_status>\s*complete\s*<\/task_status>/i.test(content);
 }
@@ -599,12 +725,13 @@ async function requestChatCompletion(params: {
   toolChoice?: "auto" | "required";
   tools?: AiFunctionToolDefinition[];
 }): Promise<AiChatStreamResult> {
-  const advertisedTools: unknown[] = params.enableTools
+  const providerTools: unknown[] = params.enableTools
     ? [
         ...(params.tools ?? MCP_AI_TOOL_DEFINITIONS),
         ...buildWebSearchTools(params.config),
       ]
     : [];
+  const advertisedTools = providerTools.map(toProviderCompatibleToolSchema);
   const toolParsingPolicy: ToolParsingPolicy = {
     allowFormalToolCalls: params.enableTools,
     allowPseudoToolCalls:
@@ -651,30 +778,40 @@ async function requestChatCompletion(params: {
   }
 
   try {
-    const response = await fetch(resolveChatCompletionsUrl(params.config.apiUrl), {
-      method: "POST",
-      headers: buildChatCompletionHeaders(params.config.apiKey),
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
-    });
+    let response = await sendChatCompletionRequest(
+      params.config,
+      requestBody,
+      controller.signal,
+    );
     resetIdleTimeout();
 
     if (!response.ok) {
-      const rawText = await response.text().catch(() => "");
-      let apiMessage = "";
-      try {
-        const payload = JSON.parse(rawText) as OpenAiChatResponse;
-        apiMessage =
-          payload?.error?.message ??
-          (typeof (payload as Record<string, unknown>).message === "string"
-            ? String((payload as Record<string, unknown>).message)
-            : "");
-      } catch {
-        apiMessage = rawText.slice(0, 300);
+      let apiMessage = await readChatCompletionError(response);
+      if (
+        providerTools.length > 0 &&
+        isProviderToolSchemaCompatibilityError(apiMessage)
+      ) {
+        const conservativeTools = providerTools.map(
+          toConservativeProviderToolSchema,
+        );
+        response = await sendChatCompletionRequest(
+          params.config,
+          {
+            ...requestBody,
+            tools: conservativeTools,
+          },
+          controller.signal,
+        );
+        resetIdleTimeout();
+        if (!response.ok) {
+          apiMessage = await readChatCompletionError(response);
+        }
       }
-      throw new Error(
-        apiMessage || `AI request failed with HTTP ${response.status}.`,
-      );
+      if (!response.ok) {
+        throw new Error(
+          apiMessage || `AI request failed with HTTP ${response.status}.`,
+        );
+      }
     }
 
     if (!response.body) {
@@ -710,6 +847,34 @@ async function requestChatCompletion(params: {
       window.clearTimeout(timeoutId);
     }
     params.abortSignal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+function sendChatCompletionRequest(
+  config: AiConfig,
+  requestBody: Record<string, unknown>,
+  signal: AbortSignal,
+): Promise<Response> {
+  return fetch(resolveChatCompletionsUrl(config.apiUrl), {
+    method: "POST",
+    headers: buildChatCompletionHeaders(config.apiKey),
+    body: JSON.stringify(requestBody),
+    signal,
+  });
+}
+
+async function readChatCompletionError(response: Response): Promise<string> {
+  const rawText = await response.text().catch(() => "");
+  try {
+    const payload = JSON.parse(rawText) as OpenAiChatResponse;
+    return (
+      payload?.error?.message ??
+      (typeof (payload as Record<string, unknown>).message === "string"
+        ? String((payload as Record<string, unknown>).message)
+        : "")
+    );
+  } catch {
+    return rawText.slice(0, 300);
   }
 }
 
@@ -2317,7 +2482,7 @@ function buildMessages(params: {
   return [
     {
       role: "system",
-      content: buildSystemPrompt(params.config),
+      content: buildSystemPrompt(params.config, params.context),
     },
     ...history,
     ...(untrustedContextMessage
@@ -2362,7 +2527,11 @@ function buildContent(
   ];
 }
 
-function buildSystemPrompt(config: AiConfig): string {
+function buildSystemPrompt(config: AiConfig, context: AiChatContext): string {
+  const activityCursorInstruction =
+    context.activityCursor !== undefined
+      ? `Trusted local activity state: the current conversation's saved activity cursor is streamId=${context.activityCursor.streamId}, sequence=${context.activityCursor.sequence}. For an incremental change-summary request, call browser_debug_activity exactly once with afterStreamId=${context.activityCursor.streamId} and afterSequence=${context.activityCursor.sequence}. The client stages activity.nextCursor and commits it only after your final summary succeeds.`
+      : "Trusted local activity state: this conversation has no saved activity cursor. If the user explicitly asks for changes from an already running listener, recover without restarting by calling browser_debug_activity exactly once with afterSequence=0. Never omit afterSequence for that request: the legacy no-argument mode reads only a recent snapshot, not full history. The client stages activity.nextCursor and commits it only after your final summary succeeds.";
   const parts = [
     "You are AI DevTools Assistant inside a Chrome extension.",
     "Help debug UI, DOM, CSS layout, interaction, and request issues.",
@@ -2380,7 +2549,9 @@ function buildSystemPrompt(config: AiConfig): string {
         ]
       : []),
     "Arbitrary page-side JavaScript execution is disabled until a deadline-bound isolated executor is available.",
-    "For Network debugging or a task action likely to send a request, call browser_network_start_recording before the relevant action, then call browser_network_requests with digestOnly=true once after the action barrier. Use its activityDigest with DOM, route, and visual evidence; repeated heartbeat-like GET/HEAD groups are noise, not proof of progress. Request raw rows or request/response bodies only when the user explicitly needs detailed Network debugging.",
+    "For continuous current-Tab monitoring, call browser_activity_start once and save activityCursor.streamId plus activityCursor.sequence. For each later user request asking what changed, call browser_debug_activity exactly once with those values as afterStreamId and afterSequence, summarize every retained event in that returned window, and let the client commit activity.nextCursor only after the final summary succeeds. If cursorStatus is events_dropped, explicitly report missedEvents. If transportDroppedEvents contains non-zero counts, explicitly report the local daemon transport gap. Describe the summary as partial after either condition. Never call browser_debug_activity again in the same response, even when the result is empty. Never suggest omitting afterSequence to recover full history; no-argument mode reads only a recent legacy snapshot. Incremental mode omits legacy Network/Console snapshots and returns bounded URL, DOM, Network, and Console aggregates only.",
+    activityCursorInstruction,
+    "For one action likely to send a request, call browser_network_start_recording before the action, then call browser_network_requests with digestOnly=true once after the action barrier. Use its activityDigest with DOM, route, and visual evidence; repeated heartbeat-like GET/HEAD groups are noise, not proof of progress. Request raw rows or request/response bodies only when the user explicitly needs detailed Network debugging.",
     "For request supervision, request-header rewrites, response interception, and response body mocks, use browser_proxy_upsert_rule plus browser_proxy_enable. Do not claim network interception or response mocking is unavailable when browser_proxy_upsert_rule is present in the tool list. Prefer CDP proxy rules over static DNR when the user asks to intercept or replace live page requests.",
     "For API mock data, create a browser_proxy_upsert_rule with urlContains/urlPattern, method, optional resourceType, responseBody or responseBodyBase64, contentType, statusCode, and mockStage; then call browser_proxy_enable and reload or reproduce the request.",
     "When multiple tools look similar, prefer browser_observe over browser_snapshot/browser_get_page_context, browser_act over individual same-stage actions, browser_verify over ad hoc repeat reads, and browser_network_requests over browser_network_list_requests.",

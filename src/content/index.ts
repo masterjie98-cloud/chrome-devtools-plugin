@@ -60,6 +60,8 @@ function initializeContentScript(): void {
           removed: entry.removed,
           attributes: entry.attributes,
           characterData: entry.characterData,
+          domSamples: entry.domSamples,
+          domSamplesOmitted: entry.domSamplesOmitted,
         },
       }),
     );

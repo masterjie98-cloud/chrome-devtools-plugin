@@ -5,7 +5,10 @@ import test from "node:test";
 import WebSocket from "ws";
 import { ArtifactStore } from "../src/daemon/artifacts/store";
 import { DaemonStateStore } from "../src/daemon/store/stateStore";
-import { DaemonClient } from "../src/mcp/daemonClient";
+import {
+  DaemonClient,
+  parseDaemonHandshakeFailure,
+} from "../src/mcp/daemonClient";
 import { ADAPTER_ROUTING_TOOL_NAMES } from "../src/mcp/adapterRoutingTools";
 import { COLLABORATION_TOOL_NAMES } from "../src/mcp/collaborationTools";
 import { browserStateHub } from "../src/mcp/browserStateHub";
@@ -56,6 +59,22 @@ interface ParsedTestMessage {
     [key: string]: unknown;
   };
 }
+
+test("daemon handshake mismatch preserves the daemon reason and gives recovery steps", () => {
+  const message = parseDaemonHandshakeFailure(
+    JSON.stringify({
+      requestId: "hello-1",
+      ok: false,
+      error:
+        "SCHEMA_HASH_MISMATCH: daemon=old, mcp=new. Restart the daemon and MCP client.",
+    }),
+  );
+
+  assert.match(message ?? "", /^RUNTIME_VERSION_MISMATCH:/);
+  assert.match(message ?? "", /SCHEMA_HASH_MISMATCH/);
+  assert.match(message ?? "", /older daemon instance/);
+  assert.match(message ?? "", /reopen the MCP client/);
+});
 
 test("one daemon serves multiple independent MCP adapter clients", async () => {
   browserStateHub.setCurrentTab({
@@ -235,6 +254,95 @@ test("authenticated UI clients publish sidepanel state to their bound session", 
     );
   } finally {
     ui.close();
+    browser.close();
+    await daemon.close();
+  }
+});
+
+test("each sidepanel connection keeps its own task conversation binding", async () => {
+  const daemon = startPluginWebSocketServer(0);
+  const address = await daemon.ready();
+  const url = `ws://${address.host}:${address.port}`;
+  const sessionId = "ui-conversation-binding-session";
+  const browser = await connectRole(url, "browser", sessionId);
+  const firstUi = await connectRole(url, "ui", sessionId);
+  const secondUi = await connectRole(url, "ui", sessionId);
+  const activeTab = {
+    url: "https://binding.example/",
+    title: "Bound target",
+    targetId: "77",
+    tabId: 77,
+    frameId: 0,
+    navigationId: "binding-navigation",
+    revision: 1,
+  };
+
+  try {
+    await sendAndWaitForAck(browser, {
+      requestId: "binding-active-target",
+      command: WS_COMMANDS.ACTIVE_TAB_UPDATED,
+      sentAt: new Date().toISOString(),
+      payload: { activeTab },
+    });
+    await sendAndWaitForAck(firstUi, {
+      requestId: "binding-first-conversation",
+      command: WS_COMMANDS.PLUGIN_CONVERSATION_STARTED,
+      sentAt: new Date().toISOString(),
+      payload: {
+        conversationId: "conversation-panel-a",
+        startedAt: new Date().toISOString(),
+      },
+    });
+    await sendAndWaitForAck(secondUi, {
+      requestId: "binding-second-conversation",
+      command: WS_COMMANDS.PLUGIN_CONVERSATION_STARTED,
+      sentAt: new Date().toISOString(),
+      payload: {
+        conversationId: "conversation-panel-b",
+        startedAt: new Date().toISOString(),
+      },
+    });
+    await waitUntil(
+      () =>
+        browserStateHub.snapshot(sessionId).currentConversationId ===
+        "conversation-panel-b",
+    );
+
+    const firstStatus = await callUiMcpTool(
+      firstUi,
+      "binding-first-status",
+      MCP_TOOL_NAMES.BROWSER_STATUS,
+      {},
+      {
+        taskId: "task-panel-a",
+        conversationId: "conversation-panel-a",
+        target: { tabId: 77, targetId: "77" },
+        egressDestinations: [],
+      },
+    );
+    assert.equal(
+      readString(firstStatus, "currentConversationId"),
+      "conversation-panel-b",
+    );
+
+    await assert.rejects(
+      callUiMcpTool(
+        firstUi,
+        "binding-cross-conversation-status",
+        MCP_TOOL_NAMES.BROWSER_STATUS,
+        {},
+        {
+          taskId: "task-panel-b",
+          conversationId: "conversation-panel-b",
+          target: { tabId: 77, targetId: "77" },
+          egressDestinations: [],
+        },
+      ),
+      /STALE_CONTEXT.*conversationId/,
+    );
+  } finally {
+    firstUi.close();
+    secondUi.close();
     browser.close();
     await daemon.close();
   }
@@ -2313,6 +2421,12 @@ function callUiMcpTool(
   requestId: string,
   toolName: string,
   args: Record<string, unknown>,
+  taskContext?: {
+    taskId: string;
+    conversationId: string;
+    target: { tabId: number; targetId?: string };
+    egressDestinations: string[];
+  },
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(
@@ -2341,7 +2455,10 @@ function callUiMcpTool(
         requestId,
         command: WS_COMMANDS.MCP_TOOL_CALL,
         sentAt: new Date().toISOString(),
-        payload: { call: { toolName, args } },
+        payload: {
+          call: { toolName, args },
+          ...(taskContext ? { taskContext } : {}),
+        },
       }),
     );
   });

@@ -9,10 +9,184 @@ import {
 import {
   streamAiChat,
   streamAiChatAfterTools,
+  isProviderToolSchemaCompatibilityError,
+  toConservativeProviderToolSchema,
+  toProviderCompatibleToolSchema,
 } from "../src/sidepanel/services/aiClient";
 
 const TOOL_MARKUP =
   '<tool_call>{"name":"browser_click","arguments":{"selector":"#danger"}}</tool_call>';
+
+test("provider tool schemas omit nested uniqueItems without mutating MCP schemas", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      names: {
+        type: "array",
+        uniqueItems: true,
+        items: {
+          anyOf: [
+            { type: "string" },
+            {
+              type: "array",
+              uniqueItems: false,
+              items: { type: "number" },
+            },
+          ],
+        },
+      },
+    },
+  };
+
+  assert.deepEqual(toProviderCompatibleToolSchema(schema), {
+    type: "object",
+    properties: {
+      names: {
+        type: "array",
+        items: {
+          anyOf: [
+            { type: "string" },
+            {
+              type: "array",
+              items: { type: "number" },
+            },
+          ],
+        },
+      },
+    },
+  });
+  assert.equal(schema.properties.names.uniqueItems, true);
+  assert.equal(
+    schema.properties.names.items.anyOf[1]?.uniqueItems,
+    false,
+  );
+});
+
+test("conservative provider schemas keep property names but omit grammar-only keywords", () => {
+  const tool = {
+    type: "function",
+    function: {
+      name: "example_tool",
+      description: "Example",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: {
+            anyOf: [
+              { type: "string", pattern: "^[a-z]+$" },
+              { type: "number", minimum: 1 },
+            ],
+          },
+          tags: {
+            type: "array",
+            uniqueItems: true,
+            items: { type: "string" },
+          },
+        },
+        required: ["mode"],
+        additionalProperties: false,
+      },
+    },
+  };
+
+  assert.deepEqual(toConservativeProviderToolSchema(tool), {
+    type: "function",
+    function: {
+      name: "example_tool",
+      description: "Example",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: {},
+          tags: {
+            type: "array",
+            items: { type: "string" },
+          },
+        },
+        required: ["mode"],
+        additionalProperties: false,
+      },
+    },
+  });
+  assert.equal(
+    isProviderToolSchemaCompatibilityError(
+      'Grammar error: Unimplemented keys: ["anyOf"]',
+    ),
+    true,
+  );
+  assert.equal(
+    isProviderToolSchemaCompatibilityError("Invalid API key"),
+    false,
+  );
+});
+
+test("schema grammar rejection retries once with the conservative provider projection", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const requestBodies: Array<Record<string, unknown>> = [];
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: globalThis,
+  });
+  globalThis.fetch = (async (_input, init) => {
+    requestBodies.push(
+      JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+    );
+    if (requestBodies.length === 1) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: 'Grammar error: Unimplemented keys: ["anyOf"]',
+          },
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(
+      'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    );
+  }) as typeof fetch;
+
+  try {
+    await streamAiChat({
+      config: { ...DEFAULT_AI_CONFIG, enableTools: true, maxToolRounds: 1 },
+      messages: [],
+      input: "test",
+      attachments: [],
+      context: {},
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "example_tool",
+            description: "Example",
+            parameters: {
+              type: "object",
+              properties: {
+                value: {
+                  anyOf: [{ type: "string" }, { type: "number" }],
+                },
+              },
+            },
+          },
+        },
+      ],
+      onDelta: () => undefined,
+    });
+
+    assert.equal(requestBodies.length, 2);
+    assert.equal(JSON.stringify(requestBodies[0]?.tools).includes("anyOf"), true);
+    assert.equal(JSON.stringify(requestBodies[1]?.tools).includes("anyOf"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
 
 test("assistant tool markup strips provider control tokens without hiding prose", () => {
   const content = [

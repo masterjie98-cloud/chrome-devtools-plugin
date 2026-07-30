@@ -345,6 +345,8 @@ const networkStatusSchema = outputObject({
   protocolVersion: outputString,
   requestCount: z.number().int().nonnegative(),
   maxEntries: z.number().int().positive(),
+  droppedRequestCount: z.number().int().nonnegative(),
+  capacityReached: z.boolean(),
   preservedLog: z.boolean(),
 });
 const networkActivityGroupSchema = z
@@ -376,6 +378,8 @@ const networkListResultSchema = outputObject({
   returned: z.number().int().nonnegative(),
   requests: outputArray,
   activityDigest: networkActivityDigestSchema,
+  droppedRequestCount: z.number().int().nonnegative(),
+  capacityReached: z.boolean(),
   pagination: collectionPaginationSchema("network"),
 }).superRefine((value, context) => {
   if (
@@ -436,6 +440,12 @@ export const MCP_TOOL_OUTPUT_SCHEMAS = {
     frameId: z.number().int().nonnegative().optional(),
     documentId: outputString.optional(),
     networkObservationSessionId: outputString.optional(),
+    activityCursor: z
+      .object({
+        streamId: outputString,
+        sequence: z.number().int().nonnegative(),
+      })
+      .strict(),
   }),
   [MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP]: outputObject({
     active: z.boolean(),
@@ -511,6 +521,7 @@ export const MCP_TOOL_OUTPUT_SCHEMAS = {
     capturedAt: outputString,
     network: nullableUnknown,
     console: nullableUnknown,
+    activity: nullableUnknown,
   }),
   [MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT]: selectedElementSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST]: contextDigestSchema,

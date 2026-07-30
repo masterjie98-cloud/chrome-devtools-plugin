@@ -503,6 +503,29 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
                 removed: z.number().int().nonnegative().optional(),
                 attributes: z.number().int().nonnegative().optional(),
                 characterData: z.number().int().nonnegative().optional(),
+                domSamples: z
+                  .array(
+                    z
+                      .object({
+                        changeType: z.enum([
+                          "added",
+                          "removed",
+                          "attribute",
+                          "text",
+                        ]),
+                        selector: z.string().max(500).optional(),
+                        text: z.string().max(240).optional(),
+                      })
+                      .strict(),
+                  )
+                  .max(12)
+                  .optional(),
+                domSamplesOmitted: z.number().int().nonnegative().optional(),
+                transportDroppedEvents: z
+                  .number()
+                  .int()
+                  .nonnegative()
+                  .optional(),
                 reason: z.string().max(240).optional(),
               })
               .strict(),

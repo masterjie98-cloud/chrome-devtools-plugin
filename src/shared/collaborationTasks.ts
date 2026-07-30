@@ -64,6 +64,9 @@ export interface DelegatedTaskClaimContent {
   resumed: boolean;
   requiresReobservation: boolean;
   conversationKey?: string;
+  rebound: boolean;
+  previousConversationKey?: string;
+  reboundAt?: string;
 }
 
 export interface DelegatedTaskResultContent {
@@ -272,6 +275,28 @@ export function delegatedTaskConversationKey(conversationId: string): string {
   return `conv_${encoded}`;
 }
 
+export function decodeDelegatedTaskConversationKey(
+  conversationKey: string,
+): string | undefined {
+  if (!DELEGATED_TASK_CONVERSATION_KEY_PATTERN.test(conversationKey)) {
+    return undefined;
+  }
+  const alphabet = "abcdefghijklmnop";
+  const encoded = conversationKey.slice("conv_".length);
+  let decoded = "";
+  for (let index = 0; index < encoded.length; index += 4) {
+    const a = alphabet.indexOf(encoded[index] ?? "");
+    const b = alphabet.indexOf(encoded[index + 1] ?? "");
+    const c = alphabet.indexOf(encoded[index + 2] ?? "");
+    const d = alphabet.indexOf(encoded[index + 3] ?? "");
+    if (a < 0 || b < 0 || c < 0 || d < 0) {
+      return undefined;
+    }
+    decoded += String.fromCharCode((a << 12) | (b << 8) | (c << 4) | d);
+  }
+  return isDelegatedTaskConversationId(decoded) ? decoded : undefined;
+}
+
 export function isDelegatedTaskConversationId(value: string): boolean {
   const normalized = value.trim();
   return Boolean(
@@ -293,11 +318,33 @@ export function isDelegatedTaskBoundToConversation(
 
 export function isDelegatedTaskInboxActionable(
   task: DelegatedTaskSnapshot,
+  knownConversationIds?: readonly string[],
 ): boolean {
+  const knownConversationKeys = new Set(
+    (knownConversationIds ?? [])
+      .filter(isDelegatedTaskConversationId)
+      .map(delegatedTaskConversationKey),
+  );
   return (
-    task.claim?.conversationKey === undefined &&
+    (task.claim?.conversationKey === undefined ||
+      (knownConversationIds !== undefined &&
+        !task.result &&
+        !knownConversationKeys.has(task.claim.conversationKey))) &&
     (task.phase === "pending" || task.phase === "claimed")
   );
+}
+
+export function isDelegatedTaskOrphaned(
+  task: DelegatedTaskSnapshot,
+  knownConversationIds: readonly string[],
+): boolean {
+  if (!task.claim?.conversationKey || task.result) {
+    return false;
+  }
+  return !knownConversationIds
+    .filter(isDelegatedTaskConversationId)
+    .map(delegatedTaskConversationKey)
+    .includes(task.claim.conversationKey);
 }
 
 export function parseDelegatedTaskRequest(
@@ -347,10 +394,17 @@ export function parseDelegatedTaskClaim(
     Number(item.content.attempt) < 1 ||
     typeof item.content.resumed !== "boolean" ||
     typeof item.content.requiresReobservation !== "boolean" ||
+    (item.content.rebound !== undefined &&
+      typeof item.content.rebound !== "boolean") ||
     (item.content.conversationKey !== undefined &&
       (typeof item.content.conversationKey !== "string" ||
         !DELEGATED_TASK_CONVERSATION_KEY_PATTERN.test(
           item.content.conversationKey,
+        ))) ||
+    (item.content.previousConversationKey !== undefined &&
+      (typeof item.content.previousConversationKey !== "string" ||
+        !DELEGATED_TASK_CONVERSATION_KEY_PATTERN.test(
+          item.content.previousConversationKey,
         )))
   ) {
     return undefined;
@@ -364,6 +418,11 @@ export function parseDelegatedTaskClaim(
     resumed: item.content.resumed,
     requiresReobservation: item.content.requiresReobservation,
     conversationKey: item.content.conversationKey as string | undefined,
+    rebound: item.content.rebound === true,
+    previousConversationKey: item.content.previousConversationKey as
+      | string
+      | undefined,
+    reboundAt: item.content.rebound === true ? item.updatedAt : undefined,
   };
 }
 

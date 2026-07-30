@@ -49,6 +49,7 @@ import {
   RUNTIME_SCHEMA_HASH,
 } from "../shared/runtimeIdentity";
 import type { ArtifactReference } from "../shared/artifacts";
+import { buildBrowserActivityDigest } from "../shared/browserActivity";
 
 const noArgSchema = z.object({});
 interface SnapshotReferenceBinding {
@@ -758,13 +759,23 @@ const debugActivitySchema = z
   .object({
     includeNetwork: z.boolean().optional(),
     includeConsole: z.boolean().optional(),
+    includeActivity: z.boolean().optional(),
     networkLimit: z.number().int().min(1).max(100).optional(),
     consoleLimit: z.number().int().min(1).max(200).optional(),
+    afterSequence: z.number().int().nonnegative().optional(),
+    afterStreamId: z.string().trim().min(1).max(200).optional(),
+    activityLimit: z.number().int().min(1).max(40).optional(),
   })
   .strict()
   .refine(
-    (value) => value.includeNetwork !== false || value.includeConsole !== false,
-    { message: "includeNetwork and includeConsole cannot both be false" },
+    (value) =>
+      value.includeNetwork !== false ||
+      value.includeConsole !== false ||
+      value.includeActivity !== false,
+    {
+      message:
+        "includeNetwork, includeConsole, and includeActivity cannot all be false",
+    },
   );
 
 const coordinateSchema = z.object({
@@ -1344,12 +1355,30 @@ export async function executeMcpToolData(
   switch (normalizedToolName) {
     case MCP_TOOL_NAMES.BROWSER_STATUS:
       return readBrowserStatus(context.sessionId);
-    case MCP_TOOL_NAMES.BROWSER_ACTIVITY_START:
-      return proxyBrowserTool(pluginBridge, {
+    case MCP_TOOL_NAMES.BROWSER_ACTIVITY_START: {
+      const stateBeforeStart = getBrowserStateSnapshot(context.sessionId);
+      assertActivityMonitorTargetAvailable(
+        stateBeforeStart.activityStream,
+        stateBeforeStart.activeTab,
+      );
+      const previousStreamId = stateBeforeStart.activityStream.streamId;
+      const status = await proxyBrowserTool(pluginBridge, {
         id: createMessageId(),
         toolName: TOOL_NAMES.BROWSER_ACTIVITY_START,
         args: parsedArgs,
       });
+      const activityStream = await waitForActivityStreamRestart(
+        context.sessionId,
+        previousStreamId,
+      );
+      return {
+        ...(isRecordValue(status) ? status : { status }),
+        activityCursor: {
+          streamId: activityStream.streamId,
+          sequence: activityStream.latestSequence,
+        },
+      };
+    }
     case MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP:
       return proxyBrowserTool(pluginBridge, {
         id: createMessageId(),
@@ -3412,8 +3441,16 @@ async function readDebugActivity(
       "TARGET_NOT_FOUND: browser_debug_activity requires a selected browser target.",
     );
   }
-  const includeNetwork = args.includeNetwork !== false;
-  const includeConsole = args.includeConsole !== false;
+  const incrementalMode = typeof args.afterSequence === "number";
+  const includeNetwork = !incrementalMode && args.includeNetwork !== false;
+  const includeConsole = !incrementalMode && args.includeConsole !== false;
+  const includeActivity = args.includeActivity !== false;
+  if (includeActivity) {
+    assertActivityMonitorTargetMatches(
+      stateBeforeRead.activityStream,
+      targetBeforeRead,
+    );
+  }
   const [network, consoleMessages] = await Promise.all([
     includeNetwork
       ? proxyBrowserTool(pluginBridge, {
@@ -3458,7 +3495,69 @@ async function readDebugActivity(
     capturedAt: new Date().toISOString(),
     network,
     console: consoleMessages,
+    activity: includeActivity
+      ? buildBrowserActivityDigest(
+          stateAfterRead.activityStream,
+          typeof args.afterSequence === "number"
+            ? args.afterSequence
+            : Math.max(0, stateAfterRead.activityStream.latestSequence - 40),
+          typeof args.activityLimit === "number" ? args.activityLimit : 20,
+          typeof args.afterStreamId === "string"
+            ? args.afterStreamId
+            : undefined,
+        )
+      : null,
   };
+}
+
+async function waitForActivityStreamRestart(
+  sessionId: string | undefined,
+  previousStreamId: string,
+): Promise<ReturnType<typeof getBrowserStateSnapshot>["activityStream"]> {
+  const deadline = Date.now() + 750;
+  while (true) {
+    const stream = getBrowserStateSnapshot(sessionId).activityStream;
+    if (stream.active && stream.streamId !== previousStreamId) {
+      return stream;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        "ACTIVITY_START_SYNC_FAILED: browser monitor started but the daemon did not publish a new activity stream. Restart the local daemon and MCP client, then retry.",
+      );
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 25);
+    });
+  }
+}
+
+function assertActivityMonitorTargetAvailable(
+  stream: ReturnType<typeof getBrowserStateSnapshot>["activityStream"],
+  selectedTarget: import("../shared/wsProtocol").ActiveTabSnapshot | undefined,
+): void {
+  if (
+    stream.active &&
+    stream.target?.tabId !== undefined &&
+    selectedTarget?.tabId !== stream.target.tabId
+  ) {
+    throw new Error(
+      `ACTIVITY_MONITOR_CONFLICT: Tab ${stream.target.tabId} already owns the active page monitor. Stop that monitor explicitly before starting one for Tab ${selectedTarget?.tabId ?? "unknown"}; the existing stream was not replaced.`,
+    );
+  }
+}
+
+function assertActivityMonitorTargetMatches(
+  stream: ReturnType<typeof getBrowserStateSnapshot>["activityStream"],
+  selectedTarget: import("../shared/wsProtocol").ActiveTabSnapshot,
+): void {
+  if (
+    stream.target?.tabId !== undefined &&
+    selectedTarget.tabId !== stream.target.tabId
+  ) {
+    throw new Error(
+      `ACTIVITY_MONITOR_TARGET_MISMATCH: the saved activity stream belongs to Tab ${stream.target.tabId}, while this task is bound to Tab ${selectedTarget.tabId}. Switch to the owning plugin context or stop and restart monitoring for this Tab.`,
+    );
+  }
 }
 
 function assertDebugActivityTarget(

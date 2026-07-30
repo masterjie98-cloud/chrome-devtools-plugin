@@ -39,11 +39,12 @@ import { sanitizeText } from "../shared/sanitize";
 import { createMessageId } from "../shared/messaging";
 import { createResourceTargetKey } from "./resourceRouting";
 import {
-  BROWSER_ACTIVITY_EVENT_LIMIT,
+  BROWSER_ACTIVITY_EVENT_LIMITS,
   BROWSER_ACTIVITY_STREAM_VERSION,
   sanitizeBrowserActivityEventInput,
   type BrowserActivityEvent,
   type BrowserActivityEventInput,
+  type BrowserActivityKind,
   type BrowserActivityStreamSnapshot,
 } from "../shared/browserActivity";
 
@@ -60,8 +61,12 @@ export interface BrowserSession {
   consoleLogs: unknown[];
   networkRequests: unknown[];
   activityActive: boolean;
+  activityTarget?: ActiveTabSnapshot;
+  activityStreamId: string;
+  activityStartedAt: string;
   activitySequence: number;
   activityDroppedEvents: number;
+  activityEventCounts: Record<BrowserActivityKind, number>;
   activityEvents: BrowserActivityEvent[];
   screenshots: ScreenshotSnapshot[];
   lastScreenshot?: ScreenshotSnapshot;
@@ -370,17 +375,51 @@ export class BrowserStateHub {
     ).accepted;
   }
 
-  setActivityActive(active: boolean, sessionId?: string): void {
+  setActivityActive(
+    active: boolean,
+    sessionId?: string,
+    target?: ActiveTabSnapshot,
+  ): void {
     const session = this.markStateUpdated(sessionId);
+    if (
+      !active &&
+      session.activityTarget?.tabId !== undefined &&
+      target?.tabId !== undefined &&
+      target.tabId !== session.activityTarget.tabId
+    ) {
+      return;
+    }
+    if (active) {
+      session.activityTarget = target
+        ? sanitizeActiveTabForMcp(target)
+        : session.currentTab
+          ? structuredClone(session.currentTab)
+          : undefined;
+      session.activityStreamId = createActivityStreamId();
+      session.activityStartedAt = new Date(session.stateUpdatedAt).toISOString();
+      session.activitySequence = 0;
+      session.activityDroppedEvents = 0;
+      session.activityEventCounts = emptyActivityEventCounts();
+      session.activityEvents = [];
+    }
     session.activityActive = active;
   }
 
   addBrowserActivityEvent(
     input: BrowserActivityEventInput,
     sessionId?: string,
-  ): BrowserActivityEvent {
+  ): BrowserActivityEvent | undefined {
     const session = this.markStateUpdated(sessionId);
     const sanitized = sanitizeBrowserActivityEventInput(input);
+    if (
+      session.activityTarget?.tabId !== undefined &&
+      sanitized.target?.tabId !== session.activityTarget.tabId
+    ) {
+      return undefined;
+    }
+    if (!session.activityActive && sanitized.summary.reason !== "monitoring-stopped") {
+      return undefined;
+    }
     session.activitySequence += 1;
     const event: BrowserActivityEvent = {
       ...sanitized,
@@ -388,11 +427,17 @@ export class BrowserStateHub {
       sequence: session.activitySequence,
     };
     session.activityEvents.push(event);
-    if (session.activityEvents.length > BROWSER_ACTIVITY_EVENT_LIMIT) {
-      const overflow =
-        session.activityEvents.length - BROWSER_ACTIVITY_EVENT_LIMIT;
-      session.activityEvents.splice(0, overflow);
-      session.activityDroppedEvents += overflow;
+    session.activityEventCounts[event.kind] += 1;
+    const kindLimit = BROWSER_ACTIVITY_EVENT_LIMITS[event.kind];
+    if (session.activityEventCounts[event.kind] > kindLimit) {
+      const oldestKindIndex = session.activityEvents.findIndex(
+        (candidate) => candidate.kind === event.kind,
+      );
+      if (oldestKindIndex >= 0) {
+        session.activityEvents.splice(oldestKindIndex, 1);
+        session.activityEventCounts[event.kind] -= 1;
+      }
+      session.activityDroppedEvents += 1;
     }
     return structuredClone(event);
   }
@@ -535,8 +580,12 @@ export class BrowserStateHub {
         consoleLogs: [],
         networkRequests: [],
         activityActive: false,
+        activityTarget: undefined,
+        activityStreamId: createActivityStreamId(),
+        activityStartedAt: new Date(this.clock()).toISOString(),
         activitySequence: 0,
         activityDroppedEvents: 0,
+        activityEventCounts: emptyActivityEventCounts(),
         activityEvents: [],
         screenshots,
         lastScreenshot: screenshots.at(-1),
@@ -715,8 +764,12 @@ export class BrowserStateHub {
       consoleLogs: [],
       networkRequests: [],
       activityActive: false,
+      activityTarget: undefined,
+      activityStreamId: createActivityStreamId(),
+      activityStartedAt: new Date(now).toISOString(),
       activitySequence: 0,
       activityDroppedEvents: 0,
+      activityEventCounts: emptyActivityEventCounts(),
       activityEvents: [],
       screenshots: [],
       pluginConversation: [],
@@ -746,12 +799,15 @@ export class BrowserStateHub {
     return {
       version: BROWSER_ACTIVITY_STREAM_VERSION,
       sessionId: session.sessionId,
+      streamId: session.activityStreamId,
+      startedAt: session.activityStartedAt,
       active: session.activityActive,
-      target: session.currentTab ?? null,
+      target: session.activityTarget ?? null,
       latestSequence: session.activitySequence,
       retainedFromSequence: first?.sequence ?? null,
       retainedToSequence: last?.sequence ?? null,
       droppedEvents: session.activityDroppedEvents,
+      retentionLimits: { ...BROWSER_ACTIVITY_EVENT_LIMITS },
       events: structuredClone(session.activityEvents),
       updatedAt: new Date(session.stateUpdatedAt).toISOString(),
     };
@@ -877,6 +933,10 @@ function withoutUndefined<T extends object>(value: T): Partial<T> {
 
 function createConversationId(): string {
   return `conversation-${createMessageId()}`;
+}
+
+function createActivityStreamId(): string {
+  return `activity-${createMessageId()}`;
 }
 
 function parsePersistentBrowserState(value: unknown): PersistedBrowserState {
@@ -1060,6 +1120,15 @@ function isLastAgentConclusion(
 
 function isSafeTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function emptyActivityEventCounts(): Record<BrowserActivityKind, number> {
+  return {
+    dom: 0,
+    network: 0,
+    console: 0,
+    navigation: 0,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

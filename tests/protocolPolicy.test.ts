@@ -12,7 +12,13 @@ import {
   type ProtocolViolationState,
 } from "../src/mcp/protocolPolicy";
 import { pluginToMcpMessageSchema } from "../src/mcp/wsSchemas";
-import { toCollaborationTargetBinding } from "../src/shared/collaborationWorkspace";
+import {
+  sanitizeCollaborationItemInput,
+  toCollaborationTargetBinding,
+} from "../src/shared/collaborationWorkspace";
+import {
+  sanitizeBrowserActivityEventInput,
+} from "../src/shared/browserActivity";
 import {
   sanitizeActiveTabForMcp,
   sanitizePageSnapshotForMcp,
@@ -160,6 +166,46 @@ test("sanitized page context stays within the websocket schema limits", () => {
   assert.equal(parsed.success, true);
 });
 
+test("browser activity transport sanitizes long URLs and DOM samples before schema validation", () => {
+  const event = sanitizeBrowserActivityEventInput({
+    kind: "dom",
+    observedAt: "2026-07-29T00:00:00.000Z",
+    target: {
+      url: `https://example.test/page?payload=${"页".repeat(20_000)}`,
+      title: "页面".repeat(1_000),
+      targetId: "target-1",
+      tabId: 7,
+      frameId: 0,
+    },
+    summary: {
+      url: `https://example.test/api?payload=${"网".repeat(20_000)}`,
+      message: "消息".repeat(10_000),
+      domSamples: Array.from({ length: 30 }, (_, index) => ({
+        changeType: index % 2 === 0 ? "added" as const : "text" as const,
+        selector: `#${"选".repeat(2_000)}`,
+        text: "内容".repeat(2_000),
+      })),
+      domSamplesOmitted: 18,
+    },
+  });
+  const message = {
+    requestId: "activity-schema-regression",
+    command: WS_COMMANDS.BROWSER_ACTIVITY_EVENT,
+    sentAt: "2026-07-29T00:00:00.010Z",
+    payload: { event },
+  };
+  const serialized = JSON.stringify(message);
+  const parsed = pluginToMcpMessageSchema.safeParse(message);
+
+  assert.equal(parsed.success, true);
+  assert.equal(event.summary.domSamples?.length, 12);
+  assert.ok((event.summary.url?.length ?? 0) <= 1_200);
+  assert.ok(
+    utf8MessageByteLength(serialized) <=
+      inboundMessageByteLimit(WS_COMMANDS.BROWSER_ACTIVITY_EVENT),
+  );
+});
+
 test("collaboration publication schema accepts projected targets and rejects unbounded input", () => {
   const valid = pluginToMcpMessageSchema.safeParse({
     requestId: "collaboration-upsert",
@@ -224,4 +270,37 @@ test("collaboration publication schema accepts projected targets and rejects unb
     },
   });
   assert.equal(spoofed.success, false);
+});
+
+test("collaboration transport bounds long Agent titles before websocket validation", () => {
+  const item = sanitizeCollaborationItemInput({
+    id: "ctx_task_long_title",
+    kind: "task.state",
+    title: "长任务标题".repeat(200),
+    summary: "Agent task is running.",
+    content: {
+      status: "running",
+      token: "must-not-cross-the-transport",
+      optionalState: undefined,
+      recentEvents: [undefined, { status: "running", detail: undefined }],
+    },
+    visibility: "shared",
+    sensitivity: "page_content",
+    status: "active",
+  });
+  const parsed = pluginToMcpMessageSchema.safeParse({
+    requestId: "collaboration-long-title-regression",
+    command: WS_COMMANDS.COLLABORATION_ITEM_UPSERT,
+    sentAt: "2026-07-29T00:00:00.000Z",
+    payload: { item },
+  });
+
+  assert.equal(parsed.success, true);
+  assert.ok(item.title.length <= 240);
+  assert.equal(JSON.stringify(item).includes("must-not-cross"), false);
+  assert.deepEqual(item.content, {
+    status: "running",
+    token: "[redacted]",
+    recentEvents: [null, { status: "running" }],
+  });
 });
