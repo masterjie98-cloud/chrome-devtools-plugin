@@ -25,9 +25,9 @@ const target = {
   revision: 4,
 };
 
-test("[eval 01] smart profile exposes twenty task-oriented tools", () => {
+test("[eval 01] smart profile exposes task-oriented tools plus controlled DevTools debugging", () => {
   const tools = runtimeToolsForProfile("smart");
-  assert.equal(tools.length, 20);
+  assert.equal(tools.length, 24);
   assert.deepEqual(
     tools.map((tool) => tool.definition.name),
     [
@@ -46,11 +46,15 @@ test("[eval 01] smart profile exposes twenty task-oriented tools", () => {
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
       MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
       MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
       MCP_TOOL_NAMES.BROWSER_LIST_TABS,
       MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB,
       MCP_TOOL_NAMES.BROWSER_LIST_FRAMES,
       MCP_TOOL_NAMES.BROWSER_SET_TARGET_FRAME,
+      MCP_TOOL_NAMES.BROWSER_EVALUATE,
+      MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+      MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
     ],
   );
 });

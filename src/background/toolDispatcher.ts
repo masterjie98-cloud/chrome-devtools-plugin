@@ -39,6 +39,7 @@ import {
   collectRealtimeDebuggerActivity,
   detachDebugger,
   disableProxyDebugger,
+  controlJavaScriptDebugger,
   dispatchTrustedMouseClick,
   dispatchTrustedMouseDown,
   dispatchTrustedMouseDrag,
@@ -49,17 +50,22 @@ import {
   dispatchTrustedTextInput,
   enableProxyDebugger,
   emitDebuggerActivityLifecycle,
+  evaluatePageJavaScript,
   getNetworkRequest,
   getNetworkResponseBody,
   handleCurrentJavaScriptDialog,
   listConsoleMessages,
+  listRuntimeErrors,
   listProxyHits,
   listProxyRules,
   listNetworkRequests,
+  manageJavaScriptBreakpoint,
   prepareFetchDebugger,
   removeProxyRule,
   resolveGeneratedSourceLocation,
+  startRuntimeErrorMonitoring,
   startNetworkDebugger,
+  stopRuntimeErrorMonitoring,
   stopNetworkDebugger,
   upsertProxyRule,
   type TrustedInputTargetAddress,
@@ -142,7 +148,6 @@ type ContentRequestType =
   | typeof MESSAGE_TYPES.CONTENT_MOUSE_WHEEL
   | typeof MESSAGE_TYPES.CONTENT_AGENT_POINTER
   | typeof MESSAGE_TYPES.CONTENT_WAIT_FOR
-  | typeof MESSAGE_TYPES.CONTENT_EVALUATE
   | typeof MESSAGE_TYPES.CONTENT_GET_STORAGE_STATE
   | typeof MESSAGE_TYPES.CONTENT_APPLY_CSS_PATCH
   | typeof MESSAGE_TYPES.CONTENT_REMOVE_CSS_PATCH;
@@ -506,9 +511,10 @@ export async function executeToolCall(
         ).payload,
       };
     case TOOL_NAMES.BROWSER_EVALUATE:
-      throw new Error(
-        "browser.evaluate is disabled until constrained execution has a scoped, cancellable design.",
-      );
+      return {
+        toolName: normalizedCall.toolName,
+        data: await evaluatePageJavaScript(normalizedCall.args),
+      };
     case TOOL_NAMES.BROWSER_HANDLE_DIALOG: {
       const tab = await queryActiveTab();
       if (!tab?.id) {
@@ -658,6 +664,11 @@ export async function executeToolCall(
         toolName: normalizedCall.toolName,
         data: listNetworkRequests(normalizedCall.args),
       };
+    case TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS:
+      return {
+        toolName: normalizedCall.toolName,
+        data: await listRuntimeErrors(normalizedCall.args),
+      };
     case TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE: {
       const { includeSourceExcerpt, ...generated } = normalizedCall.args;
       return {
@@ -668,6 +679,16 @@ export async function executeToolCall(
         ),
       };
     }
+    case TOOL_NAMES.DEBUGGER_BREAKPOINT:
+      return {
+        toolName: normalizedCall.toolName,
+        data: await manageJavaScriptBreakpoint(normalizedCall.args),
+      };
+    case TOOL_NAMES.DEBUGGER_CONTROL:
+      return {
+        toolName: normalizedCall.toolName,
+        data: await controlJavaScriptDebugger(normalizedCall.args),
+      };
     case TOOL_NAMES.DEBUGGER_NETWORK_GET:
       return {
         toolName: normalizedCall.toolName,
@@ -700,6 +721,9 @@ async function startBrowserActivity(
   }
   const frame = getSelectedContentFrameSnapshot(tab.id);
   let networkObservationSessionId: string | undefined;
+  let runtimeErrorCursor:
+    | { streamId: string; sequence: number }
+    | undefined;
   if (includeNetwork) {
     const network = await startNetworkDebugger({
       preserveLog: input.preserveLog === true,
@@ -708,7 +732,9 @@ async function startBrowserActivity(
     networkObservationSessionId = network.observationSessionId;
   }
   if (includeConsole) {
-    await listConsoleMessages({ limit: 1 });
+    runtimeErrorCursor = await startRuntimeErrorMonitoring(
+      input.preserveLog === true,
+    );
   }
   if (includeDom) {
     await setDomActivityMonitoringForTab(tab.id, true);
@@ -722,6 +748,7 @@ async function startBrowserActivity(
     frameId: frame?.frameId ?? getSelectedContentFrame(tab.id).frameId,
     documentId: frame?.documentId,
     networkObservationSessionId,
+    runtimeErrorCursor,
   };
   activityTarget = toBrowserActivityTarget(tab);
   emitDebuggerActivityLifecycle(
@@ -745,6 +772,9 @@ async function stopBrowserActivity(): Promise<
   }
   if (activityStatus.includeNetwork) {
     await stopNetworkDebugger().catch(() => undefined);
+  }
+  if (activityStatus.includeConsole) {
+    stopRuntimeErrorMonitoring();
   }
   activityStatus = {
     ...activityStatus,

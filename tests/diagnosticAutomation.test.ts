@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { executeMcpToolData, MCP_TOOL_INPUT_SCHEMAS } from "../src/mcp/toolRuntime";
 import { MCP_TOOL_NAMES } from "../src/shared/mcpTools";
@@ -152,6 +153,43 @@ test("workspace bridge resolves only bounded configured workspace matches", asyn
   }
 });
 
+test("workspace bridge verifies the mapped local line against sourcesContent", async () => {
+  const previous = process.env.AI_DEVTOOLS_WORKSPACE_ROOTS;
+  process.env.AI_DEVTOOLS_WORKSPACE_ROOTS = process.cwd();
+  try {
+    const path = `${process.cwd()}/src/mcp/workspaceTools.ts`;
+    const lines = (await readFile(path, "utf8")).split(/\r?\n/);
+    const lineNumber =
+      lines.findIndex((line) =>
+        line.includes("export function registerWorkspaceSourceTool"),
+      ) + 1;
+    assert.ok(lineNumber > 0);
+
+    const result = await findWorkspaceSource({
+      sourceHint:
+        "https://cdn.example.test/assets/../src/mcp/workspaceTools.ts?build=private",
+      lineNumber,
+      expectedExcerpt: `  ${lines[lineNumber - 1]!.trim()}  `,
+      includeExcerpt: true,
+      limit: 3,
+    });
+
+    assert.equal(result.matches[0]?.path, "src/mcp/workspaceTools.ts");
+    assert.equal(result.matches[0]?.line, lineNumber);
+    assert.equal(result.matches[0]?.contentMatch, true);
+    assert.equal(
+      result.matches[0]?.reason.includes("mapped source content match"),
+      true,
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.AI_DEVTOOLS_WORKSPACE_ROOTS;
+    } else {
+      process.env.AI_DEVTOOLS_WORKSPACE_ROOTS = previous;
+    }
+  }
+});
+
 test("new diagnostic and replay tools keep explicit trust policy", () => {
   assert.equal(
     getToolPolicy(MCP_TOOL_NAMES.BROWSER_EXPLAIN_CSS).approvalMode,
@@ -166,4 +204,72 @@ test("new diagnostic and replay tools keep explicit trust policy", () => {
     getToolPolicy(MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE).approvalMode,
     "decision_barrier",
   );
+  const runtimeErrors = getToolPolicy(
+    MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
+  );
+  assert.equal(runtimeErrors.known, true);
+  assert.equal(runtimeErrors.policyClass, "sensitive_read");
+  assert.equal(runtimeErrors.approvalMode, "task_grant");
+  assert.equal(runtimeErrors.mutatesBrowser, false);
+  assert.equal(
+    validateToolCall({
+      toolName: TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS,
+      args: { afterSequence: 0, limit: 20, maxFramesPerError: 12 },
+    }),
+    null,
+  );
+  assert.match(
+    validateToolCall({
+      toolName: TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS,
+      args: { limit: 21 },
+    }) ?? "",
+    /limit/i,
+  );
+});
+
+test("runtime-error MCP tool enters only its declared debugger read executor", async () => {
+  let receivedCall:
+    | { toolName: string; args: Record<string, unknown> }
+    | undefined;
+  const browserBridge = {
+    callBrowserTool: async (call: {
+      toolName: string;
+      args: Record<string, unknown>;
+    }) => {
+      receivedCall = call;
+      return {
+        version: "browser-runtime-errors-v1",
+        attached: true,
+        cursorStatus: "ok",
+        cursor: { streamId: "runtime-stream", sequence: 3 },
+        nextCursor: { streamId: "runtime-stream", sequence: 4 },
+        oldestSequence: 1,
+        latestSequence: 4,
+        missedEvents: 0,
+        droppedEvents: 0,
+        total: 0,
+        returned: 0,
+        errors: [],
+      };
+    },
+  } as unknown as PluginWebSocketServer;
+
+  const result = (await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
+    {
+      afterStreamId: "runtime-stream",
+      afterSequence: 3,
+      maxWorkspaceFrames: 8,
+      includeLocalExcerpt: false,
+    },
+    browserBridge,
+  )) as Record<string, unknown>;
+
+  assert.equal(result.version, "browser-runtime-errors-v1");
+  assert.equal(receivedCall?.toolName, TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS);
+  assert.deepEqual(receivedCall?.args, {
+    afterStreamId: "runtime-stream",
+    afterSequence: 3,
+    includeSourceExcerpt: true,
+  });
 });

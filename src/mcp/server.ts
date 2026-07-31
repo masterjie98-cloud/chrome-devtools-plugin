@@ -11,6 +11,7 @@ import {
   formatMcpToolResult,
   parseMcpToolProfile,
   registerProxyMcpTools,
+  runtimeToolsForProfile,
 } from "./toolRuntime";
 import { DaemonClient } from "./daemonClient";
 import {
@@ -38,6 +39,8 @@ import {
   RESOURCE_SESSION_ID_PATTERN,
 } from "./resourceRouting";
 import { registerWorkspaceSourceTool } from "./workspaceTools";
+import { registerRuntimeErrorDiagnosticsTool } from "./runtimeErrorTools";
+import { MCP_TOOL_NAMES } from "../shared/mcpTools";
 
 const mcpServer = new McpServer({
   name: "ai-devtools-assistant",
@@ -209,8 +212,20 @@ function requireActivityStreamSubscriptionUri(uri: string): string {
 }
 
 function registerTools(server: McpServer): void {
-  registerProxyMcpTools(server, daemonClient, { profile: toolProfile });
+  registerProxyMcpTools(server, daemonClient, {
+    profile: toolProfile,
+    exclude: [MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS],
+  });
   registerWorkspaceSourceTool(server);
+  if (
+    runtimeToolsForProfile(toolProfile).some(
+      ({ definition }) =>
+        definition.name ===
+        MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
+    )
+  ) {
+    registerRuntimeErrorDiagnosticsTool(server, daemonClient);
+  }
   registerAdapterRoutingTool(
     server,
     ADAPTER_ROUTING_TOOL_NAMES.LIST_SESSIONS,

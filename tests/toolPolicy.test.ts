@@ -86,9 +86,20 @@ test("policy annotations describe intent but unknown tools remain denied", () =>
   assert.equal(unknown.openWorld, true);
 });
 
-test("arbitrary evaluate stays hidden while scoped dialog handling is exposed", () => {
+test("DevTools execution is exposed only behind non-reusable arbitrary-execution approval", () => {
   const exposed = new Set(MCP_EXPOSED_TOOL_DEFINITIONS.map((tool) => tool.name));
-  assert.equal(exposed.has(MCP_TOOL_NAMES.BROWSER_EVALUATE), false);
+  for (const toolName of [
+    MCP_TOOL_NAMES.BROWSER_EVALUATE,
+    MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+    MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
+  ]) {
+    assert.equal(exposed.has(toolName), true);
+    const policy = getToolPolicy(toolName);
+    assert.equal(policy.policyClass, "arbitrary_execution");
+    assert.equal(policy.approvalMode, "always");
+    assert.equal(policy.mutatesBrowser, true);
+    assert.equal(policy.idempotent, false);
+  }
   assert.equal(exposed.has(MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG), true);
   assert.equal(
     requiresToolApproval(MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG),

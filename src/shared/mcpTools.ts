@@ -8,6 +8,7 @@ export const MCP_TOOL_NAMES = {
   BROWSER_ACT: "browser_act",
   BROWSER_VERIFY: "browser_verify",
   BROWSER_DEBUG_ACTIVITY: "browser_debug_activity",
+  BROWSER_DIAGNOSE_RUNTIME_ERRORS: "browser_diagnose_runtime_errors",
   BROWSER_ACTIVITY_START: "browser_activity_start",
   BROWSER_ACTIVITY_STOP: "browser_activity_stop",
   BROWSER_GET_SELECTED_ELEMENT: "browser_get_selected_element",
@@ -55,6 +56,8 @@ export const MCP_TOOL_NAMES = {
   BROWSER_MOUSE_WHEEL_XY: "browser_mouse_wheel_xy",
   BROWSER_WAIT_FOR: "browser_wait_for",
   BROWSER_EVALUATE: "browser_evaluate",
+  BROWSER_DEBUGGER_BREAKPOINT: "browser_debugger_breakpoint",
+  BROWSER_DEBUGGER_CONTROL: "browser_debugger_control",
   BROWSER_HANDLE_DIALOG: "browser_handle_dialog",
   BROWSER_STORAGE_STATE: "browser_storage_state",
   BROWSER_COOKIE_LIST: "browser_cookie_list",
@@ -484,13 +487,15 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
     title: "Locate element component source",
     description:
-      "Map one element from the latest snapshot targetRef or an exact selector to bounded React/Vue component metadata and available source hints. The extension runs only a fixed MAIN-world inspector; caller-supplied JavaScript is never evaluated.",
+      "Map one element to bounded React/Vue component metadata and available source hints. Pass a targetRef returned by the latest browser_observe/browser_snapshot in the ref argument, or pass one exact selector. The extension runs only a fixed MAIN-world inspector; caller-supplied JavaScript is never evaluated.",
     parameters: {
       type: "object",
       properties: {
         ref: {
           type: "string",
           pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
+          description:
+            "Pass the latest observed targetRef in this ref argument.",
         },
         selector: { type: "string" },
         frameRef: {
@@ -775,6 +780,41 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     },
   },
   {
+    name: MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
+    title: "Diagnose JavaScript runtime errors",
+    description:
+      "Read bounded JavaScript exceptions and console error stacks captured after browser_activity_start, resolve loaded-script Source Maps, and report exact generated/original locations. In the local stdio adapter, mapped sources are additionally matched only under configured workspace roots.",
+    parameters: {
+      type: "object",
+      properties: {
+        afterStreamId: {
+          type: "string",
+          description:
+            "runtimeErrorCursor.streamId returned by browser_activity_start.",
+        },
+        afterSequence: {
+          type: "number",
+          minimum: 0,
+          description:
+            "runtimeErrorCursor.sequence returned by browser_activity_start.",
+        },
+        limit: { type: "number", minimum: 1, maximum: 20 },
+        maxFramesPerError: { type: "number", minimum: 1, maximum: 12 },
+        maxWorkspaceFrames: {
+          type: "number",
+          minimum: 1,
+          maximum: 20,
+          description:
+            "Adapter-local cap for Source Map frames matched against local workspace files.",
+        },
+        includeWarnings: { type: "boolean" },
+        includeRevoked: { type: "boolean" },
+        includeLocalExcerpt: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT,
     title: "Get selected element",
     description:
@@ -989,7 +1029,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
     title: "Take screenshot",
     description:
-      "Capture a fresh screenshot with the built-in Chrome CDP implementation and return it as MCP image content. Supports full-page and element screenshots and never writes to Chrome Downloads.",
+      "Capture a fresh screenshot with the built-in Chrome CDP implementation and return it as MCP image content. For an observed element, pass its targetRef in the ref argument. Supports full-page and element screenshots and never writes to Chrome Downloads.",
     parameters: {
       type: "object",
       properties: {
@@ -1013,7 +1053,8 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         ref: {
           type: "string",
           pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
-          description: "Observed semantic targetRef for an element screenshot.",
+          description:
+            "Pass the latest observed targetRef in this ref argument.",
         },
         frameRef: {
           type: "string",
@@ -1158,14 +1199,15 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_CLICK,
     title: "Click",
     description:
-      "Resolve a visible, unobscured top-frame element by targetRef from browser_snapshot or a native CSS selector, then click its center with trusted CDP mouse input. Prefer targetRef. Playwright/jQuery text selectors such as :has-text(), :contains(), text=, locator chaining, and XPath are not supported. This page action requires confirmation.",
+      "Resolve a visible, unobscured top-frame element by passing a targetRef from browser_observe/browser_snapshot in the ref argument, or by passing a native CSS selector, then click its center with trusted CDP mouse input. Prefer ref with a fresh targetRef. Playwright/jQuery text selectors such as :has-text(), :contains(), text=, locator chaining, and XPath are not supported. This page action requires confirmation.",
     parameters: {
       type: "object",
       properties: {
         ref: {
           type: "string",
           pattern: "^sr1_[a-f0-9]{8}_s[0-9]{1,6}$",
-          description: "Opaque targetRef from the latest browser_snapshot.",
+          description:
+            "Pass the latest observed targetRef in this ref argument.",
         },
         selector: { type: "string", description: "Exact native CSS selector from fresh page evidence." },
         target: { type: "string", description: "Alias for selector." },
@@ -1602,9 +1644,9 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
   },
   {
     name: MCP_TOOL_NAMES.BROWSER_EVALUATE,
-    title: "Evaluate",
+    title: "Execute page JavaScript",
     description:
-      "Evaluate a constrained JavaScript expression or IIFE in the active page DOM. It can read page state and perform controlled page-side mutations such as installing temporary test hooks. Prefer structured tools and CDP proxy tools first; use this when no selector, storage, network, or DOM tool fits.",
+      "Execute arbitrary caller-provided JavaScript in the exact task-bound page frame through Chrome DevTools Protocol. This is a real page execution context, not a sandbox: it can call page functions, mutate DOM and application state, access same-origin page data, and issue requests. Every call requires a fresh high-risk approval and is never automatically replayed after an unknown outcome.",
     parameters: {
       type: "object",
       properties: {
@@ -1619,10 +1661,120 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         },
         timeoutMs: {
           type: "number",
-          description: "Reserved timeout hint for compatibility.",
+          minimum: 100,
+          maximum: 10000,
+          description: "Terminate execution after this many milliseconds.",
+        },
+        awaitPromise: {
+          type: "boolean",
+          description: "Await a returned Promise. Defaults to true.",
+        },
+        replMode: {
+          type: "boolean",
+          description:
+            "Enable DevTools REPL behavior such as top-level await and redeclaring REPL let bindings.",
+        },
+        throwOnSideEffect: {
+          type: "boolean",
+          description:
+            "Ask V8 to reject execution when it cannot prove the expression is side-effect-free. This is best-effort and not a security boundary.",
+        },
+        allowBreakpoints: {
+          type: "boolean",
+          description:
+            "Allow breakpoints during this evaluation. Defaults to false to avoid blocking the tool call. To deliberately hit a breakpoint, schedule the target call asynchronously (for example with setTimeout) and set awaitPromise=false.",
         },
       },
       required: ["expression"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+    title: "Manage JavaScript breakpoints",
+    description:
+      "Set, remove, or list URL-based JavaScript breakpoints in the exact task-bound page frame. lineNumber is 1-based for this tool; columnNumber is 0-based. Conditional breakpoint expressions run in the page when hit, so every operation remains high-risk approval-gated.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["set", "remove", "list"] },
+        breakpointId: {
+          type: "string",
+          description: "Breakpoint ID returned by a prior set call.",
+        },
+        url: {
+          type: "string",
+          description: "Exact generated script URL. Mutually exclusive with urlRegex.",
+        },
+        urlRegex: {
+          type: "string",
+          description: "Generated script URL regex. Mutually exclusive with url.",
+        },
+        lineNumber: {
+          type: "number",
+          minimum: 1,
+          description: "1-based generated JavaScript line number.",
+        },
+        columnNumber: {
+          type: "number",
+          minimum: 0,
+          description: "0-based generated JavaScript column number. Defaults to 0.",
+        },
+        condition: {
+          type: "string",
+          description: "Optional JavaScript condition evaluated when the breakpoint is hit.",
+        },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
+    title: "Control JavaScript debugger",
+    description:
+      "Inspect paused state, pause or resume execution, step over/into/out, evaluate JavaScript on a paused call frame, or configure pause-on-exceptions for the exact task-bound page frame. Pausing can freeze the page until resumed or the debugger is detached.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: [
+            "status",
+            "pause",
+            "resume",
+            "step_over",
+            "step_into",
+            "step_out",
+            "evaluate_on_call_frame",
+            "set_pause_on_exceptions",
+          ],
+        },
+        callFrameId: {
+          type: "string",
+          description:
+            "Ephemeral callFrameId returned by status after a pause. Invalid after resume or navigation.",
+        },
+        expression: {
+          type: "string",
+          description: "JavaScript expression for evaluate_on_call_frame.",
+        },
+        timeoutMs: {
+          type: "number",
+          minimum: 100,
+          maximum: 10000,
+        },
+        throwOnSideEffect: {
+          type: "boolean",
+          description:
+            "Ask V8 to reject call-frame evaluation when a side effect cannot be ruled out.",
+        },
+        pauseOnExceptions: {
+          type: "string",
+          enum: ["none", "uncaught", "caught", "all"],
+        },
+      },
+      required: ["action"],
       additionalProperties: false,
     },
   },
@@ -2390,6 +2542,8 @@ const MCP_TOOL_NAME_SET = new Set<string>(
 
 const MCP_TOOL_NAME_ALIASES: Record<string, McpToolName> = {
   capture_issue_evidence: MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
+  diagnose_runtime_errors:
+    MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
   read_page_info: MCP_TOOL_NAMES.BROWSER_GET_PAGE_CONTEXT,
   browser_snapshot: MCP_TOOL_NAMES.BROWSER_SNAPSHOT,
   take_snapshot: MCP_TOOL_NAMES.BROWSER_SNAPSHOT,
@@ -2447,6 +2601,10 @@ const MCP_TOOL_NAME_ALIASES: Record<string, McpToolName> = {
   browser_wait_for: MCP_TOOL_NAMES.BROWSER_WAIT_FOR,
   evaluate: MCP_TOOL_NAMES.BROWSER_EVALUATE,
   browser_evaluate: MCP_TOOL_NAMES.BROWSER_EVALUATE,
+  debugger_breakpoint: MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+  browser_debugger_breakpoint: MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+  debugger_control: MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
+  browser_debugger_control: MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
   handle_dialog: MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG,
   browser_handle_dialog: MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG,
   storage_state: MCP_TOOL_NAMES.BROWSER_STORAGE_STATE,
@@ -2501,6 +2659,7 @@ const MCP_EXPOSED_TOOL_ORDER: readonly McpToolName[] = [
   MCP_TOOL_NAMES.BROWSER_ACT,
   MCP_TOOL_NAMES.BROWSER_VERIFY,
   MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+  MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
   MCP_TOOL_NAMES.BROWSER_SNAPSHOT,
   MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST,
   MCP_TOOL_NAMES.BROWSER_QUERY_DOM,
@@ -2517,6 +2676,9 @@ const MCP_EXPOSED_TOOL_ORDER: readonly McpToolName[] = [
   MCP_TOOL_NAMES.BROWSER_PRESS_KEY,
   MCP_TOOL_NAMES.BROWSER_SELECT_OPTION,
   MCP_TOOL_NAMES.BROWSER_WAIT_FOR,
+  MCP_TOOL_NAMES.BROWSER_EVALUATE,
+  MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+  MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
   MCP_TOOL_NAMES.BROWSER_HOVER,
   MCP_TOOL_NAMES.BROWSER_DRAG,
   MCP_TOOL_NAMES.BROWSER_NAVIGATE,

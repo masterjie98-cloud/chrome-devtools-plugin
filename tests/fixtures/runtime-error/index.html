@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Runtime Source Map Fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Runtime Source Map Fixture</h1>
+      <p>先启动页面监听，再点击按钮制造一个带 Source Map 的未捕获异常。</p>
+      <button id="trigger-runtime-error" type="button">触发映射错误</button>
+    </main>
+    <script src="./runtime-error.min.js"></script>
+    <script>
+      document
+        .querySelector("#trigger-runtime-error")
+        .addEventListener("click", () => {
+          setTimeout(() => window.triggerMappedRuntimeFailure(), 0);
+        });
+    </script>
+  </body>
+</html>

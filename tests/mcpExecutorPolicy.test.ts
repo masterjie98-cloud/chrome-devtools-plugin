@@ -40,6 +40,36 @@ test("read-only MCP tools cannot bind to DOM, browser, or network mutation execu
   }
 });
 
+test("every targetRef consumer may execute the live semantic freshness check", () => {
+  const targetRefConsumers = [
+    MCP_TOOL_NAMES.BROWSER_WORKFLOW,
+    MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+    MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
+    MCP_TOOL_NAMES.BROWSER_CLICK,
+    MCP_TOOL_NAMES.BROWSER_HOVER,
+    MCP_TOOL_NAMES.BROWSER_DRAG,
+    MCP_TOOL_NAMES.BROWSER_FILL_FORM,
+    MCP_TOOL_NAMES.BROWSER_EXECUTE_ACTION_STAGE,
+    MCP_TOOL_NAMES.BROWSER_ACT,
+    MCP_TOOL_NAMES.BROWSER_VERIFY,
+    MCP_TOOL_NAMES.BROWSER_TYPE,
+    MCP_TOOL_NAMES.BROWSER_PRESS_KEY,
+    MCP_TOOL_NAMES.BROWSER_SELECT_OPTION,
+  ] as const;
+
+  for (const toolName of targetRefConsumers) {
+    assert.doesNotThrow(
+      () =>
+        assertMcpExecutorBoundary(
+          toolName,
+          TOOL_NAMES.DOM_GET_PAGE_INFO,
+          getToolPolicy(toolName).mutatesBrowser,
+        ),
+      `${toolName} must be able to validate a targetRef before execution`,
+    );
+  }
+});
+
 test("target selection is routing-only and cannot authorize an unrelated executor", () => {
   assert.equal(
     INTERNAL_TOOL_EFFECTS[TOOL_NAMES.BROWSER_SET_TARGET_TAB].mutationScope,

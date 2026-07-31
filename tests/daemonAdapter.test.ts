@@ -1248,6 +1248,115 @@ test("daemon keeps approval input pending until an explicit decision", async () 
   }
 });
 
+test("approval resolution clears sibling sidepanels without crossing Profile sessions", async () => {
+  const sessionId = "shared-profile-approval-session";
+  const otherSessionId = "other-profile-approval-session";
+  browserStateHub.setCurrentTab(
+    {
+      url: "https://example.test/shared-profile-approval",
+      title: "Shared Profile approval",
+      targetId: "shared-profile-target",
+      tabId: 78,
+      windowId: 1,
+      navigationId: "shared-profile-navigation",
+    },
+    sessionId,
+  );
+  browserStateHub.setCurrentTab(
+    {
+      url: "https://example.test/other-profile",
+      title: "Other Profile",
+      targetId: "other-profile-target",
+      tabId: 79,
+      windowId: 2,
+      navigationId: "other-profile-navigation",
+    },
+    otherSessionId,
+  );
+  const daemon = startPluginWebSocketServer(0);
+  const address = await daemon.ready();
+  const url = `ws://${address.host}:${address.port}`;
+  const decidingUi = await connectRole(url, "ui", sessionId);
+  const siblingUi = await connectRole(url, "ui", sessionId);
+  const otherProfileUi = await connectRole(url, "ui", otherSessionId);
+  const client = new DaemonClient(url, sessionId, TEST_BRIDGE_TOKEN);
+  const decidingRequest = deferred<ParsedTestMessage>();
+  const siblingRequest = deferred<ParsedTestMessage>();
+  const siblingCancellation = deferred<ParsedTestMessage>();
+  let decidingCancellations = 0;
+  let otherProfileApprovalMessages = 0;
+
+  decidingUi.on("message", (raw) => {
+    const message = parseMessage(raw.toString());
+    if (message?.command === WS_COMMANDS.APPROVAL_REQUEST) {
+      decidingRequest.resolve(message);
+    }
+    if (message?.command === WS_COMMANDS.APPROVAL_CANCELLED) {
+      decidingCancellations += 1;
+    }
+  });
+  siblingUi.on("message", (raw) => {
+    const message = parseMessage(raw.toString());
+    if (message?.command === WS_COMMANDS.APPROVAL_REQUEST) {
+      siblingRequest.resolve(message);
+    }
+    if (message?.command === WS_COMMANDS.APPROVAL_CANCELLED) {
+      siblingCancellation.resolve(message);
+    }
+  });
+  otherProfileUi.on("message", (raw) => {
+    const message = parseMessage(raw.toString());
+    if (
+      message?.command === WS_COMMANDS.APPROVAL_REQUEST ||
+      message?.command === WS_COMMANDS.APPROVAL_CANCELLED
+    ) {
+      otherProfileApprovalMessages += 1;
+    }
+  });
+
+  try {
+    const call = client.callTool(MCP_TOOL_NAMES.BROWSER_CLICK, {
+      selector: "#confirm",
+    });
+    const [request, mirroredRequest] = await Promise.all([
+      decidingRequest.promise,
+      siblingRequest.promise,
+    ]);
+    assert.equal(
+      mirroredRequest.payload.approvalId,
+      request.payload.approvalId,
+    );
+
+    decidingUi.send(JSON.stringify({
+      requestId: request.payload.approvalId,
+      command: WS_COMMANDS.APPROVAL_RESPONSE,
+      sentAt: new Date().toISOString(),
+      payload: {
+        approvalId: request.payload.approvalId,
+        approved: false,
+        respondedAt: new Date().toISOString(),
+      },
+    }));
+
+    await assert.rejects(call, /APPROVAL_DENIED/);
+    const cancellation = await siblingCancellation.promise;
+    assert.equal(
+      cancellation.payload.approvalId,
+      request.payload.approvalId,
+    );
+    assert.match(String(cancellation.payload.reason), /resolved/i);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(decidingCancellations, 0);
+    assert.equal(otherProfileApprovalMessages, 0);
+  } finally {
+    client.close();
+    decidingUi.close();
+    siblingUi.close();
+    otherProfileUi.close();
+    await daemon.close();
+  }
+});
+
 test("daemon binds approval to the live target published after browser reconnect", async () => {
   const sessionId = "approval-reconnect-target";
   browserStateHub.setCurrentTab(
@@ -2005,16 +2114,28 @@ test("daemon enforces the configured Chrome extension ID allowlist", async () =>
   }
 });
 
-test("daemon ignores browser results from the wrong socket", async () => {
+test("daemon routes a reconnected browser session to its newest socket", async () => {
   const daemon = startPluginWebSocketServer(0);
   const address = await daemon.ready();
   const url = `ws://${address.host}:${address.port}`;
-  const expectedBrowser = await connectRole(url, "browser", "socket-bound");
-  const wrongBrowser = await connectRole(url, "browser", "socket-bound");
+  const staleBrowser = await connectRole(url, "browser", "socket-bound");
+  const staleClosed = new Promise<{ code: number; reason: string }>((resolve) => {
+    staleBrowser.once("close", (code, reason) => {
+      resolve({ code, reason: reason.toString() });
+    });
+  });
+  const currentBrowser = await connectRole(url, "browser", "socket-bound");
   const client = new DaemonClient(url, "socket-bound", TEST_BRIDGE_TOKEN);
   const receivedCall = deferred<ParsedTestMessage>();
+  let staleBrowserCalls = 0;
 
-  expectedBrowser.on("message", (raw) => {
+  staleBrowser.on("message", (raw) => {
+    const message = parseMessage(raw.toString());
+    if (message?.command === WS_COMMANDS.BROWSER_TOOL_CALL) {
+      staleBrowserCalls += 1;
+    }
+  });
+  currentBrowser.on("message", (raw) => {
     const message = parseMessage(raw.toString());
     if (message?.command === WS_COMMANDS.BROWSER_TOOL_CALL) {
       receivedCall.resolve(message);
@@ -2022,38 +2143,38 @@ test("daemon ignores browser results from the wrong socket", async () => {
   });
 
   try {
+    assert.deepEqual(await staleClosed, {
+      code: 1008,
+      reason: "SESSION_REPLACED",
+    });
+    await waitUntil(() => daemon.connectedPluginClients() === 1);
+    assert.equal(
+      browserStateHub.snapshot("socket-bound").browserConnected,
+      true,
+    );
+
     const resultPromise = client.callTool(MCP_TOOL_NAMES.BROWSER_QUERY_DOM, {
       query: "#bound",
       queryType: "selector",
     });
     const call = await receivedCall.promise;
-    wrongBrowser.send(JSON.stringify({
+    currentBrowser.send(JSON.stringify({
       requestId: call.requestId,
       command: WS_COMMANDS.BROWSER_TOOL_RESULT,
       sentAt: new Date().toISOString(),
       payload: {
         ok: true,
         toolName: TOOL_NAMES.DOM_QUERY,
-        data: { source: "wrong-socket", elements: [] },
-      },
-    }));
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expectedBrowser.send(JSON.stringify({
-      requestId: call.requestId,
-      command: WS_COMMANDS.BROWSER_TOOL_RESULT,
-      sentAt: new Date().toISOString(),
-      payload: {
-        ok: true,
-        toolName: TOOL_NAMES.DOM_QUERY,
-        data: { source: "expected-socket", elements: [] },
+        data: { source: "current-socket", elements: [] },
       },
     }));
 
-    assert.equal(readString(await resultPromise, "source"), "expected-socket");
+    assert.equal(readString(await resultPromise, "source"), "current-socket");
+    assert.equal(staleBrowserCalls, 0);
   } finally {
     client.close();
-    expectedBrowser.close();
-    wrongBrowser.close();
+    staleBrowser.close();
+    currentBrowser.close();
     await daemon.close();
   }
 });

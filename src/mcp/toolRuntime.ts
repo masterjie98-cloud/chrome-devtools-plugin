@@ -296,7 +296,8 @@ const formControlTargetShape = {
 const elementTargetSchema = z.object(elementTargetShape).refine(
   (value) => Boolean(value.ref || value.selector || value.target || value.element),
   {
-    message: "selector or target is required; targetRef may be supplied as ref",
+    message:
+      "selector or target is required; pass a fresh browser_observe/browser_snapshot targetRef in the ref argument",
   },
 );
 
@@ -308,7 +309,8 @@ const clickSchema = z
     decisionBarrier: z.boolean().optional(),
   })
   .refine((value) => Boolean(value.ref || value.selector || value.target || value.element), {
-    message: "selector or target is required; targetRef may be supplied as ref",
+    message:
+      "selector or target is required; pass a fresh browser_observe/browser_snapshot targetRef in the ref argument",
   });
 
 const hoverSchema = elementTargetSchema;
@@ -323,7 +325,8 @@ const typeTextSchema = z
     decisionBarrier: z.boolean().optional(),
   })
   .refine((value) => Boolean(value.ref || value.selector || value.target || value.element), {
-    message: "selector or target is required; targetRef may be supplied as ref",
+    message:
+      "selector or target is required; pass a fresh browser_observe/browser_snapshot targetRef in the ref argument",
   })
   .refine((value) => !value.slowly || Array.from(value.text).length <= 500, {
     message: "slowly typed text is limited to 500 Unicode characters",
@@ -348,7 +351,8 @@ const selectOptionSchema = z
   })
   .strict()
   .refine((value) => Boolean(value.ref || value.selector || value.target || value.element), {
-    message: "selector or target is required; targetRef may be supplied as ref",
+    message:
+      "selector or target is required; pass a fresh browser_observe/browser_snapshot targetRef in the ref argument",
   })
   .refine((value) => new Set(value.values).size === value.values.length, {
     message: "option values must be unique",
@@ -778,6 +782,19 @@ const debugActivitySchema = z
     },
   );
 
+const runtimeErrorDiagnosticsSchema = z
+  .object({
+    afterStreamId: z.string().trim().min(1).max(200).optional(),
+    afterSequence: z.number().int().nonnegative().optional(),
+    limit: z.number().int().min(1).max(20).optional(),
+    maxFramesPerError: z.number().int().min(1).max(12).optional(),
+    maxWorkspaceFrames: z.number().int().min(1).max(20).optional(),
+    includeWarnings: z.boolean().optional(),
+    includeRevoked: z.boolean().optional(),
+    includeLocalExcerpt: z.boolean().optional(),
+  })
+  .strict();
+
 const coordinateSchema = z.object({
   x: z.number(),
   y: z.number(),
@@ -811,10 +828,100 @@ const wheelSchema = z
   );
 
 const evaluateSchema = z.object({
-  expression: z.string().min(1).max(4000),
-  selector: z.string().min(1).optional(),
+  expression: z.string().min(1).max(12000),
+  selector: z.string().min(1).max(2000).optional(),
+  awaitPromise: z.boolean().optional(),
+  replMode: z.boolean().optional(),
+  throwOnSideEffect: z.boolean().optional(),
+  allowBreakpoints: z.boolean().optional(),
   timeoutMs: z.number().int().min(100).max(10000).optional(),
-});
+}).strict();
+
+const debuggerBreakpointSchema = z
+  .object({
+    action: z.enum(["set", "remove", "list"]),
+    breakpointId: z.string().min(1).max(1000).optional(),
+    url: z.string().min(1).max(8000).optional(),
+    urlRegex: z.string().min(1).max(4000).optional(),
+    lineNumber: z.number().int().min(1).optional(),
+    columnNumber: z.number().int().nonnegative().optional(),
+    condition: z.string().max(2000).optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.action === "remove" && !value.breakpointId) {
+      context.addIssue({
+        code: "custom",
+        path: ["breakpointId"],
+        message: "breakpointId is required when action is remove",
+      });
+    }
+    if (value.action === "set") {
+      if (Boolean(value.url) === Boolean(value.urlRegex)) {
+        context.addIssue({
+          code: "custom",
+          path: ["url"],
+          message: "provide exactly one of url or urlRegex when action is set",
+        });
+      }
+      if (value.lineNumber === undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["lineNumber"],
+          message: "lineNumber is required when action is set",
+        });
+      }
+    }
+  });
+
+const debuggerControlSchema = z
+  .object({
+    action: z.enum([
+      "status",
+      "pause",
+      "resume",
+      "step_over",
+      "step_into",
+      "step_out",
+      "evaluate_on_call_frame",
+      "set_pause_on_exceptions",
+    ]),
+    callFrameId: z.string().min(1).max(2000).optional(),
+    expression: z.string().min(1).max(12000).optional(),
+    timeoutMs: z.number().int().min(100).max(10000).optional(),
+    throwOnSideEffect: z.boolean().optional(),
+    pauseOnExceptions: z.enum(["none", "uncaught", "caught", "all"]).optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.action === "evaluate_on_call_frame") {
+      if (!value.callFrameId) {
+        context.addIssue({
+          code: "custom",
+          path: ["callFrameId"],
+          message: "callFrameId is required for evaluate_on_call_frame",
+        });
+      }
+      if (!value.expression) {
+        context.addIssue({
+          code: "custom",
+          path: ["expression"],
+          message: "expression is required for evaluate_on_call_frame",
+        });
+      }
+    }
+    if (
+      value.action === "set_pause_on_exceptions" &&
+      value.pauseOnExceptions === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["pauseOnExceptions"],
+        message:
+          "pauseOnExceptions is required for set_pause_on_exceptions",
+      });
+    }
+  });
 
 const storageStateSchema = z.object({
   includeLocalStorage: z.boolean().optional(),
@@ -1055,6 +1162,8 @@ const MCP_TOOL_INPUT_SCHEMA_BASE: Record<McpToolName, ZodTypeAny> = {
   [MCP_TOOL_NAMES.BROWSER_ACT]: actionStageSchema,
   [MCP_TOOL_NAMES.BROWSER_VERIFY]: browserVerifySchema,
   [MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY]: debugActivitySchema,
+  [MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS]:
+    runtimeErrorDiagnosticsSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT]: noArgSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST]: noArgSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_PLUGIN_CONVERSATION]: conversationPageInputSchema,
@@ -1103,6 +1212,8 @@ const MCP_TOOL_INPUT_SCHEMA_BASE: Record<McpToolName, ZodTypeAny> = {
   [MCP_TOOL_NAMES.BROWSER_MOUSE_WHEEL_XY]: wheelSchema,
   [MCP_TOOL_NAMES.BROWSER_WAIT_FOR]: waitForSchema,
   [MCP_TOOL_NAMES.BROWSER_EVALUATE]: evaluateSchema,
+  [MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT]: debuggerBreakpointSchema,
+  [MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL]: debuggerControlSchema,
   [MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG]: dialogSchema,
   [MCP_TOOL_NAMES.BROWSER_STORAGE_STATE]: storageStateSchema,
   [MCP_TOOL_NAMES.BROWSER_COOKIE_LIST]: cookieListSchema,
@@ -1203,11 +1314,15 @@ export function runtimeToolsForProfile(
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
       MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
       MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
       MCP_TOOL_NAMES.BROWSER_LIST_TABS,
       MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB,
       MCP_TOOL_NAMES.BROWSER_LIST_FRAMES,
       MCP_TOOL_NAMES.BROWSER_SET_TARGET_FRAME,
+      MCP_TOOL_NAMES.BROWSER_EVALUATE,
+      MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+      MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
     ]);
     return MCP_RUNTIME_TOOL_REGISTRY.filter((registration) =>
       smartTools.has(registration.definition.name),
@@ -1283,10 +1398,17 @@ export function registerProxyMcpTools(
       },
     ) => Promise<unknown>;
   },
-  options: { profile?: McpToolProfile } = {},
+  options: {
+    profile?: McpToolProfile;
+    exclude?: readonly McpToolName[];
+  } = {},
 ): void {
+  const excluded = new Set(options.exclude ?? []);
   for (const registration of runtimeToolsForProfile(options.profile ?? "smart")) {
     const { definition } = registration;
+    if (excluded.has(definition.name)) {
+      continue;
+    }
     server.registerTool(
       definition.name,
       {
@@ -1424,6 +1546,21 @@ export async function executeMcpToolData(
         parsedArgs,
         context.sessionId,
       );
+    case MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS: {
+      const {
+        maxWorkspaceFrames: _maxWorkspaceFrames,
+        includeLocalExcerpt: _includeLocalExcerpt,
+        ...runtimeArgs
+      } = parsedArgs;
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS,
+        args: {
+          ...runtimeArgs,
+          includeSourceExcerpt: true,
+        },
+      } as unknown as AnyToolCall);
+    }
     case MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT:
       return readSelectedElementResource(context.sessionId);
     case MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST:
@@ -1670,6 +1807,18 @@ export async function executeMcpToolData(
       return proxyBrowserTool(pluginBridge, {
         id: createMessageId(),
         toolName: TOOL_NAMES.BROWSER_EVALUATE,
+        args: parsedArgs,
+      } as unknown as AnyToolCall);
+    case MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT:
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DEBUGGER_BREAKPOINT,
+        args: parsedArgs,
+      } as unknown as AnyToolCall);
+    case MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL:
+      return proxyBrowserTool(pluginBridge, {
+        id: createMessageId(),
+        toolName: TOOL_NAMES.DEBUGGER_CONTROL,
         args: parsedArgs,
       } as unknown as AnyToolCall);
     case MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG:

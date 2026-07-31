@@ -10,8 +10,6 @@ import type {
   BrowserElementRectResult,
   BrowserDragInput,
   BrowserDragResult,
-  BrowserEvaluateInput,
-  BrowserEvaluateResult,
   BrowserFormControlInspectInput,
   BrowserFormControlInspectResult,
   BrowserFormControlKind,
@@ -40,7 +38,6 @@ import { getCssSelector } from "./domInspector";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 5000;
 const MAX_WAIT_TIMEOUT_MS = 60000;
-const MAX_EVALUATE_RESULT_CHARS = 20_000;
 const TEXT_INPUT_TYPES = new Set([
   "email",
   "number",
@@ -336,32 +333,6 @@ export function applySelectOption(
     inputMode: "dom",
     changed,
   };
-}
-
-export function evaluateExpression(
-  input: BrowserEvaluateInput,
-): BrowserEvaluateResult {
-  try {
-    const target = input.selector ? queryTarget(input.selector) : undefined;
-    const fn = new Function(
-      "element",
-      `"use strict"; return (${input.expression});`,
-    );
-    const result = fn(target);
-    const serialized = serializeEvaluationResult(result);
-    return {
-      evaluated: true,
-      result: parseSerializedEvaluationResult(serialized.value),
-      resultType: typeof result,
-      serialized: serialized.value,
-      truncated: serialized.truncated,
-    };
-  } catch (error) {
-    return {
-      evaluated: false,
-      error: error instanceof Error ? error.message : "Evaluation failed.",
-    };
-  }
 }
 
 export function getStorageState(
@@ -890,47 +861,6 @@ function selectOptionCandidates(
     disabled: option.disabled || Boolean(option.parentElement?.closest("optgroup")?.disabled),
     selected: option.selected,
   }));
-}
-
-function serializeEvaluationResult(value: unknown): {
-  value: string;
-  truncated: boolean;
-} {
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(value, jsonSafeReplacer, 2);
-  } catch {
-    serialized = String(value);
-  }
-  const truncated = serialized.length > MAX_EVALUATE_RESULT_CHARS;
-  return {
-    value: truncated
-      ? serialized.slice(0, MAX_EVALUATE_RESULT_CHARS)
-      : serialized,
-    truncated,
-  };
-}
-
-function parseSerializedEvaluationResult(value: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
-}
-
-function jsonSafeReplacer(_key: string, value: unknown): unknown {
-  if (value instanceof Element) {
-    return {
-      tagName: value.tagName.toLowerCase(),
-      selector: getCssSelector(value),
-      text: sanitizeText(value.textContent ?? "", 300),
-    };
-  }
-  if (typeof value === "function") {
-    return "[function]";
-  }
-  return value;
 }
 
 export function storageToRecordSnapshot(

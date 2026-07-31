@@ -114,11 +114,11 @@ sensitive page data.
 When a generated URL/line/column is available, the debugger adapter records
 loaded script and `sourceMapURL` metadata. A bounded Source Map v3 resolver:
 
-- supports flat maps;
+- supports flat maps and embedded indexed-map sections;
 - caps downloaded/decoded bytes and mapping count;
-- uses a short timeout;
+- reads through a bounded selected-target CDP resource stream;
 - does not send page credentials;
-- rejects unsupported indexed maps with an explicit reason;
+- rejects indexed sections that require another external map fetch;
 - returns original source URL, line, column, and name;
 - returns source excerpts only when explicitly requested and available in
   `sourcesContent`.

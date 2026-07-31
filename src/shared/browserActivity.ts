@@ -163,6 +163,10 @@ export interface BrowserActivityStatus {
   frameId?: number;
   documentId?: string;
   networkObservationSessionId?: string;
+  runtimeErrorCursor?: {
+    streamId: string;
+    sequence: number;
+  };
 }
 
 export function sanitizeBrowserActivityEventInput(

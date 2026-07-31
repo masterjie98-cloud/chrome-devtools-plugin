@@ -259,9 +259,13 @@ Responsibilities:
   instead of polling the page.
 - Framework source inspection executes one fixed build-owned MAIN-world
   function. It may read React Fiber or Vue instance metadata and then resolve a
-  loaded script's flat Source Map v3 mapping without page credentials. It does
-  not execute MCP-supplied JavaScript, and unsupported/oversized/indexed maps
-  return an explicit unavailable reason.
+  loaded script's bounded Source Map v3 mapping through the selected debugger
+  target's CDP resource stream without page credentials.
+  Runtime error monitoring also captures bounded `Runtime.exceptionThrown` and
+  error-console stacks, resolves them against the exact loaded script, and
+  exposes only mapped locations rather than full map payloads. It does not
+  execute MCP-supplied JavaScript; oversized or unsupported maps return an
+  explicit unavailable reason.
 - Network records retain bounded initiator frames and wall-clock timing.
   `browser_workflow` may correlate them with an action target, component, and
   original source, but every link carries a confidence reason; timing
@@ -575,7 +579,7 @@ profile and daemon config. Accidental and web-origin access remain in scope.
 | `reversible_write` | highlight, temporary CSS, resize | deny pending approval | required |
 | `page_action` | click, type, fill, select, drag, keyboard, dialog | deny pending approval | required |
 | `destructive_write` | navigate, close, cookie mutation, DNR/proxy rule mutation | deny pending approval | required |
-| `arbitrary_execution` | evaluate JavaScript | deny pending approval | required; never remembered |
+| `arbitrary_execution` | page JavaScript, conditional breakpoints, paused-frame evaluation, debugger stepping | deny pending approval | required for every call; never a task grant |
 | `open_world` | external MCP tool, web search, download | deny pending approval | required based on provenance and destination |
 
 Unknown tools default to deny. Tool annotations help MCP clients display intent,
@@ -792,6 +796,10 @@ Required behavior:
   original source location for an exact document-bound element. Production
   bundles that omit framework debug metadata or source maps return explicit
   partial/unavailable results.
+- Adapter-local `browser_diagnose_runtime_errors` reads a bounded incremental
+  error window, resolves loaded-script Source Maps in the extension, and
+  verifies mapped source lines only under configured local workspace roots.
+  Cursor restart, eviction, and build/debug identity mismatch remain explicit.
 - `browser_capture_issue_evidence` runs the bounded workflow and stores a
   session-bound manifest with separate before/after screenshot artifacts; it
   never downloads files to the user's Downloads directory.
@@ -966,6 +974,24 @@ evidence requirement, not an unimplemented synthetic-input fallback.
 
 Compatibility shims must be time-bounded and listed in the implementation plan.
 No new feature may depend on the V1 global active-session or latest-socket model.
+
+### 14.1 Arbitrary page execution and debugger lifecycle
+
+`browser_evaluate`, `browser_debugger_breakpoint`, and
+`browser_debugger_control` enter only their declared CDP executors. The daemon
+validates strict Zod inputs before approval, signs a single-use grant over the
+exact internal tool and arguments, and binds that grant to Profile, Tab, frame,
+document, navigation, and revision. The Chrome background repeats the grant and
+target check before `Runtime.evaluate` or `Debugger.*` dispatch.
+
+The implementation does not claim sandboxing. JavaScript executes in the
+selected page's main runtime and may read or mutate any state available to that
+page. Code and breakpoint conditions have explicit size limits; evaluation has
+a 10-second ceiling; retained breakpoints, paused stacks, previews, descriptions,
+and serialized values are bounded. MCP never receives reusable CDP
+`RemoteObjectId` handles. A paused target is resumed before an explicit debugger
+detach or a debugger-session switch so task cleanup does not intentionally leave
+the page frozen.
 
 ## 15. Out of scope
 

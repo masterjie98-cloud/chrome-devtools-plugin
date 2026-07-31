@@ -1,5 +1,60 @@
 # Chrome DevTools Plugin Threat Model
 
+## 2026-07-30 multi-sidepanel approval synchronization update
+
+An approval request is scoped to the Chrome Profile installation/session and is
+sent only to authenticated sidepanel UI sockets in that session. More than one
+sidepanel for the same Profile may render the request, but only a socket in the
+request's captured allow-set can resolve it. After the first valid response, the
+daemon removes the pending approval and sends an `APPROVAL_CANCELLED` terminal
+event to every other allowed sidepanel so sibling cards cannot remain actionable
+or appear pending. The responding socket is excluded from that notification
+because its local decision already settles the card. Sidepanels in a different
+Profile session receive neither the request nor its terminal event.
+
+This closes the stale-card availability and approval-confusion path without
+allowing one Profile to authorize another. A sidepanel connection that is
+created only after a request was issued is not added retroactively; pending
+approval replay across UI reconnect remains intentionally unsupported and the
+requesting operation must be retried if all eligible panels disconnect.
+
+## 2026-07-30 arbitrary page JavaScript and debugger update
+
+`browser_evaluate`, `browser_debugger_breakpoint`, and
+`browser_debugger_control` intentionally add DevTools-console-level authority to
+the default `smart` and expert `full` MCP profiles. They execute only in the
+exact task-bound page Profile/Tab/frame/document through CDP
+`Runtime.evaluate` and `Debugger.*`.
+This is not a sandbox: approved code can read logged-in same-origin data, mutate
+page/application state, call page functions, and issue requests with the page's
+effective authority.
+
+The deployment assumption remains a local, single-user developer tool. Page
+content and MCP/Provider output remain untrusted. A malicious process already
+running as the same OS user and remote/multi-user daemon hosting remain outside
+scope; distributing this capability in either model requires a separate trust
+and administration design.
+
+The execution path is model/Agent → strict MCP schema → daemon approval and
+single-use signed grant → Chrome background grant/target revalidation →
+registered CDP executor → selected page. Caller-provided JavaScript no longer
+has a content-script message handler and never reaches `new Function`.
+
+| Threat | Impact | Control | Residual risk |
+| --- | --- | --- | --- |
+| Prompt-injected code reads secrets or performs authenticated actions | Confidentiality/integrity loss | Every operation is `arbitrary_execution`, always approval-gated, never covered by a task grant, and the approval shows the bounded arguments/destination | A user can intentionally approve harmful code; approval fatigue remains |
+| Navigation or Tab confusion after approval | Code runs on the wrong document | One-use HMAC grant binds internal tool, argument hash, Profile, Tab, frame, document, navigation and revision; background revalidates immediately before dispatch | A small renderer dispatch race remains; future `uniqueContextId` binding can narrow it |
+| Oversized code/result or retained remote handles exhaust local resources/context | Extension/model availability loss | 12,000-character code limit, 10-second timeout, bounded previews/stacks/values/breakpoints, `returnByValue`, and object-group release in `finally` | Approved page code can still allocate memory before V8 termination |
+| Breakpoint evaluation deadlocks its own MCP call | Tool stalls while the page is paused | Breakpoints are disabled during normal evaluation; deliberate hits require asynchronous scheduling with `awaitPromise: false` and `allowBreakpoints: true` | A caller can still intentionally freeze the page |
+| Debugger cleanup leaves a page paused | Selected page unavailable | Paused targets are tracked and resumed before explicit detach, Tab-session switch, and child-target cleanup | Browser/worker crash can interrupt cleanup |
+| Stale call-frame ID is reused after resume/navigation | Wrong-scope evaluation or confusing output | Call-frame IDs are accepted only when present in the current retained pause state and are discarded on resume/detach | A pause event can become stale between final validation and CDP dispatch |
+
+Audit persistence retains the tool/policy, target metadata, argument hash,
+egress classification/size, timing, and outcome; it does not persist raw
+JavaScript results. The downstream MCP client or model may independently retain
+returned values, so code that reads credentials or private state remains an
+explicit egress decision.
+
 ## 2026-07-27 diagnostic automation V3 update
 
 V3 adds five browser diagnostics, one adapter-local workspace lookup, and

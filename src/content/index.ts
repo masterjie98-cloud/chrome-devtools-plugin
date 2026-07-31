@@ -4,7 +4,6 @@ import {
   cleanDebuggerBlockingFrames,
   dragElement,
   dragMouse,
-  evaluateExpression,
   getElementRect,
   getStorageState,
   hoverElement,
@@ -155,8 +154,6 @@ function handleContentRequest(request: ExtensionRequest) {
       return Promise.resolve(waitFor(request.payload)).then((result) =>
         okResponse(request, result),
       );
-    case MESSAGE_TYPES.CONTENT_EVALUATE:
-      return okResponse(request, evaluateExpression(request.payload));
     case MESSAGE_TYPES.CONTENT_GET_STORAGE_STATE:
       return okResponse(request, getStorageState(request.payload));
     case MESSAGE_TYPES.CONTENT_CLEAN_DEBUGGER_FRAMES:

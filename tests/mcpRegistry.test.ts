@@ -62,6 +62,7 @@ test("diagnostic activity, source, and evidence tools are exposed to MCP clients
     MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
     MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
     MCP_TOOL_NAMES.BROWSER_LOCATE_SOURCE,
+    MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
     MCP_TOOL_NAMES.BROWSER_CAPTURE_ISSUE_EVIDENCE,
   ]) {
     assert.equal(exposedNames.has(toolName), true, `${toolName} must be exposed`);
@@ -412,7 +413,7 @@ test("MCP tool profiles reduce model-visible capability without changing policy"
   );
   assert.equal(inspect.length < read.length, true);
   assert.equal(read.length < full.length, true);
-  assert.equal(smart.length, 20);
+  assert.equal(smart.length, 24);
   assert.deepEqual(
     smart.map((tool) => tool.definition.name),
     [
@@ -431,11 +432,15 @@ test("MCP tool profiles reduce model-visible capability without changing policy"
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
       MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+      MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
       MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
       MCP_TOOL_NAMES.BROWSER_LIST_TABS,
       MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB,
       MCP_TOOL_NAMES.BROWSER_LIST_FRAMES,
       MCP_TOOL_NAMES.BROWSER_SET_TARGET_FRAME,
+      MCP_TOOL_NAMES.BROWSER_EVALUATE,
+      MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+      MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
     ],
   );
   assert.equal(parseMcpToolProfile(undefined), "smart");

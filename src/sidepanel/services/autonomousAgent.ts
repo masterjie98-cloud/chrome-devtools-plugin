@@ -1053,7 +1053,7 @@ export async function runAutonomousAgentSession(
             requireContinuation: replanBlockedResults.length > 0,
             continuationInstruction:
               replanBlockedResults.length > 0
-                ? "The previous tool call was rejected before execution because the same tool and arguments already failed. Do not repeat that unchanged call. For invalid arguments, inspect the tool schema and provide a selector or fresh targetRef. For stale, unavailable, or missing targets, call browser_observe, browser_snapshot, or a bounded wait first, then retry only with fresh evidence. Continue the original task now."
+                ? "The previous tool call was rejected before execution because the same tool and arguments already failed. Do not repeat that unchanged call. For invalid target arguments, inspect the tool schema and provide an exact selector or pass a fresh targetRef in the ref argument. For stale, unavailable, or missing targets, call browser_observe, browser_snapshot, or a bounded wait first, then retry only with fresh evidence. Continue the original task now."
                 : undefined,
             forceToolChoice: replanBlockedResults.length > 0,
             abortSignal: params.abortSignal,
@@ -2144,7 +2144,7 @@ function describeRepeatedPreExecutionFailure(
 ): string {
   const recovery =
     record.failure.kind === "invalid_arguments"
-      ? "检查工具参数 schema，并提供有效 selector 或最新 targetRef"
+      ? "检查工具参数 schema，并提供有效 selector，或把最新 targetRef 填入 ref 参数"
       : "先重新观察或等待页面稳定，再基于新证据修改目标";
   return terminal
     ? `工具 ${toolCall.name} 在执行前失败后仍连续提交完全相同的参数。Agent 已停止这个重复分支；${recovery}。`

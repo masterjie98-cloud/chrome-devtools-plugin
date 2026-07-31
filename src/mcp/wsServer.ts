@@ -275,6 +275,7 @@ export function startPluginWebSocketServer(
   const clientRoles = new Map<WebSocket, WsClientRole | "unknown">();
   const clientSessionIds = new Map<WebSocket, string>();
   const clientConversationIds = new Map<WebSocket, string>();
+  const currentBrowserSockets = new Map<string, WebSocket>();
   const connectionIds = new Map<WebSocket, string>();
   const connectionRates = new Map<
     WebSocket,
@@ -455,7 +456,16 @@ export function startPluginWebSocketServer(
       }
       if (wasPlugin || role === "browser") {
         const sessionId = clientSessionIds.get(socket);
-        browserStateHub.disconnect("browser", sessionId);
+        if (role === "browser" && sessionId) {
+          if (currentBrowserSockets.get(sessionId) === socket) {
+            currentBrowserSockets.delete(sessionId);
+          }
+          if (!findBrowserSocketForSession(sessionId)) {
+            browserStateHub.disconnect("browser", sessionId);
+          }
+        } else {
+          browserStateHub.disconnect("browser", sessionId);
+        }
       }
       if (role === "observer" || role === "ui") {
         browserStateHub.disconnect("ui", clientSessionIds.get(socket));
@@ -1031,6 +1041,12 @@ export function startPluginWebSocketServer(
     }
     pending.cleanup?.();
     pendingApprovals.delete(payload.approvalId);
+    notifyApprovalCancelled(
+      payload.approvalId,
+      pending,
+      "The approval was resolved in another sidepanel.",
+      socket,
+    );
     pending.resolve(payload);
   }
 
@@ -1044,6 +1060,20 @@ export function startPluginWebSocketServer(
     clientRoles.set(socket, "browser");
     if (sessionId) {
       clientSessionIds.set(socket, sessionId);
+      const previous = currentBrowserSockets.get(sessionId);
+      currentBrowserSockets.set(sessionId, socket);
+      if (
+        previous &&
+        previous !== socket &&
+        previous.readyState === previous.OPEN
+      ) {
+        rejectAllPendingToolRequests(
+          pendingToolRequests,
+          "Browser session reconnected before the browser tool completed.",
+          previous,
+        );
+        previous.close(1008, "SESSION_REPLACED");
+      }
     }
     primaryBrowserSocket = socket;
     browserStateHub.connect("browser", sessionId);
@@ -1096,15 +1126,30 @@ export function startPluginWebSocketServer(
   }
 
   function findBrowserSocketForSession(sessionId: string): WebSocket | null {
-    for (const socket of clients) {
+    const current = currentBrowserSockets.get(sessionId);
+    if (
+      current &&
+      clientRoles.get(current) === "browser" &&
+      current.readyState === current.OPEN
+    ) {
+      return current;
+    }
+
+    // A browser service worker can briefly leave its previous WebSocket open
+    // while the reloaded worker registers a replacement for the same profile.
+    // Prefer the newest registration so tool calls never get stuck on that
+    // stale-but-still-open socket.
+    for (const socket of Array.from(clients).reverse()) {
       if (
         clientRoles.get(socket) === "browser" &&
         clientSessionIds.get(socket) === sessionId &&
         socket.readyState === socket.OPEN
       ) {
+        currentBrowserSockets.set(sessionId, socket);
         return socket;
       }
     }
+    currentBrowserSockets.delete(sessionId);
     return null;
   }
 
@@ -2941,6 +2986,7 @@ function notifyApprovalCancelled(
   approvalId: string,
   pending: PendingApproval,
   reason: string,
+  excludedSocket?: WebSocket,
 ): void {
   const message: McpToPluginMessage = {
     requestId: createMessageId(),
@@ -2949,6 +2995,9 @@ function notifyApprovalCancelled(
     payload: { approvalId, reason },
   };
   for (const socket of pending.allowedSockets) {
+    if (socket === excludedSocket) {
+      continue;
+    }
     sendRawMessage(socket, message);
   }
 }

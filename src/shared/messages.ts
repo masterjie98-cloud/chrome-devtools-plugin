@@ -12,8 +12,6 @@ import type {
   BrowserDebuggerFrameCleanupResult,
   BrowserDragInput,
   BrowserDragResult,
-  BrowserEvaluateInput,
-  BrowserEvaluateResult,
   BrowserFormControlInspectInput,
   BrowserFormControlInspectResult,
   BrowserHoverInput,
@@ -76,7 +74,6 @@ export const MESSAGE_TYPES = {
   CONTENT_MOUSE_WHEEL: "content:mouseWheel",
   CONTENT_AGENT_POINTER: "content:agentPointer",
   CONTENT_WAIT_FOR: "content:waitFor",
-  CONTENT_EVALUATE: "content:evaluate",
   CONTENT_GET_STORAGE_STATE: "content:getStorageState",
   CONTENT_CLEAN_DEBUGGER_FRAMES: "content:cleanDebuggerFrames",
   CONTENT_APPLY_CSS_PATCH: "content:applyCssPatch",
@@ -235,12 +232,6 @@ export type ExtensionRequest =
   | {
       id: string;
       source: "background";
-      type: typeof MESSAGE_TYPES.CONTENT_EVALUATE;
-      payload: BrowserEvaluateInput;
-    }
-  | {
-      id: string;
-      source: "background";
       type: typeof MESSAGE_TYPES.CONTENT_GET_STORAGE_STATE;
       payload: BrowserStorageStateInput;
     }
@@ -363,7 +354,6 @@ export interface ResponsePayloadMap {
   [MESSAGE_TYPES.CONTENT_MOUSE_WHEEL]: BrowserMouseResult;
   [MESSAGE_TYPES.CONTENT_AGENT_POINTER]: AgentPointerResult;
   [MESSAGE_TYPES.CONTENT_WAIT_FOR]: BrowserWaitForResult;
-  [MESSAGE_TYPES.CONTENT_EVALUATE]: BrowserEvaluateResult;
   [MESSAGE_TYPES.CONTENT_GET_STORAGE_STATE]: BrowserStorageStateResult;
   [MESSAGE_TYPES.CONTENT_CLEAN_DEBUGGER_FRAMES]: BrowserDebuggerFrameCleanupResult;
   [MESSAGE_TYPES.CONTENT_APPLY_CSS_PATCH]: CssPatchResult;

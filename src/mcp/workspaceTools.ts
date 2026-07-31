@@ -31,7 +31,7 @@ const IGNORED_DIRECTORIES = new Set([
 const MAX_SCANNED_FILES = 5_000;
 const MAX_FILE_BYTES = 512 * 1024;
 
-const inputSchema = z
+export const workspaceSourceInputSchema = z
   .object({
     sourceHint: z.string().min(1).max(2_000).optional(),
     symbol: z.string().min(1).max(300).optional(),
@@ -42,13 +42,15 @@ const inputSchema = z
       .optional(),
     limit: z.number().int().min(1).max(50).optional(),
     includeExcerpt: z.boolean().optional(),
+    lineNumber: z.number().int().positive().max(10_000_000).optional(),
+    expectedExcerpt: z.string().min(1).max(500).optional(),
   })
   .strict()
   .refine((value) => Boolean(value.sourceHint || value.symbol), {
     message: "sourceHint or symbol is required",
   });
 
-const outputSchema = z
+export const workspaceSourceOutputSchema = z
   .object({
     version: z.literal("browser-workspace-source-v1"),
     roots: z.array(z.string()),
@@ -63,6 +65,7 @@ const outputSchema = z
           line: z.number().int().positive().optional(),
           reason: z.array(z.string()),
           excerpt: z.string().optional(),
+          contentMatch: z.boolean().optional(),
         })
         .strict(),
     ),
@@ -77,6 +80,7 @@ interface WorkspaceMatch {
   line?: number;
   reason: string[];
   excerpt?: string;
+  contentMatch?: boolean;
 }
 
 export function registerWorkspaceSourceTool(server: McpServer): void {
@@ -86,8 +90,8 @@ export function registerWorkspaceSourceTool(server: McpServer): void {
       title: "Find browser source in local workspace",
       description:
         "Resolve a browser/source-map file hint or component symbol to bounded files under configured local workspace roots. Roots come only from AI_DEVTOOLS_WORKSPACE_ROOTS or the adapter working directory; arbitrary paths are rejected.",
-      inputSchema,
-      outputSchema,
+      inputSchema: workspaceSourceInputSchema,
+      outputSchema: workspaceSourceOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -97,7 +101,7 @@ export function registerWorkspaceSourceTool(server: McpServer): void {
     },
     async (rawArgs: Record<string, unknown>) => {
       try {
-        const args = inputSchema.parse(rawArgs);
+        const args = workspaceSourceInputSchema.parse(rawArgs);
         return formatMcpToolResult(await findWorkspaceSource(args));
       } catch (error) {
         return formatMcpToolResult(
@@ -115,8 +119,8 @@ export function registerWorkspaceSourceTool(server: McpServer): void {
 }
 
 export async function findWorkspaceSource(
-  args: z.infer<typeof inputSchema>,
-): Promise<z.infer<typeof outputSchema>> {
+  args: z.infer<typeof workspaceSourceInputSchema>,
+): Promise<z.infer<typeof workspaceSourceOutputSchema>> {
   const roots = await configuredWorkspaceRoots();
   const extensions = new Set(args.extensions ?? DEFAULT_EXTENSIONS);
   const limit = args.limit ?? 20;
@@ -178,27 +182,54 @@ export async function findWorkspaceSource(
           score += 40;
           reasons.push("source filename match");
         }
-        let line: number | undefined;
+        let line: number | undefined = args.lineNumber;
         let excerpt: string | undefined;
-        if (symbol) {
+        let contentMatch: boolean | undefined;
+        const shouldInspectContent =
+          Boolean(symbol) || (args.lineNumber !== undefined && score > 0);
+        if (shouldInspectContent) {
           const metadata = await stat(absolutePath);
           if (metadata.size <= MAX_FILE_BYTES) {
             const content = await readFile(absolutePath, "utf8");
-            const index = content.toLowerCase().indexOf(symbol.toLowerCase());
-            if (index >= 0) {
-              line = content.slice(0, index).split(/\r?\n/).length;
-              score += 60;
-              reasons.push("symbol content match");
+            const lines = content.split(/\r?\n/);
+            if (symbol) {
+              const index = content
+                .toLowerCase()
+                .indexOf(symbol.toLowerCase());
+              if (index >= 0) {
+                line ??= content.slice(0, index).split(/\r?\n/).length;
+                score += 60;
+                reasons.push("symbol content match");
+              }
+            }
+            if (line !== undefined && line <= lines.length) {
+              const mappedLine = lines[line - 1] ?? "";
+              if (args.expectedExcerpt) {
+                contentMatch =
+                  normalizeComparableSource(mappedLine) ===
+                  normalizeComparableSource(args.expectedExcerpt);
+                if (contentMatch) {
+                  score += 80;
+                  reasons.push("mapped source content match");
+                } else {
+                  reasons.push("mapped source content differs");
+                }
+              }
               if (args.includeExcerpt) {
-                const lines = content.split(/\r?\n/);
                 excerpt = lines
-                  .slice(Math.max(0, line - 2), Math.min(lines.length, line + 1))
+                  .slice(
+                    Math.max(0, line - 2),
+                    Math.min(lines.length, line + 1),
+                  )
                   .join("\n")
                   .slice(0, 1_500);
               }
             }
           }
-          if (entry.name.toLowerCase().includes(symbol.toLowerCase())) {
+          if (
+            symbol &&
+            entry.name.toLowerCase().includes(symbol.toLowerCase())
+          ) {
             score += 20;
             reasons.push("symbol filename match");
           }
@@ -211,6 +242,7 @@ export async function findWorkspaceSource(
             line,
             reason: reasons,
             excerpt,
+            contentMatch,
           });
         }
       }
@@ -241,6 +273,9 @@ export async function findWorkspaceSource(
         ...(match.line ? { line: match.line } : {}),
         reason: match.reason,
         ...(match.excerpt ? { excerpt: match.excerpt } : {}),
+        ...(match.contentMatch === undefined
+          ? {}
+          : { contentMatch: match.contentMatch }),
       })),
     warnings,
   };
@@ -268,9 +303,29 @@ function normalizeSourceHint(value: string | undefined): string | undefined {
   if (!value) {
     return undefined;
   }
-  const withoutScheme =
-    value.replace(/^(?:webpack|vite|file):\/+/, "").split(/[?#]/, 1)[0] ?? "";
-  const normalized = normalizePath(withoutScheme).replace(/^\/+/, "");
+  let pathValue: string;
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol === "data:" ||
+      url.protocol === "javascript:" ||
+      url.protocol === "blob:"
+    ) {
+      throw new Error("unsupported source URL scheme");
+    }
+    pathValue = decodeURIComponent(url.pathname || url.hostname);
+  } catch (error) {
+    if (
+      error instanceof URIError ||
+      /^[a-z][a-z0-9+.-]*:/i.test(value)
+    ) {
+      throw new Error("WORKSPACE_SOURCE_HINT_INVALID: unsupported source URL.");
+    }
+    pathValue = value.split(/[?#]/, 1)[0] ?? "";
+  }
+  const normalized = normalizePath(pathValue)
+    .replace(/^\/+/, "")
+    .replace(/^(?:\.\/)+/, "");
   if (!normalized || normalized.split("/").includes("..")) {
     throw new Error("WORKSPACE_SOURCE_HINT_INVALID: path traversal is not allowed.");
   }
@@ -279,4 +334,8 @@ function normalizeSourceHint(value: string | undefined): string | undefined {
 
 function normalizePath(value: string): string {
   return value.split(sep).join("/").replace(/\\/g, "/");
+}
+
+function normalizeComparableSource(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }

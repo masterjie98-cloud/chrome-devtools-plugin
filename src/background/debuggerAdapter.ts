@@ -4,6 +4,7 @@ import {
   debuggerGetTargets,
   debuggerSendCommand,
   getAllNavigationFrames,
+  getSelectedContentFrameSnapshot,
   getTab,
   isTabUrlScriptable,
   queryActiveTab,
@@ -57,12 +58,34 @@ import type {
   BrowserRealtimeActivityResult,
 } from "../shared/pageDiagnostics";
 import type {
+  BrowserRuntimeError,
+  BrowserRuntimeErrorsInput,
+  BrowserRuntimeErrorsResult,
   GeneratedSourceLocation,
+  RuntimeErrorStackFrame,
   SourceMapResolution,
 } from "../shared/sourceLocation";
 import {
+  DEBUG_EXECUTION_LIMITS,
+  type BrowserDebugBreakpoint,
+  type BrowserDebugBreakpointInput,
+  type BrowserDebugBreakpointResult,
+  type BrowserDebugCallFrame,
+  type BrowserDebugControlInput,
+  type BrowserDebugControlResult,
+  type BrowserDebugEvaluateInput,
+  type BrowserDebugEvaluateResult,
+  type BrowserDebugException,
+  type BrowserDebugPauseOnExceptionsState,
+  type BrowserDebugPausedState,
+  type BrowserDebugRemoteObject,
+} from "../shared/debugExecution";
+import {
+  MAX_SOURCE_MAP_BYTES,
   resolveSourceMapLocation,
+  SOURCE_MAP_TIMEOUT_MS,
   type LoadedScriptMetadata,
+  type SourceMapLoadContext,
 } from "./sourceMapResolver";
 import {
   buildNetworkActivityDigest,
@@ -87,6 +110,7 @@ import {
   trustedReplaceSelectionEvents,
   type TrustedKeyEventParams,
 } from "../shared/trustedKeyboard";
+import { selectRuntimeErrorWindow } from "../shared/runtimeErrorCursor";
 import {
   createOopifAutoAttachParams,
   frameOwnerContentOrigin,
@@ -101,12 +125,16 @@ import {
   selectPageTargetInfo,
   topLevelDebuggerTarget,
 } from "./debuggerTargetRouting";
+import { getTargetNavigationState } from "./targetNavigation";
 
 const PROTOCOL_VERSION = "1.3";
 const DEFAULT_MAX_NETWORK_ENTRIES = 2_000;
 const MAX_RESPONSE_BODY_CHARS = 120_000;
 const MAX_PROXY_HITS = 300;
 const MAX_CONSOLE_MESSAGES = 500;
+const MAX_RUNTIME_ERRORS = 500;
+const MAX_CAPTURED_RUNTIME_STACK_FRAMES = 24;
+const MAX_RUNTIME_ERROR_TEXT_CHARS = 4_000;
 const MAX_CHILD_DEBUGGER_SESSIONS = 128;
 const PROXY_STATE_STORAGE_KEY = "aiDevtools.proxyState";
 const PROXY_HITS_STORAGE_KEY = "aiDevtools.proxyHits";
@@ -229,6 +257,15 @@ interface ConsoleMessageRecord extends BrowserConsoleMessage {
   timestampMs: number;
 }
 
+interface CapturedRuntimeStackFrame extends RuntimeErrorStackFrame {
+  debuggerTargetKey: string;
+}
+
+interface RuntimeErrorRecord extends Omit<BrowserRuntimeError, "frames"> {
+  timestampMs: number;
+  frames: CapturedRuntimeStackFrame[];
+}
+
 interface RealtimeWebSocketRecord {
   requestId: string;
   url?: string;
@@ -269,9 +306,29 @@ interface NetworkSession {
   requests: Map<string, NetworkRequestRecord>;
   requestOrder: string[];
   consoleMessages: ConsoleMessageRecord[];
+  runtimeErrorMonitoringActive: boolean;
+  runtimeErrorStreamId: string;
+  runtimeErrorSequence: number;
+  droppedRuntimeErrorCount: number;
+  runtimeErrors: RuntimeErrorRecord[];
   scripts: Map<string, LoadedScriptMetadata>;
+  scriptsById: Map<string, LoadedScriptMetadata>;
+  breakpoints: Map<string, StoredDebugBreakpoint>;
+  pausedTargets: Map<string, BrowserDebugPausedState>;
+  pauseOnExceptions: Map<string, BrowserDebugPauseOnExceptionsState>;
   webSockets: Map<string, RealtimeWebSocketRecord>;
   eventSources: Map<string, RealtimeEventSourceRecord>;
+}
+
+interface StoredDebugBreakpoint extends BrowserDebugBreakpoint {
+  debuggerTargetKey: string;
+}
+
+interface SelectedDebugTarget {
+  tabId: number;
+  frameId: number;
+  documentId?: string;
+  target: DebuggerTarget;
 }
 
 interface ChildDebuggerSession {
@@ -365,7 +422,620 @@ export async function resolveGeneratedSourceLocation(
   const session = await ensureDebuggerSession();
   await ensureDebuggerEnabled(session);
   const script = session.scripts.get(generated.url);
-  return resolveSourceMapLocation(script, generated, includeExcerpt);
+  return resolveSourceMapLocation(
+    script,
+    generated,
+    includeExcerpt,
+    createSourceMapLoadContext(session, session.target, script),
+  );
+}
+
+export async function evaluatePageJavaScript(
+  input: BrowserDebugEvaluateInput,
+): Promise<BrowserDebugEvaluateResult> {
+  const selected = await resolveSelectedDebugTarget();
+  const session = requireActiveDebugSession(selected.tabId);
+  await ensureRuntimeEnabled(session);
+  const objectGroup = `ai-devtools-evaluate-${Date.now().toString(36)}`;
+  const startedAt = Date.now();
+  try {
+    const response = await debuggerSendCommand<
+      {
+        expression: string;
+        objectGroup: string;
+        includeCommandLineAPI: boolean;
+        silent: boolean;
+        returnByValue: boolean;
+        generatePreview: boolean;
+        userGesture: boolean;
+        awaitPromise: boolean;
+        throwOnSideEffect: boolean;
+        timeout: number;
+        disableBreaks: boolean;
+        replMode: boolean;
+        allowUnsafeEvalBlockedByCSP: boolean;
+      },
+      RuntimeEvaluationResponse
+    >(selected.target, "Runtime.evaluate", {
+      expression: evaluationExpression(input),
+      objectGroup,
+      includeCommandLineAPI: true,
+      silent: false,
+      returnByValue: true,
+      generatePreview: true,
+      userGesture: false,
+      awaitPromise: input.awaitPromise ?? true,
+      throwOnSideEffect: input.throwOnSideEffect ?? false,
+      timeout: input.timeoutMs ?? 5_000,
+      disableBreaks: input.allowBreakpoints !== true,
+      replMode: input.replMode ?? false,
+      allowUnsafeEvalBlockedByCSP: true,
+    });
+    const exception = toDebugException(response.exceptionDetails);
+    return {
+      evaluated: exception === undefined,
+      tabId: selected.tabId,
+      frameId: selected.frameId,
+      ...(selected.documentId ? { documentId: selected.documentId } : {}),
+      elapsedMs: Date.now() - startedAt,
+      result: toDebugRemoteObject(response.result),
+      ...(exception ? { exception } : {}),
+    };
+  } finally {
+    await debuggerSendCommand(
+      selected.target,
+      "Runtime.releaseObjectGroup",
+      { objectGroup },
+    ).catch(() => undefined);
+  }
+}
+
+export async function manageJavaScriptBreakpoint(
+  input: BrowserDebugBreakpointInput,
+): Promise<BrowserDebugBreakpointResult> {
+  const selected = await resolveSelectedDebugTarget();
+  const session = requireActiveDebugSession(selected.tabId);
+  await ensureDebuggerEnabled(session);
+  const targetKey = debuggerTargetIdentity(selected.target);
+
+  if (input.action === "list") {
+    return breakpointResult("list", session, selected.tabId, targetKey);
+  }
+
+  if (input.action === "remove") {
+    const stored = findStoredBreakpoint(
+      session,
+      targetKey,
+      input.breakpointId ?? "",
+    );
+    if (!stored) {
+      throw new Error(
+        `BREAKPOINT_NOT_FOUND: ${input.breakpointId ?? "missing breakpointId"} is not owned by the selected page frame.`,
+      );
+    }
+    await debuggerSendCommand(selected.target, "Debugger.removeBreakpoint", {
+      breakpointId: stored.breakpointId,
+    });
+    session.breakpoints.delete(storedBreakpointKey(stored));
+    return {
+      ...breakpointResult("remove", session, selected.tabId, targetKey),
+      removedBreakpointId: stored.breakpointId,
+    };
+  }
+
+  if (session.breakpoints.size >= DEBUG_EXECUTION_LIMITS.breakpoints) {
+    throw new Error(
+      `BREAKPOINT_LIMIT_REACHED: at most ${DEBUG_EXECUTION_LIMITS.breakpoints} active breakpoints are retained.`,
+    );
+  }
+  const response = await debuggerSendCommand<
+    {
+      lineNumber: number;
+      columnNumber: number;
+      condition?: string;
+      url?: string;
+      urlRegex?: string;
+    },
+    DebuggerSetBreakpointByUrlResponse
+  >(selected.target, "Debugger.setBreakpointByUrl", {
+    lineNumber: (input.lineNumber ?? 1) - 1,
+    columnNumber: input.columnNumber ?? 0,
+    ...(input.condition ? { condition: input.condition } : {}),
+    ...(input.url ? { url: input.url } : {}),
+    ...(input.urlRegex ? { urlRegex: input.urlRegex } : {}),
+  });
+  const breakpoint: StoredDebugBreakpoint = {
+    breakpointId: response.breakpointId,
+    ...(input.url ? { url: input.url } : {}),
+    ...(input.urlRegex ? { urlRegex: input.urlRegex } : {}),
+    lineNumber: input.lineNumber ?? 1,
+    columnNumber: input.columnNumber ?? 0,
+    ...(input.condition ? { condition: input.condition } : {}),
+    resolvedLocations: (response.locations ?? []).map(toPublicBreakpointLocation),
+    createdAt: new Date().toISOString(),
+    debuggerTargetKey: targetKey,
+  };
+  session.breakpoints.set(storedBreakpointKey(breakpoint), breakpoint);
+  return {
+    ...breakpointResult("set", session, selected.tabId, targetKey),
+    breakpoint: publicBreakpoint(breakpoint),
+  };
+}
+
+export async function controlJavaScriptDebugger(
+  input: BrowserDebugControlInput,
+): Promise<BrowserDebugControlResult> {
+  const selected = await resolveSelectedDebugTarget();
+  const session = requireActiveDebugSession(selected.tabId);
+  await ensureDebuggerEnabled(session);
+  const targetKey = debuggerTargetIdentity(selected.target);
+
+  if (input.action === "pause") {
+    await debuggerSendCommand(selected.target, "Debugger.pause", {});
+    if (!(await waitForDebuggerPause(session, targetKey))) {
+      throw new Error(
+        "DEBUGGER_PAUSE_TIMEOUT: Chrome did not report a paused state for the selected page frame.",
+      );
+    }
+  } else if (input.action === "resume") {
+    requirePausedTarget(session, targetKey);
+    await debuggerSendCommand(selected.target, "Debugger.resume", {});
+    session.pausedTargets.delete(targetKey);
+  } else if (
+    input.action === "step_over" ||
+    input.action === "step_into" ||
+    input.action === "step_out"
+  ) {
+    requirePausedTarget(session, targetKey);
+    const method =
+      input.action === "step_over"
+        ? "Debugger.stepOver"
+        : input.action === "step_into"
+          ? "Debugger.stepInto"
+          : "Debugger.stepOut";
+    await debuggerSendCommand(selected.target, method, {});
+    session.pausedTargets.delete(targetKey);
+    await waitForDebuggerPause(session, targetKey);
+  } else if (input.action === "set_pause_on_exceptions") {
+    const state = input.pauseOnExceptions ?? "none";
+    await debuggerSendCommand(selected.target, "Debugger.setPauseOnExceptions", {
+      state,
+    });
+    session.pauseOnExceptions.set(targetKey, state);
+  } else if (input.action === "evaluate_on_call_frame") {
+    const paused = requirePausedTarget(session, targetKey);
+    const callFrameId = input.callFrameId ?? "";
+    if (!paused.callFrames.some((frame) => frame.callFrameId === callFrameId)) {
+      throw new Error(
+        "STALE_CALL_FRAME: callFrameId is not part of the current pause. Read debugger status again.",
+      );
+    }
+    const objectGroup = `ai-devtools-call-frame-${Date.now().toString(36)}`;
+    try {
+      const response = await debuggerSendCommand<
+        {
+          callFrameId: string;
+          expression: string;
+          objectGroup: string;
+          includeCommandLineAPI: boolean;
+          silent: boolean;
+          returnByValue: boolean;
+          generatePreview: boolean;
+          throwOnSideEffect: boolean;
+          timeout: number;
+        },
+        RuntimeEvaluationResponse
+      >(selected.target, "Debugger.evaluateOnCallFrame", {
+        callFrameId,
+        expression: input.expression ?? "",
+        objectGroup,
+        includeCommandLineAPI: true,
+        silent: false,
+        returnByValue: true,
+        generatePreview: true,
+        throwOnSideEffect: input.throwOnSideEffect ?? false,
+        timeout: input.timeoutMs ?? 5_000,
+      });
+      const exception = toDebugException(response.exceptionDetails);
+      return debugControlResult(input.action, session, selected, targetKey, {
+        evaluation: toDebugRemoteObject(response.result),
+        ...(exception ? { exception } : {}),
+      });
+    } finally {
+      await debuggerSendCommand(
+        selected.target,
+        "Runtime.releaseObjectGroup",
+        { objectGroup },
+      ).catch(() => undefined);
+    }
+  }
+
+  return debugControlResult(input.action, session, selected, targetKey);
+}
+
+function evaluationExpression(input: BrowserDebugEvaluateInput): string {
+  if (!input.selector) {
+    return input.expression;
+  }
+  return `(async function(element) { return (${input.expression}); })(document.querySelector(${JSON.stringify(input.selector)}))`;
+}
+
+async function resolveSelectedDebugTarget(): Promise<SelectedDebugTarget> {
+  const tab = await queryActiveTab();
+  if (!tab?.id) {
+    throw new Error("No active task-bound tab is available.");
+  }
+  const before = getSelectedContentFrameSnapshot(tab.id);
+  if (!before?.documentId) {
+    throw new Error(
+      "STALE_CONTEXT: the selected page frame has no current document binding. Observe the page again before debugging.",
+    );
+  }
+  const navigationBefore = getTargetNavigationState(tab.id, false);
+  const trusted = await ensureTrustedInputSession({
+    tabId: tab.id,
+    frameId: before.frameId,
+    documentId: before.documentId,
+  });
+  const after = getSelectedContentFrameSnapshot(tab.id);
+  const navigationAfter = getTargetNavigationState(tab.id, false);
+  if (
+    !after ||
+    after.frameId !== before.frameId ||
+    after.documentId !== before.documentId ||
+    navigationAfter.navigationId !== navigationBefore.navigationId ||
+    navigationAfter.revision !== navigationBefore.revision
+  ) {
+    throw new Error(
+      "STALE_CONTEXT: the selected page frame changed before debugger execution. Observe the page and request a fresh approval.",
+    );
+  }
+  return {
+    tabId: tab.id,
+    frameId: after.frameId,
+    documentId: after.documentId,
+    target: trusted.target,
+  };
+}
+
+function requireActiveDebugSession(tabId: number): NetworkSession {
+  if (!activeSession?.attached || activeSession.tabId !== tabId) {
+    throw new Error(
+      "DEBUGGER_SESSION_UNAVAILABLE: the exact selected tab is not attached.",
+    );
+  }
+  return activeSession;
+}
+
+async function ensureRuntimeEnabled(session: NetworkSession): Promise<void> {
+  if (session.runtimeEnabled) {
+    return;
+  }
+  for (const target of allDebuggerTargets(session)) {
+    await debuggerSendCommand(target, "Runtime.enable", {});
+  }
+  session.runtimeEnabled = true;
+}
+
+function breakpointResult(
+  action: BrowserDebugBreakpointInput["action"],
+  session: NetworkSession,
+  tabId: number,
+  targetKey: string,
+): BrowserDebugBreakpointResult {
+  return {
+    action,
+    tabId,
+    breakpoints: [...session.breakpoints.values()]
+      .filter((entry) => entry.debuggerTargetKey === targetKey)
+      .map(publicBreakpoint),
+  };
+}
+
+function publicBreakpoint(
+  value: StoredDebugBreakpoint,
+): BrowserDebugBreakpoint {
+  const { debuggerTargetKey: _targetKey, ...result } = value;
+  return result;
+}
+
+function storedBreakpointKey(value: StoredDebugBreakpoint): string {
+  return `${value.debuggerTargetKey}:${value.breakpointId}`;
+}
+
+function findStoredBreakpoint(
+  session: NetworkSession,
+  targetKey: string,
+  breakpointId: string,
+): StoredDebugBreakpoint | undefined {
+  return [...session.breakpoints.values()].find(
+    (entry) =>
+      entry.debuggerTargetKey === targetKey &&
+      entry.breakpointId === breakpointId,
+  );
+}
+
+function toPublicBreakpointLocation(
+  location: DebuggerLocation,
+): BrowserDebugBreakpoint["resolvedLocations"][number] {
+  return {
+    scriptId: location.scriptId,
+    lineNumber: location.lineNumber + 1,
+    columnNumber: location.columnNumber ?? 0,
+  };
+}
+
+function requirePausedTarget(
+  session: NetworkSession,
+  targetKey: string,
+): BrowserDebugPausedState {
+  const state = session.pausedTargets.get(targetKey);
+  if (!state) {
+    throw new Error(
+      "DEBUGGER_NOT_PAUSED: the selected page frame is not currently paused.",
+    );
+  }
+  return state;
+}
+
+async function waitForDebuggerPause(
+  session: NetworkSession,
+  targetKey: string,
+): Promise<boolean> {
+  const deadline = Date.now() + 2_000;
+  while (!session.pausedTargets.has(targetKey) && Date.now() < deadline) {
+    await delayMs(10);
+  }
+  return session.pausedTargets.has(targetKey);
+}
+
+function debugControlResult(
+  action: BrowserDebugControlInput["action"],
+  session: NetworkSession,
+  selected: SelectedDebugTarget,
+  targetKey: string,
+  extra: Pick<
+    BrowserDebugControlResult,
+    "evaluation" | "exception"
+  > = {},
+): BrowserDebugControlResult {
+  const state = session.pausedTargets.get(targetKey);
+  return {
+    action,
+    tabId: selected.tabId,
+    frameId: selected.frameId,
+    ...(selected.documentId ? { documentId: selected.documentId } : {}),
+    paused: Boolean(state),
+    pauseOnExceptions: session.pauseOnExceptions.get(targetKey) ?? "none",
+    ...(state ? { state } : {}),
+    ...extra,
+  };
+}
+
+function toDebugRemoteObject(
+  remote: RuntimeRemoteObject,
+): BrowserDebugRemoteObject {
+  let value = remote.value;
+  let truncated = false;
+  if (value !== undefined) {
+    try {
+      const serialized = JSON.stringify(value);
+      if (serialized.length > DEBUG_EXECUTION_LIMITS.valueChars) {
+        value = `${serialized.slice(0, DEBUG_EXECUTION_LIMITS.valueChars)}…[truncated]`;
+        truncated = true;
+      }
+    } catch {
+      value = undefined;
+      truncated = true;
+    }
+  }
+  const description = boundedDebugText(remote.description);
+  const preview = remote.preview?.properties
+    ?.slice(0, DEBUG_EXECUTION_LIMITS.previewProperties)
+    .map((property) => ({
+      name: boundedDebugText(property.name, 500) ?? "",
+      type: property.type,
+      ...(property.value !== undefined
+        ? { value: boundedDebugText(property.value, 2_000) }
+        : {}),
+      ...(property.subtype ? { subtype: property.subtype } : {}),
+    }));
+  return {
+    type: remote.type,
+    ...(remote.subtype ? { subtype: remote.subtype } : {}),
+    ...(remote.className ? { className: remote.className } : {}),
+    ...(value !== undefined ? { value } : {}),
+    ...(remote.unserializableValue
+      ? { unserializableValue: remote.unserializableValue }
+      : {}),
+    ...(description ? { description } : {}),
+    ...(preview?.length ? { preview } : {}),
+    truncated:
+      truncated ||
+      (remote.preview?.overflow === true) ||
+      (remote.preview?.properties?.length ?? 0) >
+        DEBUG_EXECUTION_LIMITS.previewProperties,
+  };
+}
+
+function toDebugException(
+  details: RuntimeExceptionDetails | undefined,
+): BrowserDebugException | undefined {
+  if (!details) {
+    return undefined;
+  }
+  return {
+    text: boundedDebugText(details.text) ?? "JavaScript evaluation failed.",
+    ...(details.url ? { url: boundedDebugText(details.url, 8_000) } : {}),
+    ...(details.lineNumber !== undefined
+      ? { lineNumber: details.lineNumber + 1 }
+      : {}),
+    ...(details.columnNumber !== undefined
+      ? { columnNumber: details.columnNumber }
+      : {}),
+    ...(details.exception?.description
+      ? { description: boundedDebugText(details.exception.description) }
+      : {}),
+  };
+}
+
+function boundedDebugText(
+  value: string | undefined,
+  maxChars = 4_000,
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return value.length <= maxChars
+    ? value
+    : `${value.slice(0, maxChars)}…[truncated]`;
+}
+
+function createSourceMapLoadContext(
+  session: NetworkSession,
+  target: DebuggerTarget,
+  script: LoadedScriptMetadata | undefined,
+): SourceMapLoadContext {
+  const scriptIdentity =
+    script?.hash || script?.buildId || script?.scriptId || "unknown-script";
+  return {
+    cachePartition: `${session.tabId}:${debuggerTargetIdentity(target)}:${scriptIdentity}`,
+    loadText: (mapUrl) =>
+      withSourceMapTimeout(loadSourceMapThroughDebugger(target, mapUrl)),
+  };
+}
+
+async function withSourceMapTimeout<T>(pending: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Source Map load timed out after 8 seconds.")),
+          SOURCE_MAP_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+async function loadSourceMapThroughDebugger(
+  target: DebuggerTarget,
+  mapUrl: string,
+): Promise<string> {
+  const frameTree = await debuggerSendCommand<
+    Record<string, never>,
+    { frameTree?: { frame?: { id?: string } } }
+  >(target, "Page.getFrameTree", {});
+  const frameId = frameTree.frameTree?.frame?.id;
+  if (!frameId) {
+    throw new Error("CDP did not return a frame for Source Map loading.");
+  }
+  const response = await debuggerSendCommand<
+    {
+      frameId: string;
+      url: string;
+      options: { disableCache: boolean; includeCredentials: boolean };
+    },
+    {
+      resource?: {
+        success?: boolean;
+        netError?: number;
+        netErrorName?: string;
+        httpStatusCode?: number;
+        stream?: string;
+      };
+    }
+  >(target, "Network.loadNetworkResource", {
+    frameId,
+    url: mapUrl,
+    options: {
+      disableCache: false,
+      includeCredentials: false,
+    },
+  });
+  const resource = response.resource;
+  if (
+    resource?.success !== true ||
+    (resource.httpStatusCode !== undefined &&
+      resource.httpStatusCode >= 400) ||
+    !resource.stream
+  ) {
+    const detail =
+      resource?.netErrorName ||
+      (resource?.httpStatusCode !== undefined
+        ? `HTTP ${resource.httpStatusCode}`
+        : resource?.netError !== undefined
+          ? `network error ${resource.netError}`
+          : "no readable stream");
+    throw new Error(`CDP Source Map load failed: ${detail}.`);
+  }
+  return readDebuggerTextStream(target, resource.stream);
+}
+
+async function readDebuggerTextStream(
+  target: DebuggerTarget,
+  handle: string,
+): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let emptyReads = 0;
+  try {
+    while (true) {
+      const result = await debuggerSendCommand<
+        { handle: string; size: number },
+        { data?: string; base64Encoded?: boolean; eof?: boolean }
+      >(target, "IO.read", {
+        handle,
+        size: 64 * 1024,
+      });
+      const data = result.data ?? "";
+      const bytes = result.base64Encoded
+        ? decodeBase64Bytes(data)
+        : new TextEncoder().encode(data);
+      if (bytes.byteLength > 0) {
+        chunks.push(bytes);
+        totalBytes += bytes.byteLength;
+        emptyReads = 0;
+      } else {
+        emptyReads += 1;
+      }
+      if (totalBytes > MAX_SOURCE_MAP_BYTES) {
+        throw new Error("Source map exceeds the 16 MiB limit.");
+      }
+      if (result.eof === true) {
+        break;
+      }
+      if (emptyReads >= 3) {
+        throw new Error("CDP Source Map stream stopped making progress.");
+      }
+    }
+  } finally {
+    await debuggerSendCommand(target, "IO.close", { handle }).catch(
+      () => undefined,
+    );
+  }
+  const output = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(output);
+}
+
+function decodeBase64Bytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 interface StoredProxyState {
@@ -979,6 +1649,77 @@ export async function listConsoleMessages(
   };
 }
 
+export async function startRuntimeErrorMonitoring(
+  preserveLog = false,
+): Promise<{ streamId: string; sequence: number }> {
+  const session = await ensureDebuggerSession();
+  if (!session.runtimeErrorMonitoringActive && !preserveLog) {
+    resetRuntimeErrorStream(session);
+  }
+  await Promise.all([
+    ensureConsoleEnabled(session),
+    ensureDebuggerEnabled(session),
+  ]);
+  session.runtimeErrorMonitoringActive = true;
+  return {
+    streamId: session.runtimeErrorStreamId,
+    sequence: session.runtimeErrorSequence,
+  };
+}
+
+export function stopRuntimeErrorMonitoring(): void {
+  if (activeSession) {
+    activeSession.runtimeErrorMonitoringActive = false;
+  }
+}
+
+export async function listRuntimeErrors(
+  input: BrowserRuntimeErrorsInput,
+): Promise<BrowserRuntimeErrorsResult> {
+  const session = await ensureDebuggerSession();
+  await startRuntimeErrorMonitoring(true);
+
+  const window = selectRuntimeErrorWindow(
+    session.runtimeErrors,
+    session.runtimeErrorStreamId,
+    session.runtimeErrorSequence,
+    input,
+  );
+  const maxFrames = input.maxFramesPerError ?? 8;
+  const errors = await Promise.all(
+    window.selected.map((error) =>
+      materializeRuntimeError(
+        session,
+        error,
+        maxFrames,
+        input.includeSourceExcerpt === true,
+      ),
+    ),
+  );
+
+  return {
+    version: "browser-runtime-errors-v1",
+    attached: session.attached,
+    tabId: session.tabId,
+    cursorStatus: window.cursorStatus,
+    cursor: {
+      streamId: session.runtimeErrorStreamId,
+      sequence: window.effectiveAfter,
+    },
+    nextCursor: {
+      streamId: session.runtimeErrorStreamId,
+      sequence: window.nextSequence,
+    },
+    oldestSequence: window.oldestSequence,
+    latestSequence: window.latestSequence,
+    missedEvents: window.missedEvents,
+    droppedEvents: session.droppedRuntimeErrorCount,
+    total: window.candidates.length,
+    returned: errors.length,
+    errors,
+  };
+}
+
 export async function startNetworkDebugger(
   input: DebuggerNetworkStartInput,
 ): Promise<DebuggerNetworkStatus> {
@@ -1164,6 +1905,7 @@ export async function detachDebugger(
 
   manualDebuggerDetachTabIds.add(tabId);
   if (activeSession?.tabId === tabId && activeSession.attached) {
+    await resumePausedDebugTargets(activeSession);
     await debuggerDetach(activeSession.target).catch((error) => {
       manualDebuggerDetachTabIds.delete(tabId);
       throw error;
@@ -1203,6 +1945,9 @@ function registerDebuggerListeners(): void {
     session.networkEnabled = false;
     session.fetchEnabled = false;
     session.oopifAutoAttachEnabled = false;
+    session.breakpoints.clear();
+    session.pausedTargets.clear();
+    session.pauseOnExceptions.clear();
     if (shouldRespectManualDebuggerDetach(session.tabId, reason)) {
       void stopProxyAfterManualDebuggerDetach(session.tabId, reason);
       return;
@@ -1439,16 +2184,109 @@ function handleDebuggerEvent(
       handleEventSourceMessage(params as NetworkEventSourceMessageEvent);
       break;
     case "Runtime.consoleAPICalled":
-      handleRuntimeConsoleAPICalled(params as RuntimeConsoleApiCalledEvent);
+      handleRuntimeConsoleAPICalled(
+        source,
+        params as RuntimeConsoleApiCalledEvent,
+      );
+      break;
+    case "Runtime.exceptionThrown":
+      handleRuntimeExceptionThrown(
+        source,
+        params as RuntimeExceptionThrownEvent,
+      );
+      break;
+    case "Runtime.exceptionRevoked":
+      handleRuntimeExceptionRevoked(params as RuntimeExceptionRevokedEvent);
       break;
     case "Log.entryAdded":
       handleLogEntryAdded(params as LogEntryAddedEvent);
       break;
     case "Debugger.scriptParsed":
-      handleScriptParsed(params as DebuggerScriptParsedEvent);
+      handleScriptParsed(source, params as DebuggerScriptParsedEvent);
+      break;
+    case "Debugger.paused":
+      handleDebuggerPaused(source, params as DebuggerPausedEvent);
+      break;
+    case "Debugger.resumed":
+      activeSession.pausedTargets.delete(debuggerTargetIdentity(source));
+      break;
+    case "Debugger.breakpointResolved":
+      handleDebuggerBreakpointResolved(
+        source,
+        params as DebuggerBreakpointResolvedEvent,
+      );
       break;
     default:
       break;
+  }
+}
+
+function handleDebuggerPaused(
+  source: DebuggerTarget,
+  event: DebuggerPausedEvent,
+): void {
+  const session = activeSession;
+  if (!session || !sourceMatchesSession(source, session)) {
+    return;
+  }
+  const callFrames = event.callFrames
+    .slice(0, DEBUG_EXECUTION_LIMITS.callFrames)
+    .map((frame): BrowserDebugCallFrame => {
+      const script = session.scriptsById.get(frame.location.scriptId);
+      return {
+        callFrameId: frame.callFrameId,
+        functionName:
+          boundedDebugText(frame.functionName, 1_000) || "(anonymous)",
+        ...(frame.url || script?.url
+          ? { url: boundedDebugText(frame.url || script?.url, 8_000) }
+          : {}),
+        scriptId: frame.location.scriptId,
+        lineNumber: frame.location.lineNumber + 1,
+        columnNumber: frame.location.columnNumber ?? 0,
+        scopeTypes: frame.scopeChain
+          .slice(0, 20)
+          .map((scope) => scope.type),
+      };
+    });
+  session.pausedTargets.set(debuggerTargetIdentity(source), {
+    paused: true,
+    reason: boundedDebugText(event.reason, 500) ?? "other",
+    hitBreakpoints: (event.hitBreakpoints ?? []).slice(
+      0,
+      DEBUG_EXECUTION_LIMITS.breakpoints,
+    ),
+    callFrames,
+    pausedAt: new Date().toISOString(),
+  });
+}
+
+function handleDebuggerBreakpointResolved(
+  source: DebuggerTarget,
+  event: DebuggerBreakpointResolvedEvent,
+): void {
+  const session = activeSession;
+  if (!session || !sourceMatchesSession(source, session)) {
+    return;
+  }
+  const targetKey = debuggerTargetIdentity(source);
+  const stored = findStoredBreakpoint(
+    session,
+    targetKey,
+    event.breakpointId,
+  );
+  if (!stored) {
+    return;
+  }
+  const resolved = toPublicBreakpointLocation(event.location);
+  if (
+    !stored.resolvedLocations.some(
+      (location) =>
+        location.scriptId === resolved.scriptId &&
+        location.lineNumber === resolved.lineNumber &&
+        location.columnNumber === resolved.columnNumber,
+    )
+  ) {
+    stored.resolvedLocations.push(resolved);
   }
 }
 
@@ -1665,7 +2503,20 @@ function handleDetachedFromTarget(event: TargetDetachedFromTargetEvent): void {
   if (!event.sessionId) {
     return;
   }
+  const childTarget = childDebuggerSessions.get(event.sessionId)?.target;
+  const detachedTargetKey = childTarget
+    ? debuggerTargetIdentity(childTarget)
+    : undefined;
   childDebuggerSessions.delete(event.sessionId);
+  if (activeSession && detachedTargetKey) {
+    activeSession.pausedTargets.delete(detachedTargetKey);
+    activeSession.pauseOnExceptions.delete(detachedTargetKey);
+    for (const [key, breakpoint] of activeSession.breakpoints) {
+      if (breakpoint.debuggerTargetKey === detachedTargetKey) {
+        activeSession.breakpoints.delete(key);
+      }
+    }
+  }
   childRouteRefreshGeneration += 1;
   for (const [frameId, route] of childDebuggerRoutes) {
     if (route.sessionId === event.sessionId) {
@@ -1710,6 +2561,7 @@ async function ensureDebuggerSessionForTab(
         `ACTIVITY_MONITOR_CONFLICT: Tab ${debuggerActivityMonitorTabId} owns the active Network/Console monitor. Stop that monitor before attaching Chrome debugger to Tab ${tab.id}.`,
       );
     }
+    await resumePausedDebugTargets(activeSession);
     await debuggerDetach(activeSession.target).catch(() => undefined);
     clearChildDebuggerSessions();
     activeSession = null;
@@ -1736,7 +2588,16 @@ async function ensureDebuggerSessionForTab(
       requests: new Map(),
       requestOrder: [],
       consoleMessages: [],
+      runtimeErrorMonitoringActive: false,
+      runtimeErrorStreamId: createRuntimeErrorStreamId(),
+      runtimeErrorSequence: 0,
+      droppedRuntimeErrorCount: 0,
+      runtimeErrors: [],
       scripts: new Map(),
+      scriptsById: new Map(),
+      breakpoints: new Map(),
+      pausedTargets: new Map(),
+      pauseOnExceptions: new Map(),
       webSockets: new Map(),
       eventSources: new Map(),
     };
@@ -1878,6 +2739,15 @@ function allDebuggerTargets(session: NetworkSession): DebuggerTarget[] {
   ]);
 }
 
+function findDebuggerTargetByIdentity(
+  session: NetworkSession,
+  identity: string,
+): DebuggerTarget | undefined {
+  return allDebuggerTargets(session).find(
+    (target) => debuggerTargetIdentity(target) === identity,
+  );
+}
+
 async function ensureNetworkEnabled(session: NetworkSession): Promise<void> {
   if (session.networkEnabled) {
     return;
@@ -1914,6 +2784,19 @@ async function ensureDebuggerEnabled(session: NetworkSession): Promise<void> {
     await debuggerSendCommand(target, "Debugger.enable", {});
   }
   session.debuggerEnabled = true;
+}
+
+async function resumePausedDebugTargets(session: NetworkSession): Promise<void> {
+  for (const target of allDebuggerTargets(session)) {
+    const targetKey = debuggerTargetIdentity(target);
+    if (!session.pausedTargets.has(targetKey)) {
+      continue;
+    }
+    await debuggerSendCommand(target, "Debugger.resume", {}).catch(
+      () => undefined,
+    );
+    session.pausedTargets.delete(targetKey);
+  }
 }
 
 async function applyFetchInterception(session: NetworkSession): Promise<void> {
@@ -3026,6 +3909,7 @@ function normalizeScreenshotClip(clip: ScreenshotClip): ScreenshotClip {
 }
 
 function handleRuntimeConsoleAPICalled(
+  source: DebuggerTarget,
   event: RuntimeConsoleApiCalledEvent,
 ): void {
   const session = activeSession;
@@ -3046,22 +3930,107 @@ function handleRuntimeConsoleAPICalled(
     timestamp: new Date(timestampMs).toISOString(),
     timestampMs,
   });
+  if (
+    session.runtimeErrorMonitoringActive &&
+    (event.type === "error" ||
+      event.type === "assert" ||
+      event.type === "warning" ||
+      event.type === "warn")
+  ) {
+    pushRuntimeError(session, {
+      kind: "console",
+      level:
+        event.type === "warning" || event.type === "warn"
+          ? "warning"
+          : "error",
+      text: event.args.map(remoteObjectText).join(" "),
+      timestampMs,
+      frames: captureRuntimeStackFrames(
+        session,
+        source,
+        event.stackTrace,
+      ),
+    });
+  }
 }
 
-function handleScriptParsed(event: DebuggerScriptParsedEvent): void {
+function handleRuntimeExceptionThrown(
+  source: DebuggerTarget,
+  event: RuntimeExceptionThrownEvent,
+): void {
+  const session = activeSession;
+  if (!session?.runtimeErrorMonitoringActive) {
+    return;
+  }
+  const details = event.exceptionDetails;
+  const timestampMs = event.timestamp ?? Date.now();
+  const frames = captureRuntimeStackFrames(
+    session,
+    source,
+    details.stackTrace,
+  );
+  if (frames.length === 0) {
+    const fallback = runtimeExceptionFallbackFrame(session, source, details);
+    if (fallback) {
+      frames.push(fallback);
+    }
+  }
+  pushRuntimeError(session, {
+    kind: "exception",
+    level: "error",
+    text: runtimeExceptionText(details),
+    timestampMs,
+    exceptionId: details.exceptionId,
+    frames,
+  });
+}
+
+function handleRuntimeExceptionRevoked(
+  event: RuntimeExceptionRevokedEvent,
+): void {
+  const session = activeSession;
+  if (!session) {
+    return;
+  }
+  for (let index = session.runtimeErrors.length - 1; index >= 0; index -= 1) {
+    const error = session.runtimeErrors[index];
+    if (error?.exceptionId === event.exceptionId) {
+      error.revoked = true;
+      break;
+    }
+  }
+}
+
+function handleScriptParsed(
+  source: DebuggerTarget,
+  event: DebuggerScriptParsedEvent,
+): void {
   const session = activeSession;
   if (!session || !event.url) {
     return;
   }
-  session.scripts.set(event.url, {
+  const script: LoadedScriptMetadata = {
     scriptId: event.scriptId,
     url: event.url,
     sourceMapURL: event.sourceMapURL,
-  });
+    hash: event.hash,
+    buildId: event.buildId,
+  };
+  session.scripts.set(event.url, script);
+  session.scriptsById.set(
+    loadedScriptKey(source, event.scriptId),
+    script,
+  );
   if (session.scripts.size > 2_000) {
     const oldest = session.scripts.keys().next().value;
     if (typeof oldest === "string") {
       session.scripts.delete(oldest);
+    }
+  }
+  if (session.scriptsById.size > 4_000) {
+    const oldest = session.scriptsById.keys().next().value;
+    if (typeof oldest === "string") {
+      session.scriptsById.delete(oldest);
     }
   }
 }
@@ -3105,6 +4074,226 @@ function pushConsoleMessage(
       },
     },
   });
+}
+
+function createRuntimeErrorStreamId(): string {
+  return `runtime-errors-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function resetRuntimeErrorStream(session: NetworkSession): void {
+  session.runtimeErrorStreamId = createRuntimeErrorStreamId();
+  session.runtimeErrorSequence = 0;
+  session.droppedRuntimeErrorCount = 0;
+  session.runtimeErrors = [];
+}
+
+function pushRuntimeError(
+  session: NetworkSession,
+  input: {
+    kind: BrowserRuntimeError["kind"];
+    level: BrowserRuntimeError["level"];
+    text: string;
+    timestampMs: number;
+    exceptionId?: number;
+    frames: CapturedRuntimeStackFrame[];
+  },
+): void {
+  const sequence = session.runtimeErrorSequence + 1;
+  session.runtimeErrorSequence = sequence;
+  session.runtimeErrors.push({
+    id: `runtime-error-${sequence.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    sequence,
+    kind: input.kind,
+    level: input.level,
+    text: input.text.slice(0, MAX_RUNTIME_ERROR_TEXT_CHARS),
+    timestamp: new Date(input.timestampMs).toISOString(),
+    timestampMs: input.timestampMs,
+    exceptionId: input.exceptionId,
+    frames: input.frames.slice(0, MAX_CAPTURED_RUNTIME_STACK_FRAMES),
+    framesOmitted: Math.max(
+      0,
+      input.frames.length - MAX_CAPTURED_RUNTIME_STACK_FRAMES,
+    ),
+  });
+  while (session.runtimeErrors.length > MAX_RUNTIME_ERRORS) {
+    session.runtimeErrors.shift();
+    session.droppedRuntimeErrorCount += 1;
+  }
+}
+
+function captureRuntimeStackFrames(
+  session: NetworkSession,
+  source: DebuggerTarget,
+  stack: RuntimeStackTrace | undefined,
+): CapturedRuntimeStackFrame[] {
+  const frames: CapturedRuntimeStackFrame[] = [];
+  let current = stack;
+  let depth = 0;
+  while (
+    current &&
+    depth < 8 &&
+    frames.length < MAX_CAPTURED_RUNTIME_STACK_FRAMES
+  ) {
+    for (const frame of current.callFrames ?? []) {
+      const script = findLoadedScript(
+        session,
+        source,
+        frame.scriptId,
+        frame.url,
+      );
+      const url = frame.url || script?.url;
+      if (!url) {
+        continue;
+      }
+      frames.push({
+        scriptId: frame.scriptId,
+        generated: {
+          url,
+          lineNumber: Math.max(0, Math.floor(frame.lineNumber ?? 0)),
+          columnNumber: Math.max(0, Math.floor(frame.columnNumber ?? 0)),
+          functionName: frame.functionName?.slice(0, 300),
+        },
+        asyncContext:
+          depth > 0
+            ? (current.description || "async").slice(0, 200)
+            : undefined,
+        debuggerTargetKey: debuggerTargetIdentity(source),
+      });
+      if (frames.length >= MAX_CAPTURED_RUNTIME_STACK_FRAMES) {
+        break;
+      }
+    }
+    current = current.parent;
+    depth += 1;
+  }
+  return frames;
+}
+
+function runtimeExceptionFallbackFrame(
+  session: NetworkSession,
+  source: DebuggerTarget,
+  details: RuntimeExceptionDetails,
+): CapturedRuntimeStackFrame | undefined {
+  const script = findLoadedScript(
+    session,
+    source,
+    details.scriptId,
+    details.url,
+  );
+  const url = details.url || script?.url;
+  if (!url) {
+    return undefined;
+  }
+  return {
+    scriptId: details.scriptId,
+    generated: {
+      url,
+      lineNumber: Math.max(0, Math.floor(details.lineNumber ?? 0)),
+      columnNumber: Math.max(0, Math.floor(details.columnNumber ?? 0)),
+    },
+    debuggerTargetKey: debuggerTargetIdentity(source),
+  };
+}
+
+function runtimeExceptionText(details: RuntimeExceptionDetails): string {
+  const detail =
+    details.exception === undefined
+      ? ""
+      : remoteObjectText(details.exception);
+  return (detail || details.text || "Unhandled JavaScript exception").slice(
+    0,
+    MAX_RUNTIME_ERROR_TEXT_CHARS,
+  );
+}
+
+function debuggerTargetIdentity(target: DebuggerTarget): string {
+  return (
+    target.sessionId ||
+    target.targetId ||
+    (target.tabId === undefined ? "unknown" : `tab:${target.tabId}`)
+  );
+}
+
+function loadedScriptKey(
+  target: DebuggerTarget | string,
+  scriptId: string,
+): string {
+  const targetKey =
+    typeof target === "string" ? target : debuggerTargetIdentity(target);
+  return `${targetKey}:${scriptId}`;
+}
+
+function findLoadedScript(
+  session: NetworkSession,
+  target: DebuggerTarget | string,
+  scriptId: string | undefined,
+  url: string | undefined,
+): LoadedScriptMetadata | undefined {
+  if (scriptId) {
+    const byId = session.scriptsById.get(loadedScriptKey(target, scriptId));
+    if (byId) {
+      return byId;
+    }
+  }
+  return url ? session.scripts.get(url) : undefined;
+}
+
+async function materializeRuntimeError(
+  session: NetworkSession,
+  error: RuntimeErrorRecord,
+  maxFrames: number,
+  includeSourceExcerpt: boolean,
+): Promise<BrowserRuntimeError> {
+  const frames = await Promise.all(
+    error.frames.slice(0, maxFrames).map(async (frame) => {
+      const script = findLoadedScript(
+        session,
+        frame.debuggerTargetKey,
+        frame.scriptId,
+        frame.generated.url,
+      );
+      const target = findDebuggerTargetByIdentity(
+        session,
+        frame.debuggerTargetKey,
+      );
+      const sourceMap = await resolveSourceMapLocation(
+        script,
+        frame.generated,
+        includeSourceExcerpt,
+        target
+          ? createSourceMapLoadContext(session, target, script)
+          : {
+              cachePartition: `${session.tabId}:${frame.debuggerTargetKey}:detached`,
+              loadText: async () => {
+                throw new Error(
+                  "The debugger target that produced this stack frame is no longer attached.",
+                );
+              },
+            },
+      );
+      const {
+        debuggerTargetKey: _debuggerTargetKey,
+        ...publicFrame
+      } = frame;
+      return {
+        ...publicFrame,
+        sourceMap,
+      };
+    }),
+  );
+  return {
+    id: error.id,
+    sequence: error.sequence,
+    kind: error.kind,
+    level: error.level,
+    text: error.text,
+    timestamp: error.timestamp,
+    exceptionId: error.exceptionId,
+    revoked: error.revoked,
+    frames,
+    framesOmitted:
+      error.framesOmitted + Math.max(0, error.frames.length - frames.length),
+  };
 }
 
 function consoleTypeToLevel(
@@ -3604,6 +4793,8 @@ interface DebuggerScriptParsedEvent {
   scriptId: string;
   url: string;
   sourceMapURL?: string;
+  hash?: string;
+  buildId?: string;
 }
 
 interface NetworkResponseReceivedEvent {
@@ -3692,9 +4883,25 @@ interface PageLayoutMetrics {
 
 interface RuntimeRemoteObject {
   type: string;
+  subtype?: string;
+  className?: string;
   value?: unknown;
   unserializableValue?: string;
   description?: string;
+  preview?: {
+    overflow?: boolean;
+    properties?: Array<{
+      name: string;
+      type: string;
+      value?: string;
+      subtype?: string;
+    }>;
+  };
+}
+
+interface RuntimeEvaluationResponse {
+  result: RuntimeRemoteObject;
+  exceptionDetails?: RuntimeExceptionDetails;
 }
 
 interface RuntimeConsoleApiCalledEvent {
@@ -3720,13 +4927,69 @@ interface RuntimeConsoleApiCalledEvent {
     | "timeEnd";
   args: RuntimeRemoteObject[];
   timestamp?: number;
-  stackTrace?: {
-    callFrames?: Array<{
-      url?: string;
-      lineNumber?: number;
-      columnNumber?: number;
-    }>;
-  };
+  stackTrace?: RuntimeStackTrace;
+}
+
+interface RuntimeStackTrace {
+  description?: string;
+  callFrames?: RuntimeCallFrame[];
+  parent?: RuntimeStackTrace;
+}
+
+interface RuntimeCallFrame {
+  functionName?: string;
+  scriptId?: string;
+  url?: string;
+  lineNumber?: number;
+  columnNumber?: number;
+}
+
+interface RuntimeExceptionDetails {
+  exceptionId: number;
+  text: string;
+  lineNumber?: number;
+  columnNumber?: number;
+  scriptId?: string;
+  url?: string;
+  stackTrace?: RuntimeStackTrace;
+  exception?: RuntimeRemoteObject;
+}
+
+interface RuntimeExceptionThrownEvent {
+  timestamp?: number;
+  exceptionDetails: RuntimeExceptionDetails;
+}
+
+interface RuntimeExceptionRevokedEvent {
+  exceptionId: number;
+}
+
+interface DebuggerLocation {
+  scriptId: string;
+  lineNumber: number;
+  columnNumber?: number;
+}
+
+interface DebuggerSetBreakpointByUrlResponse {
+  breakpointId: string;
+  locations?: DebuggerLocation[];
+}
+
+interface DebuggerPausedEvent {
+  callFrames: Array<{
+    callFrameId: string;
+    functionName: string;
+    url?: string;
+    location: DebuggerLocation;
+    scopeChain: Array<{ type: string }>;
+  }>;
+  reason: string;
+  hitBreakpoints?: string[];
+}
+
+interface DebuggerBreakpointResolvedEvent {
+  breakpointId: string;
+  location: DebuggerLocation;
 }
 
 interface LogEntryAddedEvent {

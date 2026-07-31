@@ -330,6 +330,99 @@ const mouseActionSchema = outputObject({
   action: z.enum(["move", "click", "down", "up", "drag", "wheel"]),
 });
 
+const runtimeGeneratedLocationSchema = z
+  .object({
+    url: outputString,
+    lineNumber: z.number().int().nonnegative(),
+    columnNumber: z.number().int().nonnegative(),
+    functionName: outputString.optional(),
+  })
+  .strict();
+const runtimeSourceMapSchema = z
+  .object({
+    status: z.enum(["resolved", "unavailable", "unsupported", "failed"]),
+    generated: runtimeGeneratedLocationSchema.optional(),
+    original: z
+      .object({
+        source: outputString,
+        lineNumber: z.number().int().positive(),
+        columnNumber: z.number().int().positive(),
+        name: outputString.optional(),
+        sourceRoot: outputString.optional(),
+        excerpt: outputString.optional(),
+      })
+      .strict()
+      .optional(),
+    sourceMapUrl: outputString.optional(),
+    scriptIdentity: z
+      .object({
+        hash: outputString.optional(),
+        buildId: outputString.optional(),
+        debugId: outputString.optional(),
+        debugIdMatch: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+    reason: outputString.optional(),
+  })
+  .strict();
+const runtimeErrorCursorSchema = z
+  .object({
+    streamId: outputString,
+    sequence: z.number().int().nonnegative(),
+  })
+  .strict();
+const runtimeErrorResultSchema = z
+  .object({
+    version: z.literal("browser-runtime-errors-v1"),
+    attached: z.boolean(),
+    tabId: z.number().int().nonnegative().optional(),
+    cursorStatus: z.enum([
+      "ok",
+      "stream_restarted",
+      "events_dropped",
+      "cursor_ahead",
+    ]),
+    cursor: runtimeErrorCursorSchema,
+    nextCursor: runtimeErrorCursorSchema,
+    oldestSequence: z.number().int().nonnegative(),
+    latestSequence: z.number().int().nonnegative(),
+    missedEvents: z.number().int().nonnegative(),
+    droppedEvents: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+    returned: z.number().int().nonnegative(),
+    errors: z
+      .array(
+        z
+          .object({
+            id: outputString,
+            sequence: z.number().int().positive(),
+            kind: z.enum(["exception", "console"]),
+            level: z.enum(["error", "warning"]),
+            text: outputString,
+            timestamp: outputString,
+            exceptionId: z.number().int().optional(),
+            revoked: z.boolean().optional(),
+            frames: z
+              .array(
+                z
+                  .object({
+                    scriptId: outputString.optional(),
+                    generated: runtimeGeneratedLocationSchema,
+                    asyncContext: outputString.optional(),
+                    sourceMap: runtimeSourceMapSchema.optional(),
+                  })
+                  .strict(),
+              )
+              .max(12),
+            framesOmitted: z.number().int().nonnegative(),
+          })
+          .strict(),
+      )
+      .max(20),
+  })
+  .strict();
+
 const cookieSchema = outputObject({
   name: outputString,
   valueIncluded: z.boolean(),
@@ -440,6 +533,13 @@ export const MCP_TOOL_OUTPUT_SCHEMAS = {
     frameId: z.number().int().nonnegative().optional(),
     documentId: outputString.optional(),
     networkObservationSessionId: outputString.optional(),
+    runtimeErrorCursor: z
+      .object({
+        streamId: outputString,
+        sequence: z.number().int().nonnegative(),
+      })
+      .strict()
+      .optional(),
     activityCursor: z
       .object({
         streamId: outputString,
@@ -523,6 +623,8 @@ export const MCP_TOOL_OUTPUT_SCHEMAS = {
     console: nullableUnknown,
     activity: nullableUnknown,
   }),
+  [MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS]:
+    runtimeErrorResultSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_SELECTED_ELEMENT]: selectedElementSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST]: contextDigestSchema,
   [MCP_TOOL_NAMES.BROWSER_GET_PLUGIN_CONVERSATION]: outputObject({
@@ -690,6 +792,27 @@ export const MCP_TOOL_OUTPUT_SCHEMAS = {
   }),
   [MCP_TOOL_NAMES.BROWSER_EVALUATE]: outputObject({
     evaluated: z.boolean(),
+  }),
+  [MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT]: outputObject({
+    action: z.enum(["set", "remove", "list"]),
+    tabId: z.number().int().nonnegative(),
+    breakpoints: outputArray,
+  }),
+  [MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL]: outputObject({
+    action: z.enum([
+      "status",
+      "pause",
+      "resume",
+      "step_over",
+      "step_into",
+      "step_out",
+      "evaluate_on_call_frame",
+      "set_pause_on_exceptions",
+    ]),
+    tabId: z.number().int().nonnegative(),
+    frameId: z.number().int().nonnegative(),
+    paused: z.boolean(),
+    pauseOnExceptions: z.enum(["none", "uncaught", "caught", "all"]),
   }),
   [MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG]: outputObject({
     handled: z.literal(true),

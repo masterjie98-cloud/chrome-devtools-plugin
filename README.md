@@ -193,6 +193,9 @@ The diagnostic workflow also exposes:
   workflow replay;
 - adapter-local `browser_find_workspace_source` for bounded path/symbol matching
   under configured workspace roots;
+- adapter-local `browser_diagnose_runtime_errors` for incremental JavaScript
+  exceptions/console error stacks, loaded-script Source Map resolution, and
+  verified local workspace locations;
 - `browser_performance_diagnostics` for Navigation/Resource Timing, buffered
   LCP, layout-shift and Long Task summaries, plus bounded interaction/INP and
   trace summaries;
@@ -211,6 +214,39 @@ Recipe artifacts are bound to the selected Profile session. Replaying a recipe
 never reuses the old execution grant and remains approval-gated; a lost write
 result is not automatically replayed. The workspace tool never accepts a
 caller-supplied root and does not make arbitrary filesystem paths reachable.
+
+### JavaScript runtime error source mapping
+
+Run the MCP adapter from the project root, or set
+`AI_DEVTOOLS_WORKSPACE_ROOTS` to the local checkout roots. Then use this flow:
+
+1. Call `browser_activity_start` before reproducing the error and save its
+   `runtimeErrorCursor`.
+2. Reproduce the error in the Tab bound to that task.
+3. Call `browser_diagnose_runtime_errors` with the saved `afterStreamId` and
+   `afterSequence`.
+4. Prefer a frame whose confidence is `source-map-content-verified`; it means
+   the mapped local line also matches the Source Map `sourcesContent` line.
+
+The extension captures bounded `Runtime.exceptionThrown` and error/warning
+console stacks only while monitoring is active. It parses flat and embedded
+indexed Source Map v3 payloads up to 16 MiB, limits mapping segments and cache
+entries, and reports cursor restart/eviction instead of silently replaying an
+incomplete history. External-URL indexed sections are rejected. Remote map
+loads use the selected debugger target's bounded CDP resource stream without
+page credentials; map bodies stay inside the extension, signed query strings
+are omitted from MCP output, and local lookup remains restricted to configured
+workspace roots.
+
+For a manual local check:
+
+```bash
+python3 -m http.server 8766 --directory tests/fixtures/runtime-error
+```
+
+Open `http://127.0.0.1:8766/`, start monitoring, click `触发映射错误`, and
+request runtime-error diagnosis. The expected verified local target is
+`tests/fixtures/runtime-error/src/runtime-error.ts:2`.
 
 `browser_snapshot` remains the expert-compatible accessibility-oriented snapshot for the
 adapter's bound Chrome Profile and selected tab/frame/document. Nodes include a
@@ -231,6 +267,36 @@ audit snapshot; edits, truncation, filter changes, and Network's newest-first
 updates fail closed with `STALE_PAGINATION_CURSOR`. Start again without a
 cursor. Audit results are restricted to the adapter-selected Profile and expose
 only the persisted redacted audit allowlist.
+
+### Page JavaScript and breakpoint debugging
+
+The default `smart` and expert `full` MCP tool profiles expose an
+approval-gated DevTools debugging loop:
+
+- `browser_evaluate` executes up to 12,000 characters of JavaScript in the exact
+  selected page frame through CDP `Runtime.evaluate`. It can call page functions,
+  use top-level await, inspect or mutate application state, and optionally ask V8
+  to reject expressions whose side effects cannot be ruled out.
+- `browser_debugger_breakpoint` sets, removes, or lists URL/URL-regex
+  breakpoints. Tool line numbers are 1-based and columns are 0-based.
+- `browser_debugger_control` reports paused stacks, pauses/resumes execution,
+  steps over/into/out, evaluates an expression on a current paused call frame,
+  and configures pause-on-exceptions.
+
+This is intentionally **not a JavaScript sandbox**. Code runs with the selected
+page's privileges and can modify DOM/application state, access same-origin page
+data, and issue requests. Every call uses the `arbitrary_execution` policy,
+receives a fresh authorization decision, and is bound to the current Profile,
+Tab, frame, document, navigation, and revision. The daemon stores only the
+argument hash and bounded result metadata in its audit history.
+
+Normal evaluation disables breakpoints by default so a synchronous breakpoint
+cannot leave the MCP call waiting for itself. To deliberately trigger a
+breakpoint from `browser_evaluate`, schedule the target call asynchronously (for
+example `setTimeout(() => app.run(), 0)`), set `awaitPromise: false`, and set
+`allowBreakpoints: true`; then read `browser_debugger_control` with
+`action: "status"`. Stopping debugging with `browser_debugger_detach` resumes a
+paused target before detaching.
 
 MCP inputs reject unknown fields. Successful structured outputs are validated
 against a tool-specific Zod contract before the stdio SDK returns them; the
@@ -278,6 +344,10 @@ guessed from the current active tab.
   daemon and Chrome background both validate that boundary before dispatch.
 - Raw browser commands from clients are rejected; only registered MCP tools can
   reach the browser executor.
+- Caller-provided JavaScript never runs through the content script or
+  `new Function`. The only supported arbitrary-execution path is the registered,
+  approval-gated CDP executor. Results, stack frames, breakpoint counts, code
+  size, and execution time are bounded; remote object handles are not returned.
 - DOM and selector tools route to an explicitly selected `tabId + frameId +
   documentId`; top-level frame 0 is the safe default, and stale documents are
   rejected after navigation.

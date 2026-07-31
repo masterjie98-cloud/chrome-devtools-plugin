@@ -695,21 +695,6 @@ export interface BrowserConsoleMessagesResult {
   messages: BrowserConsoleMessage[];
 }
 
-export interface BrowserEvaluateInput {
-  expression: string;
-  selector?: string;
-  timeoutMs?: number;
-}
-
-export interface BrowserEvaluateResult {
-  evaluated: boolean;
-  result?: unknown;
-  resultType?: string;
-  serialized?: string;
-  error?: string;
-  truncated?: boolean;
-}
-
 export interface BrowserDialogInput {
   action: "accept" | "dismiss";
   promptText?: string;

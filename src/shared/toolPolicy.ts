@@ -200,6 +200,7 @@ const POLICY_GROUPS = {
     MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS,
     MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
     MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
+    MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS,
     MCP_TOOL_NAMES.BROWSER_GET_PLUGIN_CONVERSATION,
     MCP_TOOL_NAMES.BROWSER_GET_AUDIT_EVENTS,
     MCP_TOOL_NAMES.BROWSER_GET_LAST_PLUGIN_MESSAGE,
@@ -270,7 +271,11 @@ const POLICY_GROUPS = {
     MCP_TOOL_NAMES.BROWSER_UPSERT_GET_MOCK,
     MCP_TOOL_NAMES.BROWSER_REMOVE_NETWORK_RULE,
   ],
-  arbitrary_execution: [MCP_TOOL_NAMES.BROWSER_EVALUATE],
+  arbitrary_execution: [
+    MCP_TOOL_NAMES.BROWSER_EVALUATE,
+    MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT,
+    MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL,
+  ],
 } as const satisfies Partial<
   Record<ToolPolicyClass, readonly McpToolName[]>
 >;
@@ -380,6 +385,18 @@ export function getToolPolicy(
       capability: "page.observe.network_digest",
       reason:
         "Reads only a bounded aggregated Network digest, sanitized console messages, and a sequence-based page activity summary; raw request rows, headers, and bodies remain separately protected.",
+    });
+  }
+
+  if (
+    normalizedName === MCP_TOOL_NAMES.BROWSER_DIAGNOSE_RUNTIME_ERRORS
+  ) {
+    return overridePolicy(createPolicy(normalizedName, baseClass, true), {
+      dataSensitivity: "page_content",
+      approvalMode: "task_grant",
+      capability: "page.observe.sensitive",
+      reason:
+        "Reads bounded JavaScript error text, stack locations, Source Map excerpts, and configured local workspace matches for the current task.",
     });
   }
 

@@ -49,7 +49,10 @@ export function classifySensitiveEgress(
     case MCP_TOOL_NAMES.BROWSER_CONSOLE_MESSAGES:
       return "page_runtime";
     case MCP_TOOL_NAMES.BROWSER_EVALUATE:
+    case MCP_TOOL_NAMES.BROWSER_DEBUGGER_CONTROL:
       return "evaluated_page_data";
+    case MCP_TOOL_NAMES.BROWSER_DEBUGGER_BREAKPOINT:
+      return "page_runtime";
     default:
       return normalizeMcpToolName(toolName)
         ? "sensitive_result"

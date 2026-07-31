@@ -19,6 +19,8 @@ interface MainWorldFrameworkResult {
   warnings: string[];
 }
 
+export const SOURCE_INSPECTION_TIMEOUT_MS = 8_000;
+
 export async function locateElementSource(
   input: BrowserLocateSourceInput,
 ): Promise<BrowserLocateSourceResult> {
@@ -52,16 +54,28 @@ export async function locateElementSource(
     );
   }
 
-  const target: chrome.scripting.InjectionTarget = documentId
-    ? { tabId: tab.id, documentIds: [documentId] }
-    : { tabId: tab.id, frameIds: [frameId] };
-  const results = await chrome.scripting.executeScript({
-    target,
-    world: "MAIN",
-    func: inspectFrameworkElementInMainWorld,
-    args: [input.selector, input.maxDepth ?? 8],
-  });
-  const value = results[0]?.result as MainWorldFrameworkResult | undefined;
+  const results = await withSourceInspectionTimeout(
+    chrome.scripting.executeScript({
+      // documentIds-targeted MAIN-world injections can remain pending after an
+      // extension reload. Execute against the stable frame slot, then accept
+      // the result only when Chrome reports the expected documentId.
+      target: { tabId: tab.id, frameIds: [frameId] },
+      world: "MAIN",
+      func: inspectFrameworkElementInMainWorld,
+      args: [input.selector, input.maxDepth ?? 8],
+    }),
+  );
+  const injection =
+    results.find((entry) => entry.frameId === frameId) ?? results[0];
+  if (
+    documentId &&
+    (!injection?.documentId || injection.documentId !== documentId)
+  ) {
+    throw new Error(
+      "STALE_FRAME: the frame document changed during MAIN-world source inspection.",
+    );
+  }
+  const value = injection?.result as MainWorldFrameworkResult | undefined;
   if (!value) {
     throw new Error(
       "SOURCE_LOCATION_FAILED: MAIN-world inspection returned no result.",
@@ -99,6 +113,28 @@ export async function locateElementSource(
     },
     warnings: value.warnings.slice(0, 10),
   };
+}
+
+async function withSourceInspectionTimeout<T>(operation: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(
+            new Error(
+              "SOURCE_LOCATION_TIMEOUT: MAIN-world source inspection did not return within 8 seconds.",
+            ),
+          );
+        }, SOURCE_INSPECTION_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function inspectFrameworkElementInMainWorld(

@@ -19,8 +19,6 @@ import type {
   BrowserDragInput,
   BrowserDragResult,
   BrowserElementActionResult,
-  BrowserEvaluateInput,
-  BrowserEvaluateResult,
   BrowserFillFormInput,
   BrowserFillFormResult,
   BrowserHoverInput,
@@ -95,6 +93,8 @@ import type {
 import type {
   BrowserLocateSourceInput,
   BrowserLocateSourceResult,
+  BrowserRuntimeErrorsInput,
+  BrowserRuntimeErrorsResult,
   GeneratedSourceLocation,
   SourceMapResolution,
 } from "./sourceLocation";
@@ -106,6 +106,15 @@ import type {
   BrowserRealtimeActivityInput,
   BrowserRealtimeActivityResult,
 } from "./pageDiagnostics";
+import {
+  DEBUG_EXECUTION_LIMITS,
+  type BrowserDebugBreakpointInput,
+  type BrowserDebugBreakpointResult,
+  type BrowserDebugControlInput,
+  type BrowserDebugControlResult,
+  type BrowserDebugEvaluateInput,
+  type BrowserDebugEvaluateResult,
+} from "./debugExecution";
 
 export const TOOL_NAMES = {
   DOM_GET_PAGE_INFO: "dom.getPageInfo",
@@ -172,7 +181,10 @@ export const TOOL_NAMES = {
   DEBUGGER_NETWORK_STOP: "debugger.network.stop",
   DEBUGGER_NETWORK_CLEAR: "debugger.network.clear",
   DEBUGGER_NETWORK_LIST: "debugger.network.list",
+  DEBUGGER_RUNTIME_ERRORS: "debugger.runtimeErrors",
   DEBUGGER_RESOLVE_SOURCE: "debugger.resolveSource",
+  DEBUGGER_BREAKPOINT: "debugger.breakpoint",
+  DEBUGGER_CONTROL: "debugger.control",
   DEBUGGER_NETWORK_GET: "debugger.network.get",
   DEBUGGER_NETWORK_GET_BODY: "debugger.network.getBody",
   DEBUGGER_DETACH: "debugger.detach",
@@ -219,7 +231,7 @@ export interface ToolArgumentMap {
   [TOOL_NAMES.BROWSER_MOUSE_DRAG]: BrowserCoordinateDragInput;
   [TOOL_NAMES.BROWSER_MOUSE_WHEEL]: BrowserMouseWheelInput;
   [TOOL_NAMES.BROWSER_WAIT_FOR]: BrowserWaitForInput;
-  [TOOL_NAMES.BROWSER_EVALUATE]: BrowserEvaluateInput;
+  [TOOL_NAMES.BROWSER_EVALUATE]: BrowserDebugEvaluateInput;
   [TOOL_NAMES.BROWSER_HANDLE_DIALOG]: BrowserDialogInput;
   [TOOL_NAMES.BROWSER_STORAGE_STATE]: BrowserStorageStateInput;
   [TOOL_NAMES.BROWSER_COOKIE_LIST]: BrowserCookieListInput;
@@ -245,9 +257,12 @@ export interface ToolArgumentMap {
   [TOOL_NAMES.DEBUGGER_NETWORK_STOP]: Record<string, never>;
   [TOOL_NAMES.DEBUGGER_NETWORK_CLEAR]: Record<string, never>;
   [TOOL_NAMES.DEBUGGER_NETWORK_LIST]: DebuggerNetworkListInput;
+  [TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS]: BrowserRuntimeErrorsInput;
   [TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE]: GeneratedSourceLocation & {
     includeSourceExcerpt?: boolean;
   };
+  [TOOL_NAMES.DEBUGGER_BREAKPOINT]: BrowserDebugBreakpointInput;
+  [TOOL_NAMES.DEBUGGER_CONTROL]: BrowserDebugControlInput;
   [TOOL_NAMES.DEBUGGER_NETWORK_GET]: DebuggerNetworkGetInput;
   [TOOL_NAMES.DEBUGGER_NETWORK_GET_BODY]: DebuggerNetworkBodyInput;
   [TOOL_NAMES.DEBUGGER_DETACH]: DebuggerDetachInput;
@@ -292,7 +307,7 @@ export interface ToolResultMap {
   [TOOL_NAMES.BROWSER_MOUSE_DRAG]: BrowserMouseResult;
   [TOOL_NAMES.BROWSER_MOUSE_WHEEL]: BrowserMouseResult;
   [TOOL_NAMES.BROWSER_WAIT_FOR]: BrowserWaitForResult;
-  [TOOL_NAMES.BROWSER_EVALUATE]: BrowserEvaluateResult;
+  [TOOL_NAMES.BROWSER_EVALUATE]: BrowserDebugEvaluateResult;
   [TOOL_NAMES.BROWSER_HANDLE_DIALOG]: BrowserDialogResult;
   [TOOL_NAMES.BROWSER_STORAGE_STATE]: BrowserStorageStateResult;
   [TOOL_NAMES.BROWSER_COOKIE_LIST]: BrowserCookieListResult;
@@ -318,7 +333,10 @@ export interface ToolResultMap {
   [TOOL_NAMES.DEBUGGER_NETWORK_STOP]: DebuggerNetworkStatus;
   [TOOL_NAMES.DEBUGGER_NETWORK_CLEAR]: DebuggerNetworkStatus;
   [TOOL_NAMES.DEBUGGER_NETWORK_LIST]: DebuggerNetworkListResult;
+  [TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS]: BrowserRuntimeErrorsResult;
   [TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE]: SourceMapResolution;
+  [TOOL_NAMES.DEBUGGER_BREAKPOINT]: BrowserDebugBreakpointResult;
+  [TOOL_NAMES.DEBUGGER_CONTROL]: BrowserDebugControlResult;
   [TOOL_NAMES.DEBUGGER_NETWORK_GET]: DebuggerNetworkRequestDetail;
   [TOOL_NAMES.DEBUGGER_NETWORK_GET_BODY]: DebuggerNetworkResponseBody;
   [TOOL_NAMES.DEBUGGER_DETACH]: DebuggerDetachResult;
@@ -593,9 +611,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: TOOL_NAMES.BROWSER_EVALUATE,
-    title: "执行表达式",
+    title: "执行页面 JavaScript",
     description:
-      "Evaluate a constrained JavaScript expression or IIFE against the page DOM. It can read page state and perform controlled page-side mutations for temporary testing.",
+      "Execute caller-provided JavaScript in the exact selected page frame through CDP Runtime.evaluate.",
     writesPage: true,
   },
   {
@@ -760,11 +778,32 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     writesPage: false,
   },
   {
+    name: TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS,
+    title: "运行时错误源码定位",
+    description:
+      "Read bounded JavaScript exceptions and error console stacks from the active debugger tab, resolving available source maps locally.",
+    writesPage: false,
+  },
+  {
     name: TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE,
     title: "定位请求源码",
     description:
       "Resolve one generated Network initiator frame through the captured script source map.",
     writesPage: false,
+  },
+  {
+    name: TOOL_NAMES.DEBUGGER_BREAKPOINT,
+    title: "管理 JavaScript 断点",
+    description:
+      "Set, remove, or list URL-based JavaScript breakpoints in the exact selected page frame.",
+    writesPage: true,
+  },
+  {
+    name: TOOL_NAMES.DEBUGGER_CONTROL,
+    title: "控制 JavaScript 调试器",
+    description:
+      "Pause, resume, step, inspect paused stacks, evaluate in a paused call frame, or configure exception pauses.",
+    writesPage: true,
   },
   {
     name: TOOL_NAMES.DEBUGGER_NETWORK_GET,
@@ -992,6 +1031,10 @@ export function validateToolCall(call: unknown): string | null {
       return validateBrowserWaitFor(args);
     case TOOL_NAMES.BROWSER_EVALUATE:
       return validateBrowserEvaluate(args);
+    case TOOL_NAMES.DEBUGGER_BREAKPOINT:
+      return validateDebuggerBreakpoint(args);
+    case TOOL_NAMES.DEBUGGER_CONTROL:
+      return validateDebuggerControl(args);
     case TOOL_NAMES.BROWSER_HANDLE_DIALOG:
       return args.action === "accept" || args.action === "dismiss"
         ? null
@@ -1055,6 +1098,8 @@ export function validateToolCall(call: unknown): string | null {
       return validateDebuggerNetworkStart(args);
     case TOOL_NAMES.DEBUGGER_NETWORK_LIST:
       return validateDebuggerNetworkList(args);
+    case TOOL_NAMES.DEBUGGER_RUNTIME_ERRORS:
+      return validateDebuggerRuntimeErrors(args);
     case TOOL_NAMES.DEBUGGER_RESOLVE_SOURCE:
       return typeof args.url === "string" &&
         args.url.trim().length > 0 &&
@@ -1079,6 +1124,51 @@ export function validateToolCall(call: unknown): string | null {
     default:
       return "Unsupported tool.";
   }
+}
+
+function validateDebuggerRuntimeErrors(
+  args: Record<string, unknown>,
+): string | null {
+  if (
+    args.afterStreamId !== undefined &&
+    (typeof args.afterStreamId !== "string" ||
+      args.afterStreamId.length < 1 ||
+      args.afterStreamId.length > 200)
+  ) {
+    return "afterStreamId must be a string between 1 and 200 characters.";
+  }
+  if (
+    args.afterSequence !== undefined &&
+    (!Number.isInteger(args.afterSequence) || Number(args.afterSequence) < 0)
+  ) {
+    return "afterSequence must be a non-negative integer.";
+  }
+  if (
+    args.limit !== undefined &&
+    (!Number.isInteger(args.limit) ||
+      Number(args.limit) < 1 ||
+      Number(args.limit) > 20)
+  ) {
+    return "limit must be an integer between 1 and 20.";
+  }
+  if (
+    args.maxFramesPerError !== undefined &&
+    (!Number.isInteger(args.maxFramesPerError) ||
+      Number(args.maxFramesPerError) < 1 ||
+      Number(args.maxFramesPerError) > 12)
+  ) {
+    return "maxFramesPerError must be an integer between 1 and 12.";
+  }
+  for (const key of [
+    "includeWarnings",
+    "includeRevoked",
+    "includeSourceExcerpt",
+  ]) {
+    if (args[key] !== undefined && typeof args[key] !== "boolean") {
+      return `${key} must be a boolean.`;
+    }
+  }
+  return null;
 }
 
 function validatePageSnapshotInput(args: Record<string, unknown>): string | null {
@@ -1621,17 +1711,131 @@ function validateBrowserEvaluate(args: Record<string, unknown>): string | null {
   if (args.selector !== undefined && typeof args.selector !== "string") {
     return "selector must be a string.";
   }
+  for (const key of [
+    "awaitPromise",
+    "replMode",
+    "throwOnSideEffect",
+    "allowBreakpoints",
+  ]) {
+    if (args[key] !== undefined && typeof args[key] !== "boolean") {
+      return `${key} must be a boolean.`;
+    }
+  }
   if (
     args.timeoutMs !== undefined &&
     (!Number.isInteger(args.timeoutMs) ||
       Number(args.timeoutMs) < 100 ||
-      Number(args.timeoutMs) > 10000)
+      Number(args.timeoutMs) > DEBUG_EXECUTION_LIMITS.timeoutMsMax)
   ) {
     return "timeoutMs must be an integer between 100 and 10000.";
   }
-  return args.expression.length <= 4000
+  return args.expression.length <= DEBUG_EXECUTION_LIMITS.expressionChars
     ? null
     : "expression is too long.";
+}
+
+function validateDebuggerBreakpoint(
+  args: Record<string, unknown>,
+): string | null {
+  if (
+    args.action !== "set" &&
+    args.action !== "remove" &&
+    args.action !== "list"
+  ) {
+    return "action must be set, remove, or list.";
+  }
+  if (args.action === "list") {
+    return null;
+  }
+  if (args.action === "remove") {
+    return typeof args.breakpointId === "string" && args.breakpointId.trim()
+      ? null
+      : "breakpointId is required when action is remove.";
+  }
+  if (Boolean(args.url) === Boolean(args.urlRegex)) {
+    return "provide exactly one of url or urlRegex when action is set.";
+  }
+  if (
+    (args.url !== undefined &&
+      (typeof args.url !== "string" || !args.url.trim())) ||
+    (args.urlRegex !== undefined &&
+      (typeof args.urlRegex !== "string" || !args.urlRegex.trim()))
+  ) {
+    return "url and urlRegex must be non-empty strings.";
+  }
+  if (
+    !Number.isInteger(args.lineNumber) ||
+    Number(args.lineNumber) < 1
+  ) {
+    return "lineNumber must be a positive 1-based integer.";
+  }
+  if (
+    args.columnNumber !== undefined &&
+    (!Number.isInteger(args.columnNumber) || Number(args.columnNumber) < 0)
+  ) {
+    return "columnNumber must be a non-negative integer.";
+  }
+  if (
+    args.condition !== undefined &&
+    (typeof args.condition !== "string" ||
+      args.condition.length > DEBUG_EXECUTION_LIMITS.breakpointConditionChars)
+  ) {
+    return "condition must be a string no longer than 2000 characters.";
+  }
+  return null;
+}
+
+function validateDebuggerControl(
+  args: Record<string, unknown>,
+): string | null {
+  const actions = new Set([
+    "status",
+    "pause",
+    "resume",
+    "step_over",
+    "step_into",
+    "step_out",
+    "evaluate_on_call_frame",
+    "set_pause_on_exceptions",
+  ]);
+  if (typeof args.action !== "string" || !actions.has(args.action)) {
+    return "action is not a supported debugger control operation.";
+  }
+  if (args.action === "evaluate_on_call_frame") {
+    if (typeof args.callFrameId !== "string" || !args.callFrameId.trim()) {
+      return "callFrameId is required for evaluate_on_call_frame.";
+    }
+    if (typeof args.expression !== "string" || !args.expression.trim()) {
+      return "expression is required for evaluate_on_call_frame.";
+    }
+    if (args.expression.length > DEBUG_EXECUTION_LIMITS.expressionChars) {
+      return "expression is too long.";
+    }
+  }
+  if (
+    args.timeoutMs !== undefined &&
+    (!Number.isInteger(args.timeoutMs) ||
+      Number(args.timeoutMs) < DEBUG_EXECUTION_LIMITS.timeoutMsMin ||
+      Number(args.timeoutMs) > DEBUG_EXECUTION_LIMITS.timeoutMsMax)
+  ) {
+    return "timeoutMs must be an integer between 100 and 10000.";
+  }
+  if (
+    args.throwOnSideEffect !== undefined &&
+    typeof args.throwOnSideEffect !== "boolean"
+  ) {
+    return "throwOnSideEffect must be a boolean.";
+  }
+  if (
+    args.action === "set_pause_on_exceptions" &&
+    args.pauseOnExceptions !== "none" &&
+    args.pauseOnExceptions !== "uncaught" &&
+    args.pauseOnExceptions !== "caught" &&
+    args.pauseOnExceptions !== "all"
+  ) {
+    return "pauseOnExceptions must be none, uncaught, caught, or all.";
+  }
+  return null;
 }
 
 function validateStorageState(args: Record<string, unknown>): string | null {
