@@ -23,17 +23,22 @@ export function startElementPicker(): { started: boolean } {
   return { started: true };
 }
 
-export function cancelElementPicker(reason = "cancelled"): { cancelled: boolean } {
+export function cancelElementPicker(
+  reason = "cancelled",
+  announce = true,
+): { cancelled: boolean } {
   if (!pickerActive) {
     return { cancelled: true };
   }
 
   cleanupPicker();
-  sendRuntimeEvent(
-    makeEvent("content", MESSAGE_TYPES.CONTENT_SELECTION_CANCELLED, {
-      reason
-    })
-  );
+  if (announce) {
+    sendRuntimeEvent(
+      makeEvent("content", MESSAGE_TYPES.CONTENT_SELECTION_CANCELLED, {
+        reason
+      })
+    );
+  }
 
   return { cancelled: true };
 }

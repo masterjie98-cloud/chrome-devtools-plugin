@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import test from "node:test";
 import { WS_COMMANDS, WS_PROTOCOL_VERSION } from "../src/shared/wsProtocol";
@@ -16,7 +16,7 @@ import {
 import { createTestDataDirectory } from "./helpers/tempDataDir";
 
 test("protocol fixtures centralize token, version, timestamp, and deterministic IDs", () => {
-  assert.equal(WS_PROTOCOL_VERSION, 8);
+  assert.equal(WS_PROTOCOL_VERSION, 11);
   const createId = createDeterministicIdFactory("message");
   assert.equal(createId(), "message-1");
   assert.equal(createId(), "message-2");
@@ -59,4 +59,18 @@ test("temporary daemon data directory exposes isolated paths and cleans up", asy
         error.code === "ENOENT",
     ),
   );
+});
+
+test("chat renders one activity monitor only on its anchored start message", async () => {
+  const source = await readFile(
+    new URL("../src/sidepanel/components/ChatPanel.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.equal(source.match(/<ActivityMonitorBar\b/g)?.length, 1);
+  assert.match(
+    source,
+    /message\.id === activityMonitorAnchorMessageId/,
+  );
+  assert.doesNotMatch(source, /activityMonitor\.health !== "stopped"/);
 });

@@ -1030,6 +1030,7 @@ test("daemon enforces single-use UI approval before a browser mutation", async (
     ui = await connectRole(url, "ui");
     let approve = false;
     let enrichApprovalTarget = false;
+    let switchUiSelectionWhileApprovalPending = false;
     let makeApprovalStale = false;
     let lastApprovalPayload: Record<string, unknown> | undefined;
     ui.on("message", (raw) => {
@@ -1086,6 +1087,26 @@ test("daemon enforces single-use UI approval before a browser mutation", async (
         setTimeout(respond, 20);
         return;
       }
+      if (switchUiSelectionWhileApprovalPending && browser) {
+        void sendAndWaitForAck(browser, {
+          requestId: `ui-selection-switch-${Date.now()}`,
+          command: WS_COMMANDS.ACTIVE_TAB_UPDATED,
+          sentAt: new Date().toISOString(),
+          payload: {
+            activeTab: {
+              url: "https://example.test/other-conversation",
+              title: "Other conversation",
+              targetId: "84",
+              tabId: 84,
+              windowId: 2,
+              frameId: 0,
+              documentId: "other-document",
+              navigationId: "other-navigation",
+            },
+          },
+        }).then(respond);
+        return;
+      }
       respond();
     });
 
@@ -1111,12 +1132,18 @@ test("daemon enforces single-use UI approval before a browser mutation", async (
 
     browser = await connectRole(url, "browser");
     let browserExecutionCount = 0;
+    let lastExecutionGrantTarget: Record<string, unknown> | undefined;
     browser.on("message", (raw) => {
       const message = parseMessage(raw.toString());
       if (message?.command !== WS_COMMANDS.BROWSER_TOOL_CALL) {
         return;
       }
       browserExecutionCount += 1;
+      lastExecutionGrantTarget = (
+        message.payload.executionGrant as
+          | { claims?: { target?: Record<string, unknown> } }
+          | undefined
+      )?.claims?.target;
       browser?.send(JSON.stringify({
         requestId: message.requestId,
         command: WS_COMMANDS.BROWSER_TOOL_RESULT,
@@ -1171,12 +1198,44 @@ test("daemon enforces single-use UI approval before a browser mutation", async (
     assert.equal(browserExecutionCount, 2);
 
     enrichApprovalTarget = false;
+    switchUiSelectionWhileApprovalPending = true;
+    const switchedUiResult = await client.callTool(
+      MCP_TOOL_NAMES.BROWSER_CLICK,
+      { selector: "#confirm" },
+    );
+    assert.deepEqual(switchedUiResult, {
+      selector: "#confirm",
+      matched: true,
+      action: "click",
+    });
+    assert.equal(browserExecutionCount, 3);
+    assert.equal(lastExecutionGrantTarget?.tabId, 42);
+    assert.equal(lastExecutionGrantTarget?.documentId, "document-1");
+
+    switchUiSelectionWhileApprovalPending = false;
+    await sendAndWaitForAck(browser, {
+      requestId: "restore-original-selection-before-stale-check",
+      command: WS_COMMANDS.ACTIVE_TAB_UPDATED,
+      sentAt: new Date().toISOString(),
+      payload: {
+        activeTab: {
+          url: "https://example.test/confirm",
+          title: "Confirm",
+          targetId: "42",
+          tabId: 42,
+          windowId: 1,
+          frameId: 0,
+          documentId: "document-1",
+          navigationId: "navigation-1",
+        },
+      },
+    });
     makeApprovalStale = true;
     await assert.rejects(
       client.callTool(MCP_TOOL_NAMES.BROWSER_CLICK, { selector: "#confirm" }),
       /STALE_CONTEXT/,
     );
-    assert.equal(browserExecutionCount, 2);
+    assert.equal(browserExecutionCount, 3);
   } finally {
     client.close();
     ui?.close();

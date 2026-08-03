@@ -30,6 +30,8 @@ import type {
 import { MESSAGE_TYPES } from "../shared/messages";
 import { createMessageId, errorResponse } from "../shared/messaging";
 import { transitionTargetSelection } from "./targetSelectionState";
+import type { ActiveTabSnapshot } from "../shared/wsProtocol";
+import { getTargetNavigationState } from "./targetNavigation";
 
 const TARGET_TAB_STORAGE_KEY = "aiDevtools.targetTab";
 
@@ -222,6 +224,55 @@ export async function selectTargetTab(
     selectedTabId: tab.id,
     selectedTab,
   };
+}
+
+export async function readTargetTabSnapshot(
+  tabId: number,
+): Promise<ActiveTabSnapshot | undefined> {
+  const tab = await getTab(tabId);
+  if (!isUsableBrowserTarget(tab)) {
+    return undefined;
+  }
+  const navigation = getTargetNavigationState(tab.id, false);
+  const selectedFrame = getSelectedContentFrameSnapshot(tab.id);
+  return {
+    url: selectedFrame?.url || tab.url || "",
+    title: selectedFrame?.title || tab.title || "",
+    targetId: String(tab.id),
+    tabId: tab.id,
+    windowId: tab.windowId,
+    frameId: selectedFrame?.frameId ?? 0,
+    documentId: selectedFrame?.documentId,
+    navigationId: navigation.navigationId,
+    revision: navigation.revision,
+  };
+}
+
+export async function withTemporaryTargetTab<T>(
+  tabId: number,
+  operation: () => Promise<T>,
+): Promise<T> {
+  await loadTargetTabState();
+  const previousTabId = lastTargetTabId;
+  const previousSelection = targetTabSelection;
+  const target = await getTab(tabId);
+  if (!isUsableBrowserTarget(target)) {
+    throw new Error(
+      `STALE_CONTEXT: task target Tab ${tabId} is closed or no longer scriptable.`,
+    );
+  }
+  await commitTargetTabState(tabId, "manual");
+  try {
+    return await operation();
+  } finally {
+    const previousTarget =
+      previousTabId === undefined ? undefined : await getTab(previousTabId);
+    if (isUsableBrowserTarget(previousTarget)) {
+      await commitTargetTabState(previousTarget.id, previousSelection);
+    } else {
+      await commitTargetTabState(undefined, "auto");
+    }
+  }
 }
 
 export async function focusBrowserTab(tabId: number): Promise<chrome.tabs.Tab> {

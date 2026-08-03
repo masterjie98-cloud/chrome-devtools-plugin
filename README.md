@@ -9,7 +9,7 @@ The target architecture and migration decisions are recorded in
 acceptance evidence are tracked in
 [`docs/implementation-plan.md`](docs/implementation-plan.md). Security boundaries
 are documented in
-[`chrome-devtools-plugin-threat-model.md`](chrome-devtools-plugin-threat-model.md).
+[`docs/chrome-devtools-plugin-threat-model.md`](docs/chrome-devtools-plugin-threat-model.md).
 The requirement-by-requirement completion gate is
 [`docs/completion-evidence.md`](docs/completion-evidence.md).
 Codex installation, pairing, verification, and shareable onboarding steps are in
@@ -22,59 +22,67 @@ Record only sanitized results in
 [`docs/browser-validation-results.md`](docs/browser-validation-results.md); it
 starts as `not-run` so unexecuted browser checks cannot be mistaken for proof.
 
-## Local distribution without Chrome Web Store
+## Local use (recommended): CMD scaffold
 
-Build a versioned local package for trusted macOS users:
+Primary path for **Windows and macOS** after `git clone` — not Chrome Web Store:
+
+```bash
+# Windows: double-click setup-local.cmd
+# macOS: double-click setup-local.command
+# or
+npm run setup:local
+```
+
+The scaffold can install deps, build daemon/MCP (`build:node`), generate
+`local-scripts/` start/stop helpers, and print MCP client config. macOS
+LaunchAgent is optional. Then load Chrome unpacked from `dist/`
+(`npm run build:extension` if needed) and paste the Bridge Token.
+
+```bash
+npm run update:local    # later updates: git pull + rebuild
+npm run release         # maintainers: release-it tag + GitHub Release
+```
+
+### Optional: shareable zip (Windows + macOS)
+
+For users who will not use git:
 
 ```bash
 npm run package:local
 ```
 
-The command runs the full build, bundles the daemon, MCP adapter, status, token,
-and extension-allowlist tools into self-contained Node.js 20 entrypoints, and
-creates these ignored artifacts:
+Produces `release/ai-devtools-assistant-local-<version>.zip`. Recipients unzip
+and double-click:
 
-```text
-release/ai-devtools-assistant-local-<version>/
-release/ai-devtools-assistant-local-<version>.zip
-release/ai-devtools-assistant-local-<version>.zip.sha256
-```
+- Windows: `安装 AI DevTools Assistant.cmd`
+- macOS: `安装 AI DevTools Assistant.command`
 
-Recipients unzip the archive and double-click
-`安装 AI DevTools Assistant.command`. The installer copies the runtime and
-extension to a stable user directory, installs the macOS LaunchAgent, verifies
-the daemon, and prints the local Chrome extension path plus the per-machine
-Bridge Token. Chrome still requires the user to enable developer mode and load
-that unpacked extension directory manually.
+The Release ZIP bundles verified portable Node runtimes for macOS arm64/x64
+and Windows x64, so the recipient does not install Node separately. The
+installer also registers login autostart by default. See
+[`docs/local-install.zh-CN.md`](docs/local-install.zh-CN.md). Do not ship a
+developer machine's daemon config or Bridge Token in the archive.
 
-See [`docs/local-install.zh-CN.md`](docs/local-install.zh-CN.md) for the
-shareable Chinese installation, update, Codex registration, and uninstall
-instructions. Do not include a developer machine's daemon config, Bridge Token,
-browser state, or Codex config in the release archive.
+The first install is manual. Afterwards, a running packaged daemon can check the
+latest GitHub Release and, after explicit user confirmation, download the exact
+versioned ZIP plus SHA-256 asset, validate and transactionally replace the local
+runtime/extension, then restart itself. Chrome still requires an extension
+reload because this is an unpacked extension, not a Web Store installation.
 
 ## Development startup
 
-Install and build the extension:
+Daemon is the only process that should stay running. MCP is started by
+Cursor/Codex over stdio when needed — do not keep `mcp:dev` open by default.
 
 ```bash
+npm run setup:local
+# or manually:
 npm install
-npm run build
-```
-
-Load `dist/` as an unpacked extension in Chrome. Then start exactly one daemon:
-
-```bash
-npm run daemon:dev
-```
-
-For a production-style run, build once and start the compiled JavaScript:
-
-```bash
 npm run build
 npm run daemon:start
 ```
 
-On macOS, the same compiled daemon can run as a user LaunchAgent:
+On macOS, the same compiled daemon can optionally run as a user LaunchAgent:
 
 ```bash
 npm run daemon:install-service
@@ -112,6 +120,38 @@ that possesses the token. Once at least one ID is configured, every other
 extension Origin is rejected. For ephemeral configuration, set a comma-separated
 `AI_DEVTOOLS_ALLOWED_EXTENSION_IDS`; it overrides the stored list for that daemon
 run without printing or changing the bridge token.
+
+## Versioning and local updates
+
+Maintainers publish versions with [release-it](https://github.com/release-it/release-it)
+(no npm publish; GitHub Release + git tag):
+
+```bash
+npm run release:dry   # preview
+npm run release       # bump, build versioned ZIP/SHA-256, tag and upload Release assets
+```
+
+Chrome extensions do not update files themselves. Update behavior in the sidepanel:
+
+- **Daemon disconnected:** start the installed daemon; users without an installed
+  daemon must first download a Release ZIP manually.
+- **Git checkout daemon:** `检查更新` / `由 Daemon 执行更新` runs fast-forward
+  `git pull`, install/build, restart, then prompts for extension reload.
+- **Release ZIP daemon:** the same UI downloads only the exact versioned assets
+  from this repository's latest formal GitHub Release, verifies SHA-256 and
+  archive structure, transactionally swaps the installed runtime/extension,
+  restarts, then prompts for extension reload.
+
+CLI equivalent from a git clone:
+
+```bash
+npm run update:local
+```
+
+An installation made from a ZIP older than the auto-updater must be manually
+upgraded once. GitHub account/release integrity remains the update trust root;
+SHA-256 protects artifact integrity but is not a substitute for an offline
+release-signing key.
 
 ## Codex MCP adapter
 

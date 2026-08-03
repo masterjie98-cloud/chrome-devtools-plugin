@@ -15,22 +15,43 @@ test("browser evidence verifier reports the authoritative worksheet consistently
   assert.equal(result.status, 0, result.stderr);
   const report = parseReport(result.stdout);
   assert.equal(report.ok, true);
-  assert.equal(report.complete, false);
+  assert.equal(report.complete, true);
   assert.equal(
     report.counts.notRun + report.counts.pass + report.counts.fail,
     18,
   );
-  assert.equal(report.environmentComplete, false);
+  assert.equal(report.environmentComplete, true);
   assert.equal(
     report.remainingSections.length,
     report.counts.notRun + report.counts.fail,
   );
 });
 
-test("browser evidence completion gate fails closed while rows remain not-run", () => {
-  const result = runVerifier(["--require-complete"]);
-  assert.equal(result.status, 2, result.stderr);
-  assert.equal(parseReport(result.stdout).complete, false);
+test("browser evidence completion gate fails closed while rows remain not-run", async () => {
+  const dataDir = await createTestDataDirectory("browser-evidence-incomplete-");
+  try {
+    const source = await readFile(evidencePath, "utf8");
+    const incomplete = source.replace(
+      /^\| 7 \| ([^|]+) \| pass \|.*\|$/m,
+      "| 7 | $1 | not-run | |",
+    );
+    const file = resolve(dataDir.rootDir, "incomplete.md");
+    await writeFile(file, incomplete, "utf8");
+
+    const result = runVerifier([
+      "--file",
+      file,
+      "--require-complete",
+    ]);
+    assert.equal(result.status, 2, result.stderr);
+    const report = parseReport(result.stdout);
+    assert.equal(report.ok, true);
+    assert.equal(report.complete, false);
+    assert.deepEqual(report.counts, { notRun: 1, pass: 17, fail: 0 });
+    assert.deepEqual(report.remainingSections, ["7"]);
+  } finally {
+    await dataDir.cleanup();
+  }
 });
 
 test("browser evidence completion gate accepts a fully populated sanitized worksheet", async () => {

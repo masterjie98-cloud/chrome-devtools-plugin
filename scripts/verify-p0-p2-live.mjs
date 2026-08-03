@@ -158,11 +158,8 @@ async function selectTarget() {
           String(session.activeTarget?.url ?? "").startsWith(tabUrlPrefix),
       ) ?? sessions.find((session) => session?.browserConnected === true)
     : undefined;
-  if (
-    connected &&
-    typeof connected.sessionId === "string" &&
-    connected.selected !== true
-  ) {
+  if (connected && typeof connected.sessionId === "string") {
+    // Always turn an active fallback into this adapter's explicit binding.
     await call("browser_set_session", { sessionId: connected.sessionId });
   }
 

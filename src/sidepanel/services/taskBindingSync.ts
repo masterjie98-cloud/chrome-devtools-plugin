@@ -9,6 +9,12 @@ interface TaskBindingSyncBridge {
     options?: {
       signal?: AbortSignal;
       skipTaskContext?: boolean;
+      taskContext?: {
+        taskId: string;
+        conversationId?: string;
+        target?: { tabId: number; targetId?: string };
+        egressDestinations: string[];
+      };
     },
   ) => Promise<unknown>;
 }
@@ -48,7 +54,15 @@ export async function synchronizeMcpTaskBinding(
       {},
       {
         signal: options.signal,
-        skipTaskContext: true,
+        taskContext: {
+          taskId: binding.taskId,
+          conversationId: binding.conversationId,
+          target: {
+            tabId: binding.target.tabId,
+            targetId: binding.target.targetId,
+          },
+          egressDestinations: [],
+        },
       },
     );
     if (mcpStatusMatchesTaskBinding(lastStatus, binding)) {

@@ -60,12 +60,16 @@ export interface AgentSessionExecutionBinding {
 
 export interface AgentSessionSnapshot {
   id: string;
+  assistantMessageId?: string;
   status: AgentSessionStatus;
   input: string;
   startedAt: string;
   updatedAt: string;
   completedAt?: string;
   finalContent?: string;
+  /** Bounded checkpoint used to restore the chat UI after sidepanel reload. */
+  visibleContent?: string;
+  executionOwner?: "sidepanel" | "extension_background" | "daemon";
   executionBinding?: AgentSessionExecutionBinding;
   taskState: AgentTaskState;
   events: AgentSessionEventSnapshot[];
@@ -126,14 +130,17 @@ export function createAgentSessionSnapshot(
   input: string,
   startedAt = new Date().toISOString(),
   executionBinding?: AgentSessionExecutionBinding,
+  assistantMessageId?: string,
 ): AgentSessionSnapshot {
   return {
     id,
+    ...(assistantMessageId ? { assistantMessageId } : {}),
     status: "running",
     input,
     startedAt,
     updatedAt: startedAt,
     executionBinding,
+    executionOwner: "sidepanel",
     taskState: createAgentTaskState(input, startedAt),
     events: [],
   };

@@ -1,5 +1,12 @@
 import type { PageSnapshot } from "../../shared/dom";
 import type { AgentSessionSnapshot } from "../../shared/agentSession";
+import type {
+  DaemonAgentCompletionResult,
+  DaemonAgentEventPayload,
+  DaemonAgentStartPayload,
+  DaemonAgentToolMessage,
+} from "../../shared/daemonAgent";
+import { daemonAgentResultFromSession } from "../../shared/daemonAgent";
 import {
   sanitizeCollaborationItemInput,
   type CollaborationItemInput,
@@ -30,6 +37,10 @@ import {
   type McpListToolsResultPayload,
   type McpToolResultPayload,
   type McpToolCallPayload,
+  type LocalUpdateCheckResultPayload,
+  type LocalUpdateResultPayload,
+  type LocalServiceStatusResultPayload,
+  type LocalServiceSetResultPayload,
   type McpToPluginMessage,
   type PluginChatMessageSnapshot,
   type PluginToMcpMessage,
@@ -64,6 +75,13 @@ interface McpCallOptions {
   taskContext?: McpToolCallPayload["taskContext"];
 }
 
+interface DaemonAgentHandlers {
+  onVisibleContent: (content: string) => void;
+  onStatusUpdate?: (status?: string) => void;
+  onSessionUpdate?: (session: AgentSessionSnapshot) => void;
+  onToolMessage?: (message: DaemonAgentToolMessage) => void;
+}
+
 class McpBridge {
   private socket: WebSocket | null = null;
   private authenticatedSocket: WebSocket | null = null;
@@ -93,6 +111,56 @@ class McpBridge {
       resolve: (value: McpAvailableTool[]) => void;
       reject: (error: Error) => void;
       timeout: number;
+    }
+  >();
+  private pendingLocalUpdateChecks = new Map<
+    string,
+    {
+      resolve: (value: LocalUpdateCheckResultPayload) => void;
+      reject: (error: Error) => void;
+      timeout: number;
+    }
+  >();
+  private pendingLocalUpdates = new Map<
+    string,
+    {
+      resolve: (value: LocalUpdateResultPayload) => void;
+      reject: (error: Error) => void;
+      timeout: number;
+    }
+  >();
+  private pendingLocalServiceStatus = new Map<
+    string,
+    {
+      resolve: (value: LocalServiceStatusResultPayload) => void;
+      reject: (error: Error) => void;
+      timeout: number;
+    }
+  >();
+  private pendingLocalServiceSet = new Map<
+    string,
+    {
+      resolve: (value: LocalServiceSetResultPayload) => void;
+      reject: (error: Error) => void;
+      timeout: number;
+    }
+  >();
+  private pendingDaemonAgentStarts = new Map<
+    string,
+    {
+      runId: string;
+      reject: (error: Error) => void;
+      timeout: number;
+    }
+  >();
+  private activeDaemonAgentRuns = new Map<
+    string,
+    {
+      conversationId: string;
+      handlers: DaemonAgentHandlers;
+      resolve: (value: DaemonAgentCompletionResult) => void;
+      reject: (error: Error) => void;
+      cleanup?: () => void;
     }
   >();
 
@@ -199,6 +267,107 @@ class McpBridge {
       this.socket?.readyState === WebSocket.OPEN
       ? this.connectionId
       : null;
+  }
+
+  isConnected(): boolean {
+    return (
+      this.authenticatedSocket === this.socket &&
+      this.socket?.readyState === WebSocket.OPEN
+    );
+  }
+
+  async checkLocalUpdate(): Promise<LocalUpdateCheckResultPayload> {
+    await this.waitUntilOpen();
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Daemon 未连接，无法检查更新。");
+    }
+    const requestId = createMessageId();
+    const message: PluginToMcpMessage = {
+      requestId,
+      command: WS_COMMANDS.LOCAL_UPDATE_CHECK,
+      sentAt: new Date().toISOString(),
+      payload: {},
+    };
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        this.pendingLocalUpdateChecks.delete(requestId);
+        reject(new Error("检查更新超时。"));
+      }, 60_000);
+      this.pendingLocalUpdateChecks.set(requestId, { resolve, reject, timeout });
+      this.socket?.send(JSON.stringify(message));
+    });
+  }
+
+  async runLocalUpdate(): Promise<LocalUpdateResultPayload> {
+    await this.waitUntilOpen();
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Daemon 未连接，无法执行更新。");
+    }
+    const requestId = createMessageId();
+    const message: PluginToMcpMessage = {
+      requestId,
+      command: WS_COMMANDS.LOCAL_UPDATE,
+      sentAt: new Date().toISOString(),
+      payload: {},
+    };
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        this.pendingLocalUpdates.delete(requestId);
+        reject(new Error("本地更新超时（可能仍在后台执行，请稍后重载扩展并检查 daemon）。"));
+      }, 16 * 60_000);
+      this.pendingLocalUpdates.set(requestId, { resolve, reject, timeout });
+      this.socket?.send(JSON.stringify(message));
+    });
+  }
+
+  async getLocalServiceStatus(): Promise<LocalServiceStatusResultPayload> {
+    await this.waitUntilOpen();
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Daemon 未连接，无法查询开机自启状态。");
+    }
+    const requestId = createMessageId();
+    const message: PluginToMcpMessage = {
+      requestId,
+      command: WS_COMMANDS.LOCAL_SERVICE_STATUS,
+      sentAt: new Date().toISOString(),
+      payload: {},
+    };
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        this.pendingLocalServiceStatus.delete(requestId);
+        reject(new Error("查询开机自启状态超时。"));
+      }, 30_000);
+      this.pendingLocalServiceStatus.set(requestId, {
+        resolve,
+        reject,
+        timeout,
+      });
+      this.socket?.send(JSON.stringify(message));
+    });
+  }
+
+  async setLocalServiceAutostart(
+    enabled: boolean,
+  ): Promise<LocalServiceSetResultPayload> {
+    await this.waitUntilOpen();
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Daemon 未连接，无法修改开机自启。");
+    }
+    const requestId = createMessageId();
+    const message: PluginToMcpMessage = {
+      requestId,
+      command: WS_COMMANDS.LOCAL_SERVICE_SET,
+      sentAt: new Date().toISOString(),
+      payload: { enabled },
+    };
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        this.pendingLocalServiceSet.delete(requestId);
+        reject(new Error("修改开机自启超时。"));
+      }, 60_000);
+      this.pendingLocalServiceSet.set(requestId, { resolve, reject, timeout });
+      this.socket?.send(JSON.stringify(message));
+    });
   }
 
   setTaskContext(
@@ -329,6 +498,82 @@ class McpBridge {
           : undefined,
       });
       this.socket?.send(JSON.stringify(message));
+    });
+  }
+
+  async runDaemonAgentSession(
+    payload: DaemonAgentStartPayload,
+    handlers: DaemonAgentHandlers,
+    signal?: AbortSignal,
+  ): Promise<DaemonAgentCompletionResult> {
+    if (signal?.aborted) {
+      throw browserAbortError(signal);
+    }
+    await this.waitUntilOpen();
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Daemon 未连接，无法启动后台 Agent。");
+    }
+    if (this.activeDaemonAgentRuns.has(payload.runId)) {
+      throw new Error(`AGENT_RUN_DUPLICATE: ${payload.runId}`);
+    }
+    const requestId = createMessageId();
+    const message: PluginToMcpMessage = {
+      requestId,
+      command: WS_COMMANDS.DAEMON_AGENT_START,
+      sentAt: new Date().toISOString(),
+      payload,
+    };
+
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        this.send({
+          requestId: createMessageId(),
+          command: WS_COMMANDS.DAEMON_AGENT_CANCEL,
+          sentAt: new Date().toISOString(),
+          payload: {
+            runId: payload.runId,
+            conversationId: payload.conversationId,
+            reason: "Sidepanel requested cancellation.",
+          },
+        });
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      const cleanup = signal
+        ? () => signal.removeEventListener("abort", abort)
+        : undefined;
+      this.activeDaemonAgentRuns.set(payload.runId, {
+        conversationId: payload.conversationId,
+        handlers,
+        resolve,
+        reject,
+        cleanup,
+      });
+      const timeout = window.setTimeout(() => {
+        this.pendingDaemonAgentStarts.delete(requestId);
+        const active = this.activeDaemonAgentRuns.get(payload.runId);
+        active?.cleanup?.();
+        this.activeDaemonAgentRuns.delete(payload.runId);
+        reject(new Error("启动 daemon Agent 超时。"));
+      }, 15_000);
+      this.pendingDaemonAgentStarts.set(requestId, {
+        runId: payload.runId,
+        reject,
+        timeout,
+      });
+      this.socket?.send(JSON.stringify(message));
+    });
+  }
+
+  cancelDaemonAgentRun(
+    runId: string,
+    conversationId: string,
+    reason = "Sidepanel requested cancellation.",
+  ): void {
+    this.send({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.DAEMON_AGENT_CANCEL,
+      sentAt: new Date().toISOString(),
+      payload: { runId, conversationId, reason },
     });
   }
 
@@ -538,8 +783,73 @@ class McpBridge {
       return;
     }
 
+    if (message.command === WS_COMMANDS.DAEMON_AGENT_START_RESULT) {
+      const pending = this.pendingDaemonAgentStarts.get(message.requestId);
+      if (pending) {
+        window.clearTimeout(pending.timeout);
+        this.pendingDaemonAgentStarts.delete(message.requestId);
+        if (!message.payload.ok) {
+          const active = this.activeDaemonAgentRuns.get(pending.runId);
+          active?.cleanup?.();
+          this.activeDaemonAgentRuns.delete(pending.runId);
+          pending.reject(new Error(message.payload.error));
+        }
+      }
+      return;
+    }
+
+    if (message.command === WS_COMMANDS.DAEMON_AGENT_EVENT) {
+      this.handleDaemonAgentEvent(message.payload);
+      return;
+    }
+
+    if (message.command === WS_COMMANDS.AGENT_SESSION_SYNC) {
+      this.handleDaemonAgentSessionSync(message.payload.session);
+      return;
+    }
+
     if (message.command === WS_COMMANDS.MCP_LIST_TOOLS_RESULT) {
       this.resolveMcpToolListRequest(message.requestId, message.payload);
+      return;
+    }
+
+    if (message.command === WS_COMMANDS.LOCAL_UPDATE_CHECK_RESULT) {
+      const pending = this.pendingLocalUpdateChecks.get(message.requestId);
+      if (pending) {
+        window.clearTimeout(pending.timeout);
+        this.pendingLocalUpdateChecks.delete(message.requestId);
+        pending.resolve(message.payload);
+      }
+      return;
+    }
+
+    if (message.command === WS_COMMANDS.LOCAL_UPDATE_RESULT) {
+      const pending = this.pendingLocalUpdates.get(message.requestId);
+      if (pending) {
+        window.clearTimeout(pending.timeout);
+        this.pendingLocalUpdates.delete(message.requestId);
+        pending.resolve(message.payload);
+      }
+      return;
+    }
+
+    if (message.command === WS_COMMANDS.LOCAL_SERVICE_STATUS_RESULT) {
+      const pending = this.pendingLocalServiceStatus.get(message.requestId);
+      if (pending) {
+        window.clearTimeout(pending.timeout);
+        this.pendingLocalServiceStatus.delete(message.requestId);
+        pending.resolve(message.payload);
+      }
+      return;
+    }
+
+    if (message.command === WS_COMMANDS.LOCAL_SERVICE_SET_RESULT) {
+      const pending = this.pendingLocalServiceSet.get(message.requestId);
+      if (pending) {
+        window.clearTimeout(pending.timeout);
+        this.pendingLocalServiceSet.delete(message.requestId);
+        pending.resolve(message.payload);
+      }
       return;
     }
 
@@ -562,6 +872,67 @@ class McpBridge {
   private enqueueApproval(request: ApprovalRequestPayload): void {
     void this.resolveApprovalRequest(request)
       .catch(() => undefined);
+  }
+
+  private handleDaemonAgentEvent(event: DaemonAgentEventPayload): void {
+    this.markDaemonAgentStartAccepted(event.runId);
+    const active = this.activeDaemonAgentRuns.get(event.runId);
+    if (!active || active.conversationId !== event.conversationId) {
+      return;
+    }
+    switch (event.kind) {
+      case "visible_content":
+        active.handlers.onVisibleContent(event.content);
+        return;
+      case "status":
+        active.handlers.onStatusUpdate?.(event.status);
+        return;
+      case "session":
+        active.handlers.onSessionUpdate?.(event.session);
+        return;
+      case "tool_message":
+        active.handlers.onToolMessage?.(event.message);
+        return;
+      case "completed":
+        active.cleanup?.();
+        this.activeDaemonAgentRuns.delete(event.runId);
+        active.resolve(event.result);
+        return;
+      case "failed":
+        active.cleanup?.();
+        this.activeDaemonAgentRuns.delete(event.runId);
+        active.reject(new Error(event.error));
+        return;
+    }
+  }
+
+  private handleDaemonAgentSessionSync(session: AgentSessionSnapshot): void {
+    const active = this.activeDaemonAgentRuns.get(session.id);
+    if (!active) {
+      return;
+    }
+    this.markDaemonAgentStartAccepted(session.id);
+    active.handlers.onSessionUpdate?.(session);
+    if (session.visibleContent) {
+      active.handlers.onVisibleContent(session.visibleContent);
+    }
+    const result = daemonAgentResultFromSession(session);
+    if (!result) {
+      return;
+    }
+    active.cleanup?.();
+    this.activeDaemonAgentRuns.delete(session.id);
+    active.resolve(result);
+  }
+
+  private markDaemonAgentStartAccepted(runId: string): void {
+    for (const [requestId, pending] of this.pendingDaemonAgentStarts) {
+      if (pending.runId !== runId) {
+        continue;
+      }
+      window.clearTimeout(pending.timeout);
+      this.pendingDaemonAgentStarts.delete(requestId);
+    }
   }
 
   private async resolveApprovalRequest(
@@ -790,6 +1161,13 @@ function parseServerMessage(raw: unknown): McpToPluginMessage | null {
       (parsed.command === WS_COMMANDS.MCP_LIST_TOOLS_RESULT ||
         parsed.command === WS_COMMANDS.SERVER_WELCOME ||
         parsed.command === WS_COMMANDS.MCP_TOOL_RESULT ||
+        parsed.command === WS_COMMANDS.LOCAL_UPDATE_CHECK_RESULT ||
+        parsed.command === WS_COMMANDS.LOCAL_UPDATE_RESULT ||
+        parsed.command === WS_COMMANDS.LOCAL_SERVICE_STATUS_RESULT ||
+        parsed.command === WS_COMMANDS.LOCAL_SERVICE_SET_RESULT ||
+        parsed.command === WS_COMMANDS.AGENT_SESSION_SYNC ||
+        parsed.command === WS_COMMANDS.DAEMON_AGENT_START_RESULT ||
+        parsed.command === WS_COMMANDS.DAEMON_AGENT_EVENT ||
         parsed.command === WS_COMMANDS.APPROVAL_REQUEST ||
         parsed.command === WS_COMMANDS.APPROVAL_CANCELLED ||
         parsed.command === WS_COMMANDS.BROWSER_TOOL_CALL ||

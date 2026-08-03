@@ -22,6 +22,10 @@ const releasePackageJson = JSON.parse(
   await readFile(join(bundleRoot, "package.json"), "utf8"),
 );
 const version = String(releasePackageJson.version ?? "").trim();
+const updateRepository = String(
+  releasePackageJson.aiDevtools?.updateRepository ??
+    "masterjie98-cloud/chrome-devtools-plugin",
+).trim();
 const installRoot = join(
   homedir(),
   "Library",
@@ -78,6 +82,9 @@ await writeFile(
       installedAt: new Date().toISOString(),
       extensionPath: installedExtensionRoot,
       runtimePath: installedRuntimeRoot,
+      platform: process.platform,
+      installMode: "release-zip",
+      updateRepository,
     },
     null,
     2,

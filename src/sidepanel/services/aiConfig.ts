@@ -11,6 +11,8 @@ export interface AiConfig {
   model: string;
   temperature: number;
   maxHistory: number;
+  /** Provider/model context window used for local input-budget enforcement. */
+  contextWindowTokens: number;
   maxOutputTokens?: number;
   supportsVision: boolean;
   includeImageHistory: boolean;
@@ -55,6 +57,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   model: "gpt-4.1-mini",
   temperature: 0.2,
   maxHistory: 12,
+  contextWindowTokens: 128_000,
   maxOutputTokens: undefined,
   supportsVision: false,
   includeImageHistory: false,
@@ -325,6 +328,12 @@ function normalizeAiConfig(config: Partial<AiConfig>): AiConfig {
       0,
       40,
       DEFAULT_AI_CONFIG.maxHistory,
+    ),
+    contextWindowTokens: clampInteger(
+      config.contextWindowTokens,
+      8_192,
+      2_000_000,
+      DEFAULT_AI_CONFIG.contextWindowTokens,
     ),
     maxOutputTokens:
       config.maxOutputTokens === undefined || config.maxOutputTokens === null

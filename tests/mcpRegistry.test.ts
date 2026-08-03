@@ -4,6 +4,7 @@ import {
   MCP_RUNTIME_TOOL_REGISTRY,
   MCP_TOOL_INPUT_SCHEMAS,
   listRuntimeMcpTools,
+  parseMcpToolArgs,
   parseMcpToolProfile,
   runtimeToolsForProfile,
 } from "../src/mcp/toolRuntime";
@@ -21,6 +22,7 @@ import {
   MCP_TOOL_OUTPUT_SCHEMAS,
   mcpToolOutputJsonSchema,
 } from "../src/mcp/toolOutputSchemas";
+import { MAX_CSS_PATCH_CHARS } from "../src/shared/dom";
 
 test("canonical MCP runtime registry covers every exposed tool exactly once", () => {
   const registryNames = MCP_RUNTIME_TOOL_REGISTRY.map(
@@ -67,6 +69,67 @@ test("diagnostic activity, source, and evidence tools are exposed to MCP clients
   ]) {
     assert.equal(exposedNames.has(toolName), true, `${toolName} must be exposed`);
   }
+});
+
+test("canonical Network request tool exposes pagination without the legacy duplicate", () => {
+  const exposedNames = new Set(
+    MCP_EXPOSED_TOOL_DEFINITIONS.map((tool) => tool.name),
+  );
+  const definition = MCP_EXPOSED_TOOL_DEFINITIONS.find(
+    ({ name }) => name === MCP_TOOL_NAMES.BROWSER_NETWORK_REQUESTS,
+  );
+
+  assert.ok(definition);
+  assert.equal(
+    exposedNames.has(MCP_TOOL_NAMES.BROWSER_NETWORK_LIST_REQUESTS),
+    false,
+  );
+  assert.ok("cursor" in definition.parameters.properties);
+  assert.ok("limit" in definition.parameters.properties);
+  assert.equal(
+    MCP_TOOL_INPUT_SCHEMAS[
+      MCP_TOOL_NAMES.BROWSER_NETWORK_REQUESTS
+    ].safeParse({
+      cursor: "cp1_network_deadbeef_1_2",
+      limit: 2,
+    }).success,
+    true,
+  );
+});
+
+test("CSS patch capacity is advertised and enforced with actionable errors", () => {
+  const definition = MCP_EXPOSED_TOOL_DEFINITIONS.find(
+    ({ name }) => name === MCP_TOOL_NAMES.BROWSER_APPLY_CSS_PATCH,
+  );
+  assert.ok(definition);
+  const cssSchema = definition.parameters.properties.css as Record<
+    string,
+    unknown
+  >;
+  assert.equal(cssSchema.maxLength, MAX_CSS_PATCH_CHARS);
+  assert.match(String(cssSchema.description), /complete rule|rule or at-rule/i);
+
+  assert.doesNotThrow(() =>
+    parseMcpToolArgs(MCP_TOOL_NAMES.BROWSER_APPLY_CSS_PATCH, {
+      css: "a".repeat(MAX_CSS_PATCH_CHARS),
+    }),
+  );
+  assert.throws(
+    () =>
+      parseMcpToolArgs(MCP_TOOL_NAMES.BROWSER_APPLY_CSS_PATCH, {
+        css: "a".repeat(MAX_CSS_PATCH_CHARS + 1),
+      }),
+    new RegExp(
+      `css: string length ${MAX_CSS_PATCH_CHARS + 1} exceeds maximum ${MAX_CSS_PATCH_CHARS} characters; split at complete CSS rule`,
+    ),
+  );
+  assert.throws(
+    () =>
+      parseMcpToolArgs(MCP_TOOL_NAMES.BROWSER_APPLY_CSS_PATCH, {
+        css: "a".repeat(MAX_CSS_PATCH_CHARS + 1),
+      }),
+    /argument_constraint=.*"kind":"max_string_length".*"path":"css"/,
+  );
 });
 
 test("every canonical MCP tool has a specific bounded output contract", () => {

@@ -98,9 +98,10 @@ async function selectTarget() {
   if (
     connectedSession &&
     typeof connectedSession === "object" &&
-    typeof connectedSession.sessionId === "string" &&
-    connectedSession.selected !== true
+    typeof connectedSession.sessionId === "string"
   ) {
+    // Resource subscriptions require an explicit adapter-owned binding even
+    // when the daemon exposes the same Profile as its active fallback.
     await call("browser_set_session", {
       sessionId: connectedSession.sessionId,
     });

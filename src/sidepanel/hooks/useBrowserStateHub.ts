@@ -31,6 +31,7 @@ interface BrowserStateHubState {
   selectedElement?: DomElementInfo;
   pageContext?: PageSnapshot;
   lastScreenshot?: ScreenshotCaptureResult;
+  agentSessions: AgentSessionSnapshot[];
   activeAgentSession?: AgentSessionSnapshot;
   collaborationWorkspace?: CollaborationWorkspaceSnapshot;
   activityStream?: BrowserActivityUpdatedPayload;
@@ -39,6 +40,7 @@ interface BrowserStateHubState {
 export function useBrowserStateHub(): BrowserStateHubState {
   const [state, setState] = useState<BrowserStateHubState>({
     connected: false,
+    agentSessions: [],
   });
 
   useEffect(() => {
@@ -182,11 +184,22 @@ export function useBrowserStateHub(): BrowserStateHubState {
           }));
           break;
         case WS_COMMANDS.AGENT_SESSION_SYNC:
-          setState((current) => ({
-            ...current,
-            activeAgentSession: parsed.payload
-              ?.session as AgentSessionSnapshot,
-          }));
+          setState((current) => {
+            const session = parsed.payload?.session as AgentSessionSnapshot;
+            const agentSessions = [
+              ...current.agentSessions.filter(
+                (candidate) => candidate.id !== session.id,
+              ),
+              session,
+            ].slice(-20);
+            return {
+              ...current,
+              agentSessions,
+              activeAgentSession: [...agentSessions]
+                .reverse()
+                .find((candidate) => candidate.status === "running"),
+            };
+          });
           break;
         case WS_COMMANDS.COLLABORATION_WORKSPACE_UPDATED:
           setState((current) => ({

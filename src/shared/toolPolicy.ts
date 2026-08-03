@@ -336,6 +336,20 @@ export function getToolPolicy(
   }
 
   if (
+    normalizedName === MCP_TOOL_NAMES.BROWSER_ACTIVITY_START &&
+    (args.includeRealtimePayloads === true || args.includeResponseBodies === true)
+  ) {
+    return overridePolicy(createPolicy(normalizedName, baseClass, true), {
+      sensitive: true,
+      dataSensitivity: "raw_body",
+      approvalMode: "decision_barrier",
+      capability: "page.observe.sensitive",
+      reason:
+        "Starts continuous observation with explicit WebSocket/SSE payload or Network response-body previews, so this run requires a separate sensitive-data confirmation.",
+    });
+  }
+
+  if (
     normalizedName === MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE
   ) {
     return overridePolicy(createPolicy(normalizedName, baseClass, true), {

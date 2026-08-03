@@ -107,7 +107,15 @@ export type ExtensionRequest =
       id: string;
       source: "background";
       type: typeof MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR;
-      payload: { enabled: boolean };
+      payload: {
+        enabled: boolean;
+        includeDom?: boolean;
+        includeStyle?: boolean;
+        includeVisual?: boolean;
+        includeStorage?: boolean;
+        visualSampleIntervalMs?: number;
+        hookToken?: string;
+      };
     }
   | {
       id: string;
@@ -293,7 +301,7 @@ export type ExtensionEvent =
     }
   | {
       id: string;
-      source: "content";
+      source: "content" | "background";
       type: typeof MESSAGE_TYPES.CONTENT_SELECTION_CANCELLED;
       payload: { reason: string };
     }

@@ -461,6 +461,87 @@ test("[eval 06] browser_verify evaluates multiple outcomes from one live read", 
   );
 });
 
+test("[eval 06a] browser_verify compares single and multi-select values", async () => {
+  const snapshot = pageSnapshot();
+  const bridge = {
+    connectedPluginClients: () => 1,
+    callBrowserTool: async (call: AnyToolCall) => {
+      assert.equal(call.toolName, TOOL_NAMES.DOM_GET_PAGE_INFO);
+      return {
+        ...snapshot,
+        nodeCount: 2,
+        semanticSnapshot: paginateSemanticSnapshot(
+          [
+            {
+              role: "combobox",
+              name: "Country",
+              selector: "#country",
+              tagName: "select",
+              value: "us",
+              selectedValues: ["us"],
+              bounds: { x: 20, y: 20, width: 200, height: 32 },
+            },
+            {
+              role: "listbox",
+              name: "Tags",
+              selector: "#tags",
+              tagName: "select",
+              value: "beta",
+              selectedValues: ["beta", "gamma"],
+              bounds: { x: 20, y: 64, width: 200, height: 64 },
+            },
+          ],
+          { limit: 100 },
+          `${target.url}\n${target.title}`,
+          false,
+        ),
+      };
+    },
+  } as unknown as PluginWebSocketServer;
+
+  const result = await executeMcpToolData(
+    MCP_TOOL_NAMES.BROWSER_VERIFY,
+    {
+      checks: [
+        {
+          id: "country",
+          type: "target_state",
+          selector: "#country",
+          value: "us",
+        },
+        {
+          id: "tags",
+          type: "target_state",
+          selector: "#tags",
+          selectedValues: ["gamma", "beta"],
+        },
+      ],
+    },
+    bridge,
+    { sessionId: "eval-verify-selects" },
+  );
+
+  assert.equal(read(result, "passed"), true);
+  const checks = read(result, "checks") as Array<Record<string, unknown>>;
+  assert.equal(checks.length, 2);
+  const multiSelectActual = read(checks[1], "actual") as Record<
+    string,
+    unknown
+  >;
+  assert.match(String(multiSelectActual.targetRef), /^sr1_[a-f0-9]{8}_s2$/);
+  assert.deepEqual({ ...multiSelectActual, targetRef: undefined }, {
+    role: "listbox",
+    name: "Tags",
+    targetRef: undefined,
+    disabled: undefined,
+    checked: undefined,
+    selected: undefined,
+    expanded: undefined,
+    value: "beta",
+    selectedValues: ["beta", "gamma"],
+  });
+});
+
 test("[eval 07] browser_debug_activity excludes raw response bodies", async () => {
   browserStateHub.setCurrentTab(target, "eval-debug");
   const result = await executeMcpToolData(

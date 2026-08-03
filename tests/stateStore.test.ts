@@ -3,6 +3,10 @@ import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
 import { DaemonStateStore, type RedactedAuditEvent } from "../src/daemon/store/stateStore";
 import { BrowserStateHub } from "../src/mcp/browserStateHub";
+import {
+  appendAgentSessionEvent,
+  createAgentSessionSnapshot,
+} from "../src/shared/agentSession";
 import { createTestDataDirectory } from "./helpers/tempDataDir";
 
 test("DaemonStateStore restores sanitized session metadata and current conversation", async () => {
@@ -113,6 +117,81 @@ test("DaemonStateStore restores sanitized session metadata and current conversat
     assert.equal((await restartedStore.listAuditEvents()).length, 1);
     assert.equal((await stat(dataDir.rootDir)).mode & 0o777, 0o700);
     assert.equal((await stat(dataDir.statePath)).mode & 0o777, 0o600);
+  } finally {
+    await dataDir.cleanup();
+  }
+});
+
+test("DaemonStateStore preserves a sanitized Agent snapshot and blocks an interrupted run after restart", async () => {
+  const dataDir = await createTestDataDirectory("ai-devtools-agent-state-");
+  const store = new DaemonStateStore({ statePath: dataDir.statePath });
+  const hub = new BrowserStateHub();
+
+  try {
+    await store.load();
+    let session = createAgentSessionSnapshot(
+      "agent-running-before-restart",
+      "检查当前页面并定位错误",
+      "2026-08-03T01:00:00.000Z",
+      {
+        taskId: "task-running",
+        conversationId: "conversation-running",
+        target: {
+          tabId: 42,
+          url: "https://example.test/page?access_token=secret",
+        },
+      },
+    );
+    session = appendAgentSessionEvent(session, {
+      id: "event-tool-result",
+      type: "tool_results",
+      createdAt: "2026-08-03T01:00:01.000Z",
+      summary: "读取页面完成",
+      data: {
+        toolCalls: [
+          {
+            id: "call-1",
+            name: "browser_evaluate",
+            arguments: { expression: "window.secretToken" },
+          },
+        ],
+        toolResults: [
+          {
+            toolCallId: "call-1",
+            name: "browser_evaluate",
+            content: "sensitive-result-value",
+          },
+        ],
+      },
+    });
+    hub.setAgentSession(session, "profile-agent-recovery");
+
+    store.scheduleBrowserState(hub.toPersistentState());
+    await store.flush();
+
+    const raw = await readFile(dataDir.statePath, "utf8");
+    assert.equal(raw.includes("window.secretToken"), false);
+    assert.equal(raw.includes("sensitive-result-value"), false);
+    assert.equal(raw.includes("[value omitted]"), true);
+
+    const restoredState = await new DaemonStateStore({
+      statePath: dataDir.statePath,
+    }).load();
+    const restartedHub = new BrowserStateHub(
+      () => Date.parse("2026-08-03T01:05:00.000Z"),
+    );
+    restartedHub.restorePersistentState(restoredState);
+
+    const snapshot = restartedHub.snapshot("profile-agent-recovery");
+    assert.equal(snapshot.activeAgentSession, undefined);
+    assert.equal(snapshot.agentSessions.length, 1);
+    assert.equal(snapshot.agentSessions[0]?.status, "blocked");
+    assert.equal(snapshot.agentSessions[0]?.taskState.phase, "blocked");
+    assert.match(
+      snapshot.agentSessions[0]?.finalContent ?? "",
+      /原执行环境已经结束/,
+    );
+    assert.equal(snapshot.agentSessions[0]?.events.at(-1)?.type, "blocked");
   } finally {
     await dataDir.cleanup();
   }

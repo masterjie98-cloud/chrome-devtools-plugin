@@ -274,6 +274,10 @@ export interface DomSetValueResult {
   currentValue?: string;
 }
 
+// A practical ceiling for ordinary CSS that remains well below the 256 KiB
+// MCP tool-call frame after typical JSON escaping and metadata overhead.
+export const MAX_CSS_PATCH_CHARS = 64 * 1024;
+
 export interface CssPatchInput {
   patchId: string;
   css: string;
@@ -363,6 +367,8 @@ export interface BrowserTargetSetInput {
 
 export interface BrowserTargetSetResult extends BrowserTargetListResult {
   selectedTab: BrowserTargetTab;
+  dialogHandlingPrepared?: boolean;
+  dialogHandlingPreparationError?: string;
 }
 
 export interface BrowserTargetFrame {

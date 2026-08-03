@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   getBackgroundConversationWork,
+  listBackgroundConversationWork,
   listConversationApprovals,
   listConversationQueue,
 } from "../src/sidepanel/services/backgroundConversationWork";
@@ -94,6 +95,45 @@ test("the active conversation never reports its own run as background work", () 
     undefined,
   );
 });
+
+test("multiple conversations remain independently visible as background work", () => {
+  const work = listBackgroundConversationWork({
+    activeConversationId: "chat-current",
+    activeExecutionBindings: [
+      { taskId: "task-a", conversationId: "chat-old", target: { tabId: 7 } },
+      { taskId: "task-b", conversationId: "chat-new", target: { tabId: 8 } },
+    ],
+    conversations: [
+      conversation("chat-old", "旧任务"),
+      conversation("chat-new", "新任务"),
+    ],
+    approvals,
+    queued,
+    activeDelegatedTaskIds: new Set(["task-b"]),
+  });
+  assert.deepEqual(
+    work.map((item) => [item.conversationId, item.pendingApprovalCount]),
+    [
+      ["chat-old", 1],
+      ["chat-new", 1],
+    ],
+  );
+  assert.equal(work[1]?.recoverableDelegatedTask, true);
+});
+
+function conversation(id: string, title: string) {
+  return {
+    id,
+    title,
+    updatedAt: "2026-07-29T00:00:00.000Z",
+    messageCount: 1,
+    hasDraft: false,
+    forked: false,
+    searchText: "",
+    exportMarkdown: "",
+    exportJson: "",
+  };
+}
 
 function pendingApproval(
   id: string,

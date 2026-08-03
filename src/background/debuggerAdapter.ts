@@ -126,6 +126,7 @@ import {
   topLevelDebuggerTarget,
 } from "./debuggerTargetRouting";
 import { getTargetNavigationState } from "./targetNavigation";
+import { sanitizeNetworkUrl } from "../shared/sanitize";
 
 const PROTOCOL_VERSION = "1.3";
 const DEFAULT_MAX_NETWORK_ENTRIES = 2_000;
@@ -291,6 +292,7 @@ interface NetworkSession {
   target: DebuggerTarget;
   targetInfo?: chrome.debugger.TargetInfo;
   attached: boolean;
+  pageEnabled: boolean;
   networkEnabled: boolean;
   fetchEnabled: boolean;
   runtimeEnabled: boolean;
@@ -318,6 +320,10 @@ interface NetworkSession {
   pauseOnExceptions: Map<string, BrowserDebugPauseOnExceptionsState>;
   webSockets: Map<string, RealtimeWebSocketRecord>;
   eventSources: Map<string, RealtimeEventSourceRecord>;
+  activityIncludeRealtime: boolean;
+  activityIncludeRealtimePayloads: boolean;
+  activityIncludeResponseBodies: boolean;
+  activityMaxResponseBodyBytes: number;
 }
 
 interface StoredDebugBreakpoint extends BrowserDebugBreakpoint {
@@ -359,6 +365,8 @@ interface ScreenshotClip {
 }
 
 let activeSession: NetworkSession | null = null;
+const activitySessionsByTabId = new Map<number, NetworkSession>();
+const MAX_ACTIVITY_DEBUGGER_SESSIONS = 8;
 let debuggerListenersRegistered = false;
 const proxyRules = new Map<string, DebuggerProxyRule>();
 const childDebuggerSessions = new Map<string, ChildDebuggerSession>();
@@ -375,8 +383,7 @@ const manualDebuggerDetachTabIds = new Set<number>();
 const debuggerActivityListeners = new Set<
   (event: BrowserActivityEventInput) => void
 >();
-let debuggerActivityMonitoringActive = false;
-let debuggerActivityMonitorTabId: number | undefined;
+const debuggerActivityMonitorTabIds = new Set<number>();
 
 export function subscribeDebuggerActivity(
   listener: (event: BrowserActivityEventInput) => void,
@@ -388,11 +395,16 @@ export function subscribeDebuggerActivity(
 export function emitDebuggerActivityLifecycle(
   active: boolean,
   target?: BrowserActivityEventInput["target"],
-  locksDebugger = false,
+  _locksDebugger = false,
 ): void {
-  debuggerActivityMonitoringActive = active;
-  debuggerActivityMonitorTabId =
-    active && locksDebugger ? target?.tabId : undefined;
+  const tabId = target?.tabId;
+  if (tabId !== undefined) {
+    if (active) {
+      debuggerActivityMonitorTabIds.add(tabId);
+    } else {
+      debuggerActivityMonitorTabIds.delete(tabId);
+    }
+  }
   const event: BrowserActivityEventInput = {
     kind: "navigation",
     observedAt: new Date().toISOString(),
@@ -1222,7 +1234,19 @@ export async function handleCurrentJavaScriptDialog(
   input: BrowserDialogInput,
   expectedTabId: number,
 ): Promise<BrowserDialogResult> {
-  const session = await ensureDebuggerSessionForTab(expectedTabId);
+  // Chrome cannot reliably attach and enable the Page domain after a native
+  // dialog has already blocked the renderer. Require the target-selection
+  // preflight below so an unprepared dialog fails immediately instead of
+  // consuming the daemon request deadline.
+  const session =
+    activeSession?.tabId === expectedTabId
+      ? activeSession
+      : activitySessionsByTabId.get(expectedTabId);
+  if (!session?.attached || !session.pageEnabled) {
+    throw new Error(
+      "DIALOG_SESSION_NOT_ARMED: native dialog handling was not prepared before the dialog opened. Select the target Tab with browser_set_target_tab before triggering the dialog, then retry the page action.",
+    );
+  }
   try {
     await debuggerSendCommand(
       session.target,
@@ -1241,6 +1265,15 @@ export async function handleCurrentJavaScriptDialog(
       ? { promptText: input.promptText }
       : {}),
   };
+}
+
+export async function prepareJavaScriptDialogHandling(
+  expectedTabId: number,
+): Promise<void> {
+  const session = await ensureDebuggerSessionForTab(expectedTabId, {
+    enableOopifAutoAttach: false,
+  });
+  await ensurePageEnabled(session);
 }
 
 export async function dispatchTrustedTextInput(
@@ -1667,6 +1700,137 @@ export async function startRuntimeErrorMonitoring(
   };
 }
 
+export async function startActivityDebuggerForTab(
+  tabId: number,
+  input: {
+    includeNetwork: boolean;
+    includeConsole: boolean;
+    includeRealtime?: boolean;
+    includeRealtimePayloads?: boolean;
+    includeResponseBodies?: boolean;
+    maxResponseBodyBytes?: number;
+    preserveLog: boolean;
+    maxNetworkEntries: number;
+  },
+): Promise<{
+  networkObservationSessionId?: string;
+  runtimeErrorCursor?: { streamId: string; sequence: number };
+}> {
+  const session = await ensureActivitySessionForTab(tabId);
+  if (!input.preserveLog) {
+    clearNetworkRequestsForSession(session);
+    resetRuntimeErrorStream(session);
+    session.consoleMessages = [];
+  }
+  session.maxEntries = input.maxNetworkEntries;
+  session.preservedLog = input.preserveLog;
+  session.activityIncludeRealtime = input.includeRealtime === true;
+  session.activityIncludeRealtimePayloads =
+    input.includeRealtimePayloads === true;
+  session.activityIncludeResponseBodies = input.includeResponseBodies === true;
+  session.activityMaxResponseBodyBytes = Math.min(
+    MAX_RESPONSE_BODY_CHARS,
+    Math.max(1_024, input.maxResponseBodyBytes ?? 32_768),
+  );
+
+  if (
+    input.includeNetwork ||
+    input.includeRealtime ||
+    input.includeResponseBodies
+  ) {
+    if (!session.networkEnabled) {
+      session.observationSessionId =
+        `network-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      session.observationStartedAt = new Date().toISOString();
+      await debuggerSendCommand(session.target, "Network.enable", {});
+      session.networkEnabled = true;
+    }
+  }
+
+  let runtimeErrorCursor:
+    | { streamId: string; sequence: number }
+    | undefined;
+  if (input.includeConsole) {
+    await Promise.all([
+      ensureConsoleEnabled(session),
+      ensureDebuggerEnabled(session),
+    ]);
+    session.runtimeErrorMonitoringActive = true;
+    runtimeErrorCursor = {
+      streamId: session.runtimeErrorStreamId,
+      sequence: session.runtimeErrorSequence,
+    };
+  }
+
+  return {
+    networkObservationSessionId:
+      input.includeNetwork || input.includeRealtime || input.includeResponseBodies
+      ? session.observationSessionId
+      : undefined,
+    runtimeErrorCursor,
+  };
+}
+
+export async function stopActivityDebuggerForTab(tabId: number): Promise<void> {
+  const session = activitySessionsByTabId.get(tabId);
+  if (!session) {
+    return;
+  }
+  activitySessionsByTabId.delete(tabId);
+  session.activityIncludeRealtime = false;
+  session.activityIncludeRealtimePayloads = false;
+  session.activityIncludeResponseBodies = false;
+  // The ordinary debugger/proxy workflow may share this CDP attachment when it
+  // targets the same Tab. Stopping the activity stream must not disable a
+  // Network/Runtime domain that the still-active workflow owns.
+  if (activeSession !== session) {
+    session.runtimeErrorMonitoringActive = false;
+    if (session.networkEnabled) {
+      await debuggerSendCommand(session.target, "Network.disable", {}).catch(
+        () => undefined,
+      );
+      session.networkEnabled = false;
+    }
+    await debuggerDetach(session.target).catch(() => undefined);
+    session.attached = false;
+  }
+}
+
+async function ensureActivitySessionForTab(tabId: number): Promise<NetworkSession> {
+  const existing = activitySessionsByTabId.get(tabId);
+  if (existing?.attached) {
+    return existing;
+  }
+  const tab = await getTab(tabId);
+  const tabUrl = tab?.url ?? (tab ? getPendingTabUrl(tab) : undefined);
+  if (!tab?.id || !isTabUrlScriptable(tabUrl)) {
+    throw new Error(
+      `ACTIVITY_TARGET_UNAVAILABLE: Tab ${tabId} is closed or cannot be monitored.`,
+    );
+  }
+  if (
+    !existing &&
+    activeSession?.tabId !== tabId &&
+    activitySessionsByTabId.size >= MAX_ACTIVITY_DEBUGGER_SESSIONS
+  ) {
+    throw new Error(
+      `ACTIVITY_MONITOR_LIMIT: at most ${MAX_ACTIVITY_DEBUGGER_SESSIONS} Tabs can be monitored simultaneously. Stop one existing monitor before starting another.`,
+    );
+  }
+  registerDebuggerListeners();
+  const resolvedTarget = await resolveDebuggerTarget(tabId, tabUrl);
+  const session =
+    activeSession?.tabId === tabId
+      ? activeSession
+      : existing ?? createNetworkSession(tabId, resolvedTarget);
+  if (!session.attached) {
+    await attachDebuggerToTab(session);
+    session.attached = true;
+  }
+  activitySessionsByTabId.set(tabId, session);
+  return session;
+}
+
 export function stopRuntimeErrorMonitoring(): void {
   if (activeSession) {
     activeSession.runtimeErrorMonitoringActive = false;
@@ -1851,7 +2015,9 @@ export async function getNetworkRequest(
 
   const detail: DebuggerNetworkRequestDetail = {
     ...toNetworkSummary(record),
-    documentUrl: record.documentUrl,
+    documentUrl: record.documentUrl
+      ? sanitizeNetworkUrl(record.documentUrl)
+      : undefined,
     requestHeaders: record.requestHeaders,
     responseHeaders: record.responseHeaders,
     requestPostData: record.requestPostData,
@@ -1931,8 +2097,8 @@ function registerDebuggerListeners(): void {
 
   chrome.debugger.onEvent.addListener(handleDebuggerEvent);
   chrome.debugger.onDetach.addListener((source, reason) => {
-    const session = activeSession;
-    if (!session || !sourceMatchesSession(source, session)) {
+    const session = sessionForDebuggerSource(source);
+    if (!session) {
       return;
     }
     proxyLog("debugger.detach", {
@@ -1940,14 +2106,29 @@ function registerDebuggerListeners(): void {
       source: summarizeDebuggee(source),
       tabId: session.tabId,
     });
-    clearChildDebuggerSessions();
+    if (session === activeSession) {
+      clearChildDebuggerSessions();
+    }
     session.attached = false;
+    session.pageEnabled = false;
     session.networkEnabled = false;
     session.fetchEnabled = false;
+    session.runtimeEnabled = false;
+    session.logEnabled = false;
+    session.debuggerEnabled = false;
     session.oopifAutoAttachEnabled = false;
     session.breakpoints.clear();
     session.pausedTargets.clear();
     session.pauseOnExceptions.clear();
+    if (activitySessionsByTabId.get(session.tabId) === session) {
+      activitySessionsByTabId.delete(session.tabId);
+      emitDebuggerActivityLifecycle(false, {
+        url: session.targetInfo?.url ?? "",
+        title: session.targetInfo?.title ?? "",
+        targetId: String(session.tabId),
+        tabId: session.tabId,
+      });
+    }
     if (shouldRespectManualDebuggerDetach(session.tabId, reason)) {
       void stopProxyAfterManualDebuggerDetach(session.tabId, reason);
       return;
@@ -2145,70 +2326,83 @@ function handleDebuggerEvent(
     return;
   }
 
-  if (!activeSession || !sourceMatchesSession(source, activeSession)) {
+  const session = sessionForDebuggerSource(source);
+  if (!session) {
     return;
   }
 
   switch (method) {
     case "Network.requestWillBeSent":
-      handleRequestWillBeSent(params as NetworkRequestWillBeSentEvent);
+      handleRequestWillBeSent(
+        params as NetworkRequestWillBeSentEvent,
+        session,
+      );
       break;
     case "Network.responseReceived":
-      handleResponseReceived(params as NetworkResponseReceivedEvent);
+      handleResponseReceived(params as NetworkResponseReceivedEvent, session);
       break;
     case "Network.loadingFinished":
-      handleLoadingFinished(params as NetworkLoadingFinishedEvent);
+      handleLoadingFinished(params as NetworkLoadingFinishedEvent, session);
       break;
     case "Network.loadingFailed":
-      handleLoadingFailed(params as NetworkLoadingFailedEvent);
+      handleLoadingFailed(params as NetworkLoadingFailedEvent, session);
       break;
     case "Network.webSocketCreated":
-      handleWebSocketCreated(params as NetworkWebSocketCreatedEvent);
+      handleWebSocketCreated(params as NetworkWebSocketCreatedEvent, session);
       break;
     case "Network.webSocketWillSendHandshakeRequest":
-      handleWebSocketHandshake(params as NetworkWebSocketHandshakeEvent);
+      handleWebSocketHandshake(params as NetworkWebSocketHandshakeEvent, session);
       break;
     case "Network.webSocketFrameSent":
-      handleWebSocketFrame(params as NetworkWebSocketFrameEvent, "sent");
+      handleWebSocketFrame(params as NetworkWebSocketFrameEvent, "sent", session);
       break;
     case "Network.webSocketFrameReceived":
-      handleWebSocketFrame(params as NetworkWebSocketFrameEvent, "received");
+      handleWebSocketFrame(
+        params as NetworkWebSocketFrameEvent,
+        "received",
+        session,
+      );
       break;
     case "Network.webSocketClosed":
-      handleWebSocketClosed(params as NetworkWebSocketClosedEvent);
+      handleWebSocketClosed(params as NetworkWebSocketClosedEvent, session);
       break;
     case "Network.webSocketFrameError":
-      handleWebSocketError(params as NetworkWebSocketErrorEvent);
+      handleWebSocketError(params as NetworkWebSocketErrorEvent, session);
       break;
     case "Network.eventSourceMessageReceived":
-      handleEventSourceMessage(params as NetworkEventSourceMessageEvent);
+      handleEventSourceMessage(params as NetworkEventSourceMessageEvent, session);
       break;
     case "Runtime.consoleAPICalled":
       handleRuntimeConsoleAPICalled(
         source,
         params as RuntimeConsoleApiCalledEvent,
+        session,
       );
       break;
     case "Runtime.exceptionThrown":
       handleRuntimeExceptionThrown(
         source,
         params as RuntimeExceptionThrownEvent,
+        session,
       );
       break;
     case "Runtime.exceptionRevoked":
-      handleRuntimeExceptionRevoked(params as RuntimeExceptionRevokedEvent);
+      handleRuntimeExceptionRevoked(
+        params as RuntimeExceptionRevokedEvent,
+        session,
+      );
       break;
     case "Log.entryAdded":
-      handleLogEntryAdded(params as LogEntryAddedEvent);
+      handleLogEntryAdded(params as LogEntryAddedEvent, session);
       break;
     case "Debugger.scriptParsed":
-      handleScriptParsed(source, params as DebuggerScriptParsedEvent);
+      handleScriptParsed(source, params as DebuggerScriptParsedEvent, session);
       break;
     case "Debugger.paused":
       handleDebuggerPaused(source, params as DebuggerPausedEvent);
       break;
     case "Debugger.resumed":
-      activeSession.pausedTargets.delete(debuggerTargetIdentity(source));
+      session.pausedTargets.delete(debuggerTargetIdentity(source));
       break;
     case "Debugger.breakpointResolved":
       handleDebuggerBreakpointResolved(
@@ -2539,6 +2733,7 @@ async function ensureDebuggerSession(): Promise<NetworkSession> {
 
 async function ensureDebuggerSessionForTab(
   tabId: number | undefined,
+  options: { enableOopifAutoAttach?: boolean } = {},
 ): Promise<NetworkSession> {
   const tab = tabId === undefined ? await queryActiveTab() : await getTab(tabId);
   if (!tab?.id) {
@@ -2556,51 +2751,18 @@ async function ensureDebuggerSessionForTab(
   const resolvedTarget = await resolveDebuggerTarget(tab.id, tabUrl);
 
   if (activeSession && activeSession.tabId !== tab.id) {
-    if (debuggerActivityMonitorTabId !== undefined) {
-      throw new Error(
-        `ACTIVITY_MONITOR_CONFLICT: Tab ${debuggerActivityMonitorTabId} owns the active Network/Console monitor. Stop that monitor before attaching Chrome debugger to Tab ${tab.id}.`,
-      );
-    }
     await resumePausedDebugTargets(activeSession);
-    await debuggerDetach(activeSession.target).catch(() => undefined);
+    if (!activitySessionsByTabId.has(activeSession.tabId)) {
+      await debuggerDetach(activeSession.target).catch(() => undefined);
+    }
     clearChildDebuggerSessions();
     activeSession = null;
   }
 
   if (!activeSession) {
-    activeSession = {
-      tabId: tab.id,
-      target: resolvedTarget.target,
-      targetInfo: resolvedTarget.targetInfo,
-      attached: false,
-      networkEnabled: false,
-      fetchEnabled: false,
-      runtimeEnabled: false,
-      logEnabled: false,
-      debuggerEnabled: false,
-      oopifAutoAttachEnabled: false,
-      pageStartedAt: Date.now(),
-      maxEntries: DEFAULT_MAX_NETWORK_ENTRIES,
-      preservedLog: true,
-      observationSessionId: undefined,
-      observationStartedAt: undefined,
-      droppedRequestCount: 0,
-      requests: new Map(),
-      requestOrder: [],
-      consoleMessages: [],
-      runtimeErrorMonitoringActive: false,
-      runtimeErrorStreamId: createRuntimeErrorStreamId(),
-      runtimeErrorSequence: 0,
-      droppedRuntimeErrorCount: 0,
-      runtimeErrors: [],
-      scripts: new Map(),
-      scriptsById: new Map(),
-      breakpoints: new Map(),
-      pausedTargets: new Map(),
-      pauseOnExceptions: new Map(),
-      webSockets: new Map(),
-      eventSources: new Map(),
-    };
+    activeSession =
+      activitySessionsByTabId.get(tab.id) ??
+      createNetworkSession(tab.id, resolvedTarget);
   }
 
   if (!activeSession.attached) {
@@ -2616,9 +2778,55 @@ async function ensureDebuggerSessionForTab(
     });
   }
 
-  await ensureOopifAutoAttach(activeSession);
+  if (options.enableOopifAutoAttach !== false) {
+    await ensureOopifAutoAttach(activeSession);
+  }
 
   return activeSession;
+}
+
+function createNetworkSession(
+  tabId: number,
+  resolvedTarget: Awaited<ReturnType<typeof resolveDebuggerTarget>>,
+): NetworkSession {
+  return {
+    tabId,
+    target: resolvedTarget.target,
+    targetInfo: resolvedTarget.targetInfo,
+    attached: false,
+    pageEnabled: false,
+    networkEnabled: false,
+    fetchEnabled: false,
+    runtimeEnabled: false,
+    logEnabled: false,
+    debuggerEnabled: false,
+    oopifAutoAttachEnabled: false,
+    pageStartedAt: Date.now(),
+    maxEntries: DEFAULT_MAX_NETWORK_ENTRIES,
+    preservedLog: true,
+    observationSessionId: undefined,
+    observationStartedAt: undefined,
+    droppedRequestCount: 0,
+    requests: new Map(),
+    requestOrder: [],
+    consoleMessages: [],
+    runtimeErrorMonitoringActive: false,
+    runtimeErrorStreamId: createRuntimeErrorStreamId(),
+    runtimeErrorSequence: 0,
+    droppedRuntimeErrorCount: 0,
+    runtimeErrors: [],
+    scripts: new Map(),
+    scriptsById: new Map(),
+    breakpoints: new Map(),
+    pausedTargets: new Map(),
+    pauseOnExceptions: new Map(),
+    webSockets: new Map(),
+    eventSources: new Map(),
+    activityIncludeRealtime: false,
+    activityIncludeRealtimePayloads: false,
+    activityIncludeResponseBodies: false,
+    activityMaxResponseBodyBytes: 32_768,
+  };
 }
 
 async function attachDebuggerToTab(session: NetworkSession): Promise<void> {
@@ -2703,6 +2911,18 @@ function sourceMatchesSession(
   );
 }
 
+function sessionForDebuggerSource(
+  source: DebuggerTarget,
+): NetworkSession | undefined {
+  if (activeSession && sourceMatchesSession(source, activeSession)) {
+    return activeSession;
+  }
+  if (source.tabId !== undefined) {
+    return activitySessionsByTabId.get(source.tabId);
+  }
+  return undefined;
+}
+
 async function syncChildSessionState(
   session: NetworkSession,
   target: DebuggerTarget,
@@ -2757,6 +2977,14 @@ async function ensureNetworkEnabled(session: NetworkSession): Promise<void> {
     await debuggerSendCommand(target, "Network.enable", {});
   }
   session.networkEnabled = true;
+}
+
+async function ensurePageEnabled(session: NetworkSession): Promise<void> {
+  if (session.pageEnabled) {
+    return;
+  }
+  await debuggerSendCommand(session.target, "Page.enable", {});
+  session.pageEnabled = true;
 }
 
 async function ensureConsoleEnabled(session: NetworkSession): Promise<void> {
@@ -3911,12 +4139,8 @@ function normalizeScreenshotClip(clip: ScreenshotClip): ScreenshotClip {
 function handleRuntimeConsoleAPICalled(
   source: DebuggerTarget,
   event: RuntimeConsoleApiCalledEvent,
+  session: NetworkSession,
 ): void {
-  const session = activeSession;
-  if (!session) {
-    return;
-  }
-
   const timestampMs = event.timestamp ?? Date.now();
   const frame = event.stackTrace?.callFrames?.[0];
   pushConsoleMessage(session, {
@@ -3957,9 +4181,9 @@ function handleRuntimeConsoleAPICalled(
 function handleRuntimeExceptionThrown(
   source: DebuggerTarget,
   event: RuntimeExceptionThrownEvent,
+  session: NetworkSession,
 ): void {
-  const session = activeSession;
-  if (!session?.runtimeErrorMonitoringActive) {
+  if (!session.runtimeErrorMonitoringActive) {
     return;
   }
   const details = event.exceptionDetails;
@@ -3987,11 +4211,8 @@ function handleRuntimeExceptionThrown(
 
 function handleRuntimeExceptionRevoked(
   event: RuntimeExceptionRevokedEvent,
+  session: NetworkSession,
 ): void {
-  const session = activeSession;
-  if (!session) {
-    return;
-  }
   for (let index = session.runtimeErrors.length - 1; index >= 0; index -= 1) {
     const error = session.runtimeErrors[index];
     if (error?.exceptionId === event.exceptionId) {
@@ -4004,9 +4225,9 @@ function handleRuntimeExceptionRevoked(
 function handleScriptParsed(
   source: DebuggerTarget,
   event: DebuggerScriptParsedEvent,
+  session: NetworkSession,
 ): void {
-  const session = activeSession;
-  if (!session || !event.url) {
+  if (!event.url) {
     return;
   }
   const script: LoadedScriptMetadata = {
@@ -4035,12 +4256,10 @@ function handleScriptParsed(
   }
 }
 
-function handleLogEntryAdded(event: LogEntryAddedEvent): void {
-  const session = activeSession;
-  if (!session) {
-    return;
-  }
-
+function handleLogEntryAdded(
+  event: LogEntryAddedEvent,
+  session: NetworkSession,
+): void {
   const entry = event.entry;
   const timestampMs = entry.timestamp ?? Date.now();
   pushConsoleMessage(session, {
@@ -4073,7 +4292,7 @@ function pushConsoleMessage(
         columnNumber: message.columnNumber,
       },
     },
-  });
+  }, session);
 }
 
 function createRuntimeErrorStreamId(): string {
@@ -4358,8 +4577,10 @@ function remoteObjectText(remoteObject: RuntimeRemoteObject): string {
   return remoteObject.type;
 }
 
-function handleRequestWillBeSent(event: NetworkRequestWillBeSentEvent): void {
-  const session = requireNetworkSession();
+function handleRequestWillBeSent(
+  event: NetworkRequestWillBeSentEvent,
+  session: NetworkSession,
+): void {
   if (event.type === "Document") {
     session.pageStartedAt = Date.now();
     emitDebuggerActivity({
@@ -4374,7 +4595,7 @@ function handleRequestWillBeSent(event: NetworkRequestWillBeSentEvent): void {
         source: firstInitiatorSource(event.initiator),
         reason: "document-request",
       },
-    });
+    }, session);
   }
   const existing = session.requests.get(event.requestId);
   const record: NetworkRequestRecord = {
@@ -4402,8 +4623,10 @@ function handleRequestWillBeSent(event: NetworkRequestWillBeSentEvent): void {
   trimNetworkRequests(session);
 }
 
-function handleResponseReceived(event: NetworkResponseReceivedEvent): void {
-  const session = requireNetworkSession();
+function handleResponseReceived(
+  event: NetworkResponseReceivedEvent,
+  session: NetworkSession,
+): void {
   const existing = session.requests.get(event.requestId);
   if (!existing) {
     return;
@@ -4431,12 +4654,14 @@ function handleResponseReceived(event: NetworkResponseReceivedEvent): void {
         requestId: existing.requestId,
         initiatorType: existing.initiatorType,
       },
-    });
+    }, session);
   }
 }
 
-function handleLoadingFinished(event: NetworkLoadingFinishedEvent): void {
-  const session = requireNetworkSession();
+function handleLoadingFinished(
+  event: NetworkLoadingFinishedEvent,
+  session: NetworkSession,
+): void {
   const existing = session.requests.get(event.requestId);
   if (!existing) {
     return;
@@ -4444,10 +4669,18 @@ function handleLoadingFinished(event: NetworkLoadingFinishedEvent): void {
 
   existing.finishedAt = event.timestamp;
   existing.encodedDataLength = event.encodedDataLength;
+  if (
+    session.activityIncludeResponseBodies &&
+    shouldCaptureActivityResponseBody(existing, session.activityMaxResponseBodyBytes)
+  ) {
+    void captureActivityResponseBody(session, existing).catch(() => undefined);
+  }
 }
 
-function handleLoadingFailed(event: NetworkLoadingFailedEvent): void {
-  const session = requireNetworkSession();
+function handleLoadingFailed(
+  event: NetworkLoadingFailedEvent,
+  session: NetworkSession,
+): void {
   const existing = session.requests.get(event.requestId);
   if (!existing) {
     return;
@@ -4468,11 +4701,13 @@ function handleLoadingFailed(event: NetworkLoadingFailedEvent): void {
       initiatorType: existing.initiatorType,
       reason: event.errorText,
     },
-  });
+  }, session);
 }
 
-function handleWebSocketCreated(event: NetworkWebSocketCreatedEvent): void {
-  const session = requireNetworkSession();
+function handleWebSocketCreated(
+  event: NetworkWebSocketCreatedEvent,
+  session: NetworkSession,
+): void {
   session.webSockets.set(event.requestId, {
     requestId: event.requestId,
     url: event.url?.slice(0, 2_000),
@@ -4482,10 +4717,24 @@ function handleWebSocketCreated(event: NetworkWebSocketCreatedEvent): void {
     sentBytes: 0,
     receivedBytes: 0,
   });
+  if (session.activityIncludeRealtime) {
+    emitDebuggerActivity({
+      kind: "realtime",
+      observedAt: new Date().toISOString(),
+      summary: {
+        category: "websocket",
+        action: "opened",
+        url: event.url,
+        requestId: event.requestId,
+      },
+    }, session);
+  }
 }
 
-function handleWebSocketHandshake(event: NetworkWebSocketHandshakeEvent): void {
-  const session = requireNetworkSession();
+function handleWebSocketHandshake(
+  event: NetworkWebSocketHandshakeEvent,
+  session: NetworkSession,
+): void {
   const existing = session.webSockets.get(event.requestId);
   if (existing) {
     existing.openedAt = event.timestamp ?? existing.openedAt;
@@ -4496,8 +4745,8 @@ function handleWebSocketHandshake(event: NetworkWebSocketHandshakeEvent): void {
 function handleWebSocketFrame(
   event: NetworkWebSocketFrameEvent,
   direction: "sent" | "received",
+  session: NetworkSession,
 ): void {
-  const session = requireNetworkSession();
   const existing =
     session.webSockets.get(event.requestId) ??
     ({
@@ -4516,24 +4765,73 @@ function handleWebSocketFrame(
     existing.receivedBytes += bytes;
   }
   session.webSockets.set(event.requestId, existing);
+  if (session.activityIncludeRealtime) {
+    emitDebuggerActivity({
+      kind: "realtime",
+      observedAt: new Date().toISOString(),
+      summary: {
+        category: "websocket",
+        action: direction === "sent" ? "frame-sent" : "frame-received",
+        url: existing.url,
+        requestId: event.requestId,
+        bytes,
+        ...(session.activityIncludeRealtimePayloads
+          ? { payloadPreview: (event.response.payloadData ?? "").slice(0, 1_000) }
+          : {}),
+      },
+    }, session);
+  }
 }
 
-function handleWebSocketClosed(event: NetworkWebSocketClosedEvent): void {
-  const existing = requireNetworkSession().webSockets.get(event.requestId);
+function handleWebSocketClosed(
+  event: NetworkWebSocketClosedEvent,
+  session: NetworkSession,
+): void {
+  const existing = session.webSockets.get(event.requestId);
   if (existing) {
     existing.closedAt = event.timestamp;
   }
-}
-
-function handleWebSocketError(event: NetworkWebSocketErrorEvent): void {
-  const existing = requireNetworkSession().webSockets.get(event.requestId);
-  if (existing) {
-    existing.lastError = event.errorMessage.slice(0, 500);
+  if (session.activityIncludeRealtime) {
+    emitDebuggerActivity({
+      kind: "realtime",
+      observedAt: new Date().toISOString(),
+      summary: {
+        category: "websocket",
+        action: "closed",
+        url: existing?.url,
+        requestId: event.requestId,
+      },
+    }, session);
   }
 }
 
-function handleEventSourceMessage(event: NetworkEventSourceMessageEvent): void {
-  const session = requireNetworkSession();
+function handleWebSocketError(
+  event: NetworkWebSocketErrorEvent,
+  session: NetworkSession,
+): void {
+  const existing = session.webSockets.get(event.requestId);
+  if (existing) {
+    existing.lastError = event.errorMessage.slice(0, 500);
+  }
+  if (session.activityIncludeRealtime) {
+    emitDebuggerActivity({
+      kind: "realtime",
+      observedAt: new Date().toISOString(),
+      summary: {
+        category: "websocket",
+        action: "error",
+        url: existing?.url,
+        requestId: event.requestId,
+        reason: event.errorMessage,
+      },
+    }, session);
+  }
+}
+
+function handleEventSourceMessage(
+  event: NetworkEventSourceMessageEvent,
+  session: NetworkSession,
+): void {
   const request = session.requests.get(event.requestId);
   const existing =
     session.eventSources.get(event.requestId) ??
@@ -4546,22 +4844,94 @@ function handleEventSourceMessage(event: NetworkEventSourceMessageEvent): void {
   existing.lastEventName = event.eventName?.slice(0, 500);
   existing.lastEventAt = event.timestamp;
   session.eventSources.set(event.requestId, existing);
+  if (session.activityIncludeRealtime) {
+    const bytes = new TextEncoder().encode(event.data ?? "").length;
+    emitDebuggerActivity({
+      kind: "realtime",
+      observedAt: new Date().toISOString(),
+      summary: {
+        category: "eventsource",
+        action: "message-received",
+        url: existing.url,
+        requestId: event.requestId,
+        bytes,
+        ...(event.eventName ? { area: event.eventName } : {}),
+        ...(session.activityIncludeRealtimePayloads
+          ? { payloadPreview: (event.data ?? "").slice(0, 1_000) }
+          : {}),
+      },
+    }, session);
+  }
 }
 
-function emitDebuggerActivity(event: BrowserActivityEventInput): void {
-  if (!debuggerActivityMonitoringActive) {
+function shouldCaptureActivityResponseBody(
+  request: NetworkRequestRecord,
+  maxBytes: number,
+): boolean {
+  const length = request.encodedDataLength;
+  if (typeof length === "number" && length > maxBytes) {
+    return false;
+  }
+  const mimeType = request.mimeType?.toLowerCase() ?? "";
+  return (
+    mimeType.startsWith("text/") ||
+    mimeType.includes("json") ||
+    mimeType.includes("javascript") ||
+    mimeType.includes("xml") ||
+    mimeType.includes("graphql") ||
+    mimeType.includes("form-urlencoded")
+  );
+}
+
+async function captureActivityResponseBody(
+  session: NetworkSession,
+  request: NetworkRequestRecord,
+): Promise<void> {
+  const result = await debuggerSendCommand<
+    { requestId: string },
+    { body: string; base64Encoded: boolean }
+  >(session.target, "Network.getResponseBody", { requestId: request.requestId });
+  const encodedBytes = new TextEncoder().encode(result.body).length;
+  if (encodedBytes > session.activityMaxResponseBodyBytes) {
+    return;
+  }
+  emitDebuggerActivity({
+    kind: "network",
+    observedAt: new Date().toISOString(),
+    summary: {
+      method: request.method,
+      url: request.url,
+      resourceType: request.resourceType,
+      status: request.status,
+      requestId: request.requestId,
+      category: "response-body",
+      action: "captured",
+      bytes: encodedBytes,
+      ...(result.base64Encoded
+        ? { reason: "base64-body-omitted-from-activity-preview" }
+        : { payloadPreview: result.body.slice(0, 1_000) }),
+    },
+  }, session);
+}
+
+function emitDebuggerActivity(
+  event: BrowserActivityEventInput,
+  session = activeSession ?? undefined,
+): void {
+  const tabId = event.target?.tabId ?? session?.tabId;
+  if (tabId === undefined || !debuggerActivityMonitorTabIds.has(tabId)) {
     return;
   }
   const normalizedEvent =
-    event.target || !activeSession
+    event.target || !session
       ? event
       : {
           ...event,
           target: {
-            url: activeSession.targetInfo?.url ?? "",
-            title: activeSession.targetInfo?.title ?? "",
-            targetId: String(activeSession.tabId),
-            tabId: activeSession.tabId,
+            url: session.targetInfo?.url ?? "",
+            title: session.targetInfo?.title ?? "",
+            targetId: String(session.tabId),
+            tabId: session.tabId,
           },
         };
   for (const listener of debuggerActivityListeners) {
@@ -4622,7 +4992,7 @@ function toNetworkSummary(
 ): DebuggerNetworkRequestSummary {
   return {
     requestId: request.requestId,
-    url: request.url,
+    url: sanitizeNetworkUrl(request.url),
     method: request.method,
     resourceType: request.resourceType,
     status: request.status,
@@ -4641,7 +5011,10 @@ function toNetworkSummary(
     failed: request.failed,
     errorText: request.errorText,
     initiatorType: request.initiatorType,
-    initiatorStack: request.initiatorStack,
+    initiatorStack: request.initiatorStack?.map((frame) => ({
+      ...frame,
+      url: frame.url ? sanitizeNetworkUrl(frame.url) : undefined,
+    })),
   };
 }
 
@@ -4670,13 +5043,17 @@ function flattenInitiatorStack(
 }
 
 function clearNetworkRequests(): void {
-  activeSession?.requests.clear();
   if (activeSession) {
-    activeSession.requestOrder = [];
-    activeSession.droppedRequestCount = 0;
-    activeSession.webSockets.clear();
-    activeSession.eventSources.clear();
+    clearNetworkRequestsForSession(activeSession);
   }
+}
+
+function clearNetworkRequestsForSession(session: NetworkSession): void {
+  session.requests.clear();
+  session.requestOrder = [];
+  session.droppedRequestCount = 0;
+  session.webSockets.clear();
+  session.eventSources.clear();
 }
 
 function trimNetworkRequests(session: NetworkSession): void {

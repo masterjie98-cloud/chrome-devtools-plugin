@@ -1,0 +1,24 @@
+{
+  "git": {
+    "commitMessage": "chore: release v${version}",
+    "tagName": "v${version}",
+    "tagAnnotation": "v${version}",
+    "requireCleanWorkingDir": true,
+    "requireUpstream": false
+  },
+  "github": {
+    "release": true,
+    "releaseName": "v${version}",
+    "autoGenerate": true,
+    "assets": [
+      "release/ai-devtools-assistant-local-${version}.zip",
+      "release/ai-devtools-assistant-local-${version}.zip.sha256"
+    ]
+  },
+  "npm": {
+    "publish": false
+  },
+  "hooks": {
+    "after:bump": "node scripts/sync-manifest-version.mjs && npm run build:update-notice && npm run package:local"
+  }
+}

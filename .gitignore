@@ -8,6 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+.cache/portable-node/
 coverage
 mock
 .env.local
@@ -15,6 +16,7 @@ dist
 dist-ssr
 builds
 release
+local-scripts
 *.local
 .codegraph/
 .playwright-cli/*

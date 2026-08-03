@@ -55,7 +55,10 @@ import type {
   ScreenshotCaptureInput,
   ScreenshotCaptureResult,
 } from "./dom";
-import { SUPPORTED_COMPUTED_STYLE_PROPERTIES } from "./dom";
+import {
+  MAX_CSS_PATCH_CHARS,
+  SUPPORTED_COMPUTED_STYLE_PROPERTIES,
+} from "./dom";
 import { isSupportedTrustedKey } from "./trustedKeyboard";
 import type {
   DebuggerDetachInput,
@@ -469,7 +472,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: TOOL_NAMES.BROWSER_SET_TARGET_TAB,
     title: "设置目标页面",
-    description: "Pin one tab as the explicit target for DOM, screenshot, Network, and CDP proxy tools.",
+    description:
+      "Pin one tab as the explicit target for DOM, screenshot, Network, and CDP proxy tools, and pre-arm native JavaScript dialog handling.",
     writesPage: false,
   },
   {
@@ -659,7 +663,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: TOOL_NAMES.BROWSER_ACTIVITY_START,
     title: "开始增量活动",
     description:
-      "Start bounded DOM, Network, and Console activity notifications for the exact selected target.",
+      "Start bounded DOM, Network, Console, style, visual, Storage and realtime activity notifications for the exact selected target.",
     writesPage: false,
   },
   {
@@ -809,13 +813,14 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: TOOL_NAMES.DEBUGGER_NETWORK_GET,
     title: "Network 详情",
     description:
-      "Read one collected Network request by requestId, optionally including response body.",
+      "Read one collected Network request by requestId, optionally including its response body before Network recording stops.",
     writesPage: false,
   },
   {
     name: TOOL_NAMES.DEBUGGER_NETWORK_GET_BODY,
     title: "响应体",
-    description: "Read response body for one collected Network request.",
+    description:
+      "Read one collected Network response body while Network recording remains active.",
     writesPage: false,
   },
   {
@@ -1064,9 +1069,9 @@ export function validateToolCall(call: unknown): string | null {
       if (typeof args.css !== "string" || !args.css.trim()) {
         return "css is required.";
       }
-      return args.css.length <= SANITIZE_LIMITS.cssPatch
+      return args.css.length <= MAX_CSS_PATCH_CHARS
         ? null
-        : "css patch is too long.";
+        : `css must not exceed ${MAX_CSS_PATCH_CHARS} characters; split it into complete CSS rule blocks with distinct patchId values.`;
     case TOOL_NAMES.CSS_REMOVE_PATCH:
       return typeof args.patchId === "string" && args.patchId.trim()
         ? null
@@ -2103,10 +2108,43 @@ function validateBrowserConsoleMessages(
 function validateBrowserActivityStart(
   args: Record<string, unknown>,
 ): string | null {
-  for (const key of ["includeDom", "includeNetwork", "includeConsole", "preserveLog"]) {
+  for (const key of [
+    "includeDom",
+    "includeNetwork",
+    "includeConsole",
+    "includeStyle",
+    "includeVisual",
+    "includeStorage",
+    "includeRealtime",
+    "includeRealtimePayloads",
+    "includeResponseBodies",
+    "preserveLog",
+  ]) {
     if (args[key] !== undefined && typeof args[key] !== "boolean") {
       return `${key} must be a boolean.`;
     }
+  }
+  if (
+    args.maxResponseBodyBytes !== undefined &&
+    (!Number.isInteger(args.maxResponseBodyBytes) ||
+      Number(args.maxResponseBodyBytes) < 1_024 ||
+      Number(args.maxResponseBodyBytes) > 120_000)
+  ) {
+    return "maxResponseBodyBytes must be an integer between 1024 and 120000.";
+  }
+  if (
+    args.visualSampleIntervalMs !== undefined &&
+    (!Number.isInteger(args.visualSampleIntervalMs) ||
+      Number(args.visualSampleIntervalMs) < 500 ||
+      Number(args.visualSampleIntervalMs) > 10_000)
+  ) {
+    return "visualSampleIntervalMs must be an integer between 500 and 10000.";
+  }
+  if (
+    args.includeRealtimePayloads === true &&
+    args.includeRealtime === false
+  ) {
+    return "includeRealtimePayloads requires includeRealtime.";
   }
   if (
     args.maxNetworkEntries !== undefined &&

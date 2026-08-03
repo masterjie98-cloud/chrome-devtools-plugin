@@ -1,4 +1,7 @@
-import { SUPPORTED_COMPUTED_STYLE_PROPERTIES } from "./dom";
+import {
+  MAX_CSS_PATCH_CHARS,
+  SUPPORTED_COMPUTED_STYLE_PROPERTIES,
+} from "./dom";
 
 export const MCP_TOOL_NAMES = {
   BROWSER_STATUS: "browser_status",
@@ -184,13 +187,37 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_ACTIVITY_START,
     title: "Start browser activity stream",
     description:
-      "Start bounded DOM, URL navigation, Network, and Console observation for the exact selected target. Event kinds have independent retention so Network noise cannot evict navigation, DOM, or Console evidence. Save activityCursor.streamId and activityCursor.sequence and pass both to browser_debug_activity to read only later changes.",
+      "Start bounded DOM, URL navigation, Network, Console, CSS/layout, rendered-visual, Storage/IndexedDB, WebSocket and SSE observation for the exact selected target. Event kinds have independent retention. Payload/body capture is off by default and requires an explicit sensitive approval. Save activityCursor.streamId and activityCursor.sequence and pass both to browser_debug_activity to read only later changes.",
     parameters: {
       type: "object",
       properties: {
         includeDom: { type: "boolean" },
         includeNetwork: { type: "boolean" },
         includeConsole: { type: "boolean" },
+        includeStyle: { type: "boolean" },
+        includeVisual: { type: "boolean" },
+        includeStorage: { type: "boolean" },
+        includeRealtime: { type: "boolean" },
+        includeRealtimePayloads: {
+          type: "boolean",
+          description:
+            "Include bounded redacted WebSocket/SSE payload previews. Defaults false and raises the approval boundary.",
+        },
+        includeResponseBodies: {
+          type: "boolean",
+          description:
+            "Capture bounded textual Network response-body previews. Defaults false and raises the approval boundary.",
+        },
+        maxResponseBodyBytes: {
+          type: "number",
+          minimum: 1024,
+          maximum: 120000,
+        },
+        visualSampleIntervalMs: {
+          type: "number",
+          minimum: 500,
+          maximum: 10000,
+        },
         preserveLog: { type: "boolean" },
         maxNetworkEntries: {
           type: "number",
@@ -207,7 +234,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP,
     title: "Stop browser activity stream",
     description:
-      "Stop the activity monitor owned by this extension. Retained bounded events remain readable from the activity-stream resource.",
+      "Stop the activity monitor owned by this extension and restore page hooks. Retained bounded events remain readable from the activity-stream resource.",
     parameters: NO_ARG_PARAMETERS,
   },
   {
@@ -810,6 +837,11 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         includeWarnings: { type: "boolean" },
         includeRevoked: { type: "boolean" },
         includeLocalExcerpt: { type: "boolean" },
+        workspaceRoot: {
+          type: "string",
+          description:
+            "Optional configured workspace root id, exact configured path, or unique project name returned by browser_find_workspace_source. Arbitrary paths are rejected.",
+        },
       },
       additionalProperties: false,
     },
@@ -1106,7 +1138,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB,
     title: "Select browser tab",
     description:
-      "Select one listed Chrome tab as the explicit target. This changes extension routing, not page content.",
+      "Select one listed Chrome tab as the explicit target and pre-arm native JavaScript dialog handling before a dialog can block the renderer. This changes extension/CDP routing, not page content.",
     parameters: {
       type: "object",
       properties: {
@@ -1782,7 +1814,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_HANDLE_DIALOG,
     title: "Handle dialog",
     description:
-      "Accept or dismiss the currently open JavaScript alert/confirm/prompt in the selected tab using one CDP command. It does not override future dialogs and requires confirmation.",
+      "Accept or dismiss the currently open JavaScript alert/confirm/prompt in the selected tab using one CDP command. Call browser_set_target_tab before the action that opens the dialog so the Page session is already armed. It does not override future dialogs and requires confirmation.",
     parameters: {
       type: "object",
       properties: {
@@ -2063,7 +2095,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_NETWORK_GET_REQUEST,
     title: "Get Network request",
     description:
-      "Read details for a collected Network request by requestId. Can include response body.",
+      "Read details for a collected Network request by requestId. Can include the response body while Network recording remains active; read bodies before browser_network_stop_recording because Chrome may release them when recording stops.",
     parameters: {
       type: "object",
       properties: {
@@ -2084,7 +2116,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_NETWORK_GET_RESPONSE_BODY,
     title: "Get Network response body",
     description:
-      "Read response body for a collected Network request by requestId.",
+      "Read response body for a collected Network request by requestId while Network recording remains active. Call this before browser_network_stop_recording because Chrome may release collected bodies when recording stops.",
     parameters: {
       type: "object",
       properties: {
@@ -2463,7 +2495,7 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
     name: MCP_TOOL_NAMES.BROWSER_APPLY_CSS_PATCH,
     title: "Apply CSS patch",
     description:
-      "Apply a temporary CSS patch to the current page. Use this to hide, restyle, or visually adjust elements. Do not include JavaScript.",
+      `Apply a temporary CSS patch to the current page. Use this to hide, restyle, or visually adjust elements. Do not include JavaScript. Each call accepts at most ${MAX_CSS_PATCH_CHARS} characters. If more CSS is required, split only at complete rule or at-rule boundaries and apply each segment with a distinct stable patchId.`,
     parameters: {
       type: "object",
       properties: {
@@ -2474,7 +2506,10 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
         },
         css: {
           type: "string",
-          description: "CSS text to apply temporarily.",
+          minLength: 1,
+          maxLength: MAX_CSS_PATCH_CHARS,
+          description:
+            `CSS text to apply temporarily, up to ${MAX_CSS_PATCH_CHARS} characters. For larger styles, split at complete rule or at-rule boundaries; never cut inside a declaration or block.`,
         },
       },
       required: ["css"],

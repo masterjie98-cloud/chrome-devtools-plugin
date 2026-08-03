@@ -222,7 +222,7 @@ export function normalizeGrantKey(key: string): string {
   return key.trim() || UNAUTHENTICATED_DEVELOPMENT_GRANT_KEY;
 }
 
-function executionTargetMismatchFields(
+export function executionTargetMismatchFields(
   granted: ExecutionGrantClaims["target"],
   current: ActiveTabSnapshot,
 ): string[] {

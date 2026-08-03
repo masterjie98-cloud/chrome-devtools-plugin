@@ -1,128 +1,207 @@
 # AI DevTools Assistant 本地安装说明
 
-本安装包用于可信用户在本机使用 AI DevTools Assistant，不需要发布到
-Chrome Web Store。Chrome 扩展通过开发者模式加载，本地 daemon 只监听
-`127.0.0.1:17321`。
+本说明以 **CMD 脚手架** 为推荐本地用法（Windows / macOS 均可）：
 
-## 系统要求
+1. **推荐：开发目录 CMD 脚手架**（`setup-local.cmd` / `.command`）：配置
+   daemon / MCP，Chrome 扩展单独加载项目里的 `dist/`。
+2. **可选：跨平台 zip 安装包**（`package:local`）：给不用 git 的 Windows /
+   macOS 用户（解压后双击安装脚本）。
 
-- macOS
-- Google Chrome 116 或更高版本
-- Node.js 20 或更高版本
-- 安装包必须先完整解压，不能直接在 ZIP 预览中运行
+开发目录里的 LaunchAgent **不是必须的**。Release ZIP 的一键安装器则默认注册
+macOS LaunchAgent 或 Windows 登录启动项，用户可用 `--no-autostart` 明确关闭。
 
-## 一键安装
+---
 
-1. 双击 `安装 AI DevTools Assistant.command`。
-2. 如果 macOS 阻止首次运行，右键该文件，选择“打开”，再次确认。
-3. 安装器会把程序复制到：
+## A. 开发目录：后台服务 CMD 脚手架（推荐，Win + macOS）
+
+适用于克隆了本仓库的机器。
+
+### 系统要求
+
+- Node.js 20+
+- Google Chrome 116+
+- Windows 或 macOS（LaunchAgent 仅 macOS 可选）
+
+### 步骤
+
+1. 双击仓库根目录的 `setup-local.cmd`（Windows）或 `setup-local.command`
+   （macOS），或执行：
+
+   ```bash
+   npm run setup:local
+   ```
+
+2. 按提示选择：是否 `npm install`、是否 `npm run build:node`（只构建
+   daemon/MCP，**不含** Chrome 扩展）、是否立刻启动 daemon、是否打印 MCP
+   客户端配置、是否生成 MCP 调试启动脚本。
+
+3. 脚手架会在 `local-scripts/` 生成：
+
+   - `启动 Daemon` / `停止 Daemon` / `查看 Daemon 状态`
+   - `显示连接信息`（Token + 旁路打印扩展 `dist` 路径）
+   - `显示 MCP 客户端配置`
+   - （可选）`启动 MCP 调试`（`npm run mcp:dev`，仅排错）
+
+4. **Chrome 扩展是独立步骤**（不是后台 install）：
+
+   ```bash
+   npm run build:extension   # 若还没有 dist/
+   ```
+
+   打开 `chrome://extensions` → 开发者模式 → 加载已解压的扩展程序 → 选择项目
+   的 `dist/` → 用「显示连接信息」里的 Bridge Token 填入侧栏 AI 设置。
+
+### 两个后台分别做什么
+
+| 进程 | 命令 | 是否常开 |
+|------|------|----------|
+| daemon | `启动 Daemon` / `npm run daemon:start` | **要** |
+| MCP adapter | Cursor/Codex 按配置拉起 `mcp:start` | 一般不手动常开；`mcp:dev` 仅调试 |
+
+非交互默认（不弹问答、不自动开 daemon 窗口）：
+
+```bash
+npm run setup:local -- --defaults
+```
+
+### 更新代码（git 目录）
+
+Chrome 扩展不能执行 git，按是否连上 daemon 分流：
+
+| Daemon | 做法 |
+|--------|------|
+| 未连接 | AI 设置里看版本与说明；在项目根运行 `npm run update:local`，再点「重载扩展」 |
+| 已连接 | AI 设置 →「检查更新」→「由 Daemon 执行更新」→ 提示后「重载扩展」 |
+
+```bash
+npm run update:local
+```
+
+维护者发版（规范化版本 / GitHub Release）：
+
+```bash
+npm run release:dry
+npm run release
+```
+
+---
+
+## B. 跨平台 zip 安装包（Windows + macOS）
+
+给不用 git 的可信用户：扩展走开发者模式加载，daemon 只听
+`127.0.0.1:17321`。维护者本机执行：
+
+```bash
+npm run package:local
+```
+
+产物：`release/ai-devtools-assistant-local-<version>.zip`。
+
+### 系统要求
+
+- Windows 10+ 或 macOS
+- Google Chrome 116+
+- 无需预装 Node.js；ZIP 内含 macOS arm64/x64、Windows x64 便携 Node，并在打包时校验 Node 官方 SHA-256
+- 必须先完整解压 zip，不要在压缩预览里直接运行
+
+### 一键安装
+
+**Windows**
+
+1. 解压 zip
+2. 双击 `安装 AI DevTools Assistant.cmd`
+3. 安装目录默认：
+
+   ```text
+   %LOCALAPPDATA%\AI DevTools Assistant\
+   ```
+
+4. 安装器会注册 Windows 登录自启动、启动 daemon，并打印扩展路径与 Bridge Token
+
+**macOS**
+
+1. 解压 zip
+2. 双击 `安装 AI DevTools Assistant.command`
+   （若被拦截：右键 → 打开 → 仍要打开）
+3. 安装目录默认：
 
    ```text
    ~/Library/Application Support/AI DevTools Assistant/
    ```
 
-4. 安装器会注册并启动当前用户的 LaunchAgent，然后输出扩展目录和本机
-   Bridge Token。
+4. 安装器会注册 macOS LaunchAgent、后台启动 daemon，并打印扩展路径与 Bridge Token
 
-安装器不会自动修改 Chrome，也不会把 Token 上传到任何位置。
+如明确不需要登录自启动，可从终端运行安装器并追加 `--no-autostart`。
 
-## 在 Chrome 中加载扩展
+安装器不会自动改 Chrome，也不会上传 Token。
 
-1. 打开 `chrome://extensions`。
-2. 开启右上角“开发者模式”。
-3. 点击“加载已解压的扩展程序”。
-4. 选择：
+### 在 Chrome 中加载扩展
 
-   ```text
-   ~/Library/Application Support/AI DevTools Assistant/extension
-   ```
+1. 打开 `chrome://extensions` → 开发者模式 → 加载已解压的扩展程序
+2. 选择安装器打印的 `extension` 目录（见上）
+3. 侧栏 AI 设置填入 Bridge Token 并保存
 
-5. 打开扩展侧栏的 AI 设置，将安装器输出的 Token 填入“本地 Bridge Token”
-   并保存。
+不要把 Token 贴到聊天、日志或共享文档。每台机器用本机生成的 Token。
 
-不要把 Bridge Token 粘贴到聊天、日志、截图或共享文档。每台电脑应使用本机
-生成的 Token。
+### 查看状态 / 重新取 Token
 
-## 查看状态或重新取得 Token
+Windows（PowerShell）：
 
-```bash
-AI_DEVTOOLS_HOME="$HOME/Library/Application Support/AI DevTools Assistant"
-node "$AI_DEVTOOLS_HOME/runtime/daemon/status.js"
-node "$AI_DEVTOOLS_HOME/runtime/daemon/printToken.js"
+```powershell
+$aiHome = "$env:LOCALAPPDATA\AI DevTools Assistant"
+& "$aiHome\runtime\node\win32-x64\node.exe" "$aiHome\runtime\daemon\status.js"
+& "$aiHome\runtime\node\win32-x64\node.exe" "$aiHome\runtime\daemon\printToken.js"
 ```
 
-## 可选：接入 Codex
+macOS：
 
 ```bash
 AI_DEVTOOLS_HOME="$HOME/Library/Application Support/AI DevTools Assistant"
-node "$AI_DEVTOOLS_HOME/runtime/print-client-config.mjs" \
-  --server-path "$AI_DEVTOOLS_HOME/runtime/mcp/server.js"
+NODE_TARGET="$([ "$(uname -m)" = arm64 ] && echo darwin-arm64 || echo darwin-x64)"
+"$AI_DEVTOOLS_HOME/runtime/node/$NODE_TARGET/node" "$AI_DEVTOOLS_HOME/runtime/daemon/status.js"
+"$AI_DEVTOOLS_HOME/runtime/node/$NODE_TARGET/node" "$AI_DEVTOOLS_HOME/runtime/daemon/printToken.js"
 ```
 
-按输出的 `codex mcp add` 命令注册。Codex 配置中不要写 Bridge Token；MCP
-adapter 会从本机 daemon 私有配置读取。
+### 更新（zip 用户）
 
-## 可选：限制允许连接的扩展 ID
+首次安装后，只要 daemon 正在运行，即可在侧栏 AI 设置中执行：
 
-从 `chrome://extensions` 复制 AI DevTools Assistant 的 32 位扩展 ID：
+1. 点击「检查更新」；daemon 查询本项目最新正式 GitHub Release。
+2. 有新版本时点击「由 Daemon 更新」。
+3. daemon 只接受版本精确匹配的
+   `ai-devtools-assistant-local-<version>.zip` 与 `.zip.sha256`，校验 HTTPS
+   来源、大小、SHA-256、ZIP 路径和包内版本。
+4. 校验成功后事务式替换 `runtime` 与 `extension`；失败会恢复旧目录。
+5. daemon 自动重启。侧栏重新连接后，按提示重载扩展；已解压扩展不会像商店扩展
+   一样自动刷新。
 
-```bash
-AI_DEVTOOLS_HOME="$HOME/Library/Application Support/AI DevTools Assistant"
-node "$AI_DEVTOOLS_HOME/runtime/daemon/allowExtension.js" 扩展ID
-launchctl kickstart -k \
-  "gui/$(id -u)/com.ai-devtools-assistant.daemon"
-```
+本机尚未安装 daemon 时，仍需手动下载最新 ZIP。包含自动更新器之前的旧 ZIP 也要
+人工覆盖安装一次；之后即可使用上述流程。本机 Token 和 daemon 状态目录不会被
+Release ZIP 覆盖。
 
-配置白名单后，其他扩展 ID 即使知道 Token 也不能连接。
+开发目录（`git clone`）的更新见上文 A 节。
 
-## 更新
+### 卸载
 
-下载并解压新版本，再次双击 `安装 AI DevTools Assistant.command`。安装器会：
-
-- 停止旧 daemon；
-- 替换稳定安装目录中的 runtime 和扩展；
-- 保留本机 daemon 配置、Token、状态和 artifact；
-- 重新启动 LaunchAgent。
-
-完成后打开 `chrome://extensions`，在 AI DevTools Assistant 卡片上点击“重新加载”。
-扩展目录保持不变，不要删除后重新加载其他目录。
-
-## 卸载
-
-先停止并移除 LaunchAgent：
+macOS 可先卸 LaunchAgent：
 
 ```bash
 AI_DEVTOOLS_HOME="$HOME/Library/Application Support/AI DevTools Assistant"
-node "$AI_DEVTOOLS_HOME/runtime/manage-local-service.mjs" uninstall \
+NODE_TARGET="$([ "$(uname -m)" = arm64 ] && echo darwin-arm64 || echo darwin-x64)"
+"$AI_DEVTOOLS_HOME/runtime/node/$NODE_TARGET/node" \
+  "$AI_DEVTOOLS_HOME/runtime/manage-local-service.mjs" uninstall \
   --server-path "$AI_DEVTOOLS_HOME/runtime/daemon/server.js"
 ```
 
-然后在 `chrome://extensions` 移除扩展。确认不再需要后，可将下面目录移到废纸篓：
+再在 Chrome 移除扩展，并删除安装目录。本机配对配置
+（`~/.config/ai-devtools-assistant/` 等）不会被自动删除。
 
-```text
-~/Library/Application Support/AI DevTools Assistant/
-```
+### 常见问题
 
-本机配对配置和运行状态分别位于 `~/.config/ai-devtools-assistant/` 与
-`~/.local/share/ai-devtools-assistant/`，卸载器不会自动删除这些数据。
+**提示缺少便携 Node** — ZIP 不完整或未完整解压；重新下载 Release ZIP，不要从压缩预览中直接运行。
 
-## 常见问题
+**daemon 未连接** — 先跑 status；不要同时起两个 daemon。
 
-### 提示找不到 Node.js
+**Token 不对** — 用 `printToken.js` 覆盖扩展设置；不要从别的电脑复制。
 
-安装 Node.js 20 或更高版本，重新打开终端后再次运行安装器。
-
-### 扩展显示 daemon 未连接
-
-先执行状态命令。如果状态失败，再次运行一键安装器；不要同时手工启动第二个
-daemon。
-
-### Token 不正确
-
-执行 `printToken.js` 重新读取本机 Token，覆盖扩展设置中的旧值。不要从其他电脑
-复制 Token。
-
-### 更新后页面能力没有变化
-
-打开 `chrome://extensions` 点击扩展的“重新加载”，然后刷新目标网页。内容脚本
-不会自动替换已经加载到旧页面中的版本。
+**更新后能力没变** — `chrome://extensions` 重载扩展，并刷新目标网页。

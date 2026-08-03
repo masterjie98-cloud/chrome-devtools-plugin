@@ -55,6 +55,38 @@ test("protocol role policy permits only role-specific inbound commands", () => {
     true,
   );
   assert.equal(
+    isCommandAllowedForRole("ui", WS_COMMANDS.LOCAL_SERVICE_STATUS),
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole("ui", WS_COMMANDS.LOCAL_SERVICE_SET),
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole("ui", WS_COMMANDS.LOCAL_UPDATE),
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole("ui", WS_COMMANDS.DAEMON_AGENT_START),
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole("plugin", WS_COMMANDS.DAEMON_AGENT_START),
+    false,
+  );
+  assert.equal(
+    isCommandAllowedForRole("browser", WS_COMMANDS.LOCAL_UPDATE),
+    false,
+  );
+  assert.equal(
+    isCommandAllowedForRole("mcp", WS_COMMANDS.LOCAL_UPDATE),
+    false,
+  );
+  assert.equal(
+    isCommandAllowedForRole("browser", WS_COMMANDS.LOCAL_SERVICE_SET),
+    false,
+  );
+  assert.equal(
     isCommandAllowedForRole("mcp", WS_COMMANDS.COLLABORATION_ITEM_UPSERT),
     false,
   );
@@ -79,6 +111,53 @@ test("protocol commands have discoverable message-specific UTF-8 byte limits", (
       (limit) => Number.isSafeInteger(limit) && limit > 0 && limit <= 8 * 1024 * 1024,
     ),
     true,
+  );
+});
+
+test("daemon Agent start is bounded, UI-only protocol input", () => {
+  const parsed = pluginToMcpMessageSchema.safeParse({
+    requestId: "daemon-agent-start-1",
+    command: WS_COMMANDS.DAEMON_AGENT_START,
+    sentAt: "2026-08-03T00:00:00.000Z",
+    payload: {
+      runId: "run-1",
+      conversationId: "conversation-1",
+      assistantMessageId: "assistant-1",
+      config: {
+        apiUrl: "https://provider.example/v1/chat/completions",
+        apiKey: "memory-only-secret",
+        model: "fixture",
+        temperature: 0,
+        maxHistory: 12,
+        contextWindowTokens: 128000,
+        supportsVision: false,
+        includeImageHistory: false,
+        fastAgentMode: true,
+        autoReadPage: true,
+        enableTools: true,
+        allowPseudoToolCalls: false,
+        maxToolRounds: 50,
+        autoContinueAfterToolRoundLimit: true,
+        includePageContext: true,
+        includeDomSummary: true,
+        includeSelectedElement: true,
+        visibleTextLimit: 2200,
+        domSummaryLimit: 6000,
+        supportsWebSearch: false,
+        enableWebSearch: false,
+        capabilityDetection: {},
+      },
+      messages: [],
+      input: "inspect the page",
+      attachments: [],
+      context: {},
+      egressDestinations: ["https://provider.example"],
+    },
+  });
+  assert.equal(parsed.success, true);
+  assert.equal(
+    inboundMessageByteLimit(WS_COMMANDS.DAEMON_AGENT_START),
+    8 * 1024 * 1024,
   );
 });
 

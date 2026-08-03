@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BrowserStateHub } from "../src/mcp/browserStateHub";
-import { sanitizeUrl } from "../src/shared/sanitize";
+import { sanitizeNetworkUrl, sanitizeUrl } from "../src/shared/sanitize";
 
 test("session activity, state updates, and artifact capture keep distinct clocks", () => {
   let now = Date.parse("2026-07-13T03:00:00.000Z");
@@ -382,4 +382,17 @@ test("URL sanitization redacts sensitive query and fragment parameters", () => {
   assert.match(sanitized, /api_key=%5BREDACTED%5D/);
   assert.match(sanitized, /access_token=%5BREDACTED%5D/);
   assert.match(sanitized, /state=public/);
+});
+
+test("Network URL sanitization redacts every query value and removes fragments", () => {
+  const sanitized = sanitizeNetworkUrl(
+    "https://example.test/api/items?view=private-value&token=secret#client-state",
+  );
+
+  assert.equal(sanitized.includes("private-value"), false);
+  assert.equal(sanitized.includes("secret"), false);
+  assert.equal(sanitized.includes("client-state"), false);
+  assert.match(sanitized, /view=%5BREDACTED%5D/);
+  assert.match(sanitized, /token=%5BREDACTED%5D/);
+  assert.equal(sanitizeNetworkUrl("data:text/plain,private-value"), "data://");
 });

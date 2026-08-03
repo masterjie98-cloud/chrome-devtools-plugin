@@ -62,3 +62,26 @@ export function getBackgroundConversationWork(input: {
     recoverableDelegatedTask: Boolean(input.activeDelegatedTaskId),
   };
 }
+
+export function listBackgroundConversationWork(input: {
+  activeConversationId: string;
+  activeExecutionBindings: readonly ExecutionTaskBinding[];
+  conversations: readonly ChatConversationSummary[];
+  approvals: readonly PendingToolApproval[];
+  queued: readonly QueuedChatSubmission[];
+  activeDelegatedTaskIds?: ReadonlySet<string>;
+}): BackgroundConversationWork[] {
+  return input.activeExecutionBindings.flatMap((binding) => {
+    const work = getBackgroundConversationWork({
+      activeConversationId: input.activeConversationId,
+      activeExecutionBinding: binding,
+      conversations: input.conversations,
+      approvals: input.approvals,
+      queued: input.queued,
+      activeDelegatedTaskId: input.activeDelegatedTaskIds?.has(binding.taskId)
+        ? binding.taskId
+        : undefined,
+    });
+    return work ? [work] : [];
+  });
+}

@@ -1,6 +1,9 @@
 import {
+  cancelElementPickerForForegroundTab,
   clearAgentPointerForCurrentTargetBestEffort,
+  completeElementPickerFromContent,
   executeToolCall,
+  invalidateElementPickerDocument,
   restoreBrowserActivityForContentFrame,
 } from "./toolDispatcher";
 import {
@@ -59,6 +62,7 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
+  void cancelElementPickerForForegroundTab(activeInfo.tabId);
   chrome.tabs.get(activeInfo.tabId, (tab) => {
     if (chrome.runtime.lastError) {
       return;
@@ -70,6 +74,7 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "loading") {
+    invalidateElementPickerDocument(tabId, "target-navigation");
     clearContentFrames(tabId);
   }
   if (tab.active) {
@@ -107,6 +112,7 @@ chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  invalidateElementPickerDocument(tabId, "target-tab-closed");
   clearTargetNavigationState(tabId);
   clearContentFrames(tabId);
 });
@@ -166,7 +172,26 @@ async function handleMessage(
     } else if (message.type === MESSAGE_TYPES.CONTENT_ELEMENT_PICKED) {
       registerContentFrame(sender, message.payload.page);
     }
-    await rememberTargetTab(sender.tab);
+    if (
+      (message.type === MESSAGE_TYPES.CONTENT_ELEMENT_PICKED ||
+        message.type === MESSAGE_TYPES.CONTENT_SELECTION_CANCELLED) &&
+      sender.tab?.id !== undefined
+    ) {
+      completeElementPickerFromContent(
+        sender.tab.id,
+        sender.frameId ?? 0,
+        sender.documentId,
+      );
+    }
+    // Activity from a monitored background Tab must never steal the UI/Agent
+    // target. Only foreground page announcements and an explicit picker action
+    // participate in automatic target selection.
+    if (
+      message.type === MESSAGE_TYPES.CONTENT_ELEMENT_PICKED ||
+      (message.type !== MESSAGE_TYPES.CONTENT_DOM_ACTIVITY && sender.tab?.active)
+    ) {
+      await rememberTargetTab(sender.tab);
+    }
     await syncContentEventToStateHub(message, sender);
     return {
       id: message.id,
@@ -361,23 +386,23 @@ async function syncContentEventToStateHub(
       });
       break;
     case MESSAGE_TYPES.CONTENT_DOM_ACTIVITY:
-      if (!target?.id || senderTab?.id !== target.id) {
+      if (senderTab?.id === undefined) {
         return;
       }
       {
-        const navigation = getTargetNavigationState(target.id, false);
+        const navigation = getTargetNavigationState(senderTab.id, false);
         stateHubBridge.sendBrowserActivity({
           ...message.payload,
           target: {
             url: message.payload.target?.url ??
               sender.url ??
-              target.url ??
-              target.pendingUrl ??
+              senderTab.url ??
+              senderTab.pendingUrl ??
               "",
-            title: message.payload.target?.title ?? target.title ?? "",
-            targetId: String(target.id),
-            tabId: target.id,
-            windowId: target.windowId,
+            title: message.payload.target?.title ?? senderTab.title ?? "",
+            targetId: String(senderTab.id),
+            tabId: senderTab.id,
+            windowId: senderTab.windowId,
             frameId: sender.frameId ?? 0,
             documentId: sender.documentId,
             navigationId: navigation.navigationId,

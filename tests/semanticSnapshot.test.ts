@@ -75,6 +75,30 @@ test("semantic snapshot cursors fail closed after a semantic page change", () =>
   );
 });
 
+test("semantic snapshot cursors fail closed after document replacement with identical DOM", () => {
+  const candidates = [
+    candidate("button", "Save", "#save"),
+    candidate("textbox", "Email", "#email"),
+  ];
+  const first = paginateSemanticSnapshot(
+    candidates,
+    { limit: 1 },
+    "document-a\nhttps://example.test/page",
+    false,
+  );
+
+  assert.throws(
+    () =>
+      paginateSemanticSnapshot(
+        candidates,
+        { cursor: first.pagination.nextCursor, limit: 1 },
+        "document-b\nhttps://example.test/page",
+        false,
+      ),
+    /STALE_SNAPSHOT_CURSOR/,
+  );
+});
+
 test("semantic snapshot reports when collection stopped at its source cap", () => {
   const result = paginateSemanticSnapshot(
     [candidate("heading", "Title", "h1")],

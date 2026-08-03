@@ -123,7 +123,7 @@ test("runtime-error MCP tool maps a captured browser stack to verified local sou
         limit: 5,
       },
     });
-    assert.equal(result.isError, false);
+    assert.equal(result.isError, false, JSON.stringify(result));
     const structured = result.structuredContent as {
       errors: Array<{
         frames: Array<{
@@ -132,6 +132,10 @@ test("runtime-error MCP tool maps a captured browser stack to verified local sou
             confidence: string;
             matches: Array<{
               path: string;
+              absolutePath: string;
+              fileUri: string;
+              location: string;
+              editorTargets: Array<{ editor: string; uri: string }>;
               line?: number;
               contentMatch?: boolean;
             }>;
@@ -148,6 +152,10 @@ test("runtime-error MCP tool maps a captured browser stack to verified local sou
     assert.equal(workspace?.status, "matched");
     assert.equal(workspace?.confidence, "source-map-content-verified");
     assert.equal(workspace?.matches[0]?.path, "src/mcp/workspaceTools.ts");
+    assert.equal(workspace?.matches[0]?.absolutePath, localPath);
+    assert.equal(workspace?.matches[0]?.fileUri.startsWith("file://"), true);
+    assert.equal(workspace?.matches[0]?.location, `${localPath}:${lineNumber}:1`);
+    assert.equal(workspace?.matches[0]?.editorTargets[0]?.editor, "vscode");
     assert.equal(workspace?.matches[0]?.line, lineNumber);
     assert.equal(workspace?.matches[0]?.contentMatch, true);
     assert.deepEqual(structured.mappingSummary, {

@@ -2435,7 +2435,6 @@ test("Agent requires a read-only observation after a browser mutation", async ()
     responses[index] ?? responses.at(-1)!,
   );
   const executedTools: string[] = [];
-  let snapshotCount = 0;
 
   try {
     const result = await runAutonomousAgentSession({
@@ -2479,11 +2478,7 @@ test("Agent requires a read-only observation after a browser mutation", async ()
           name: call.name,
           content:
             call.name === "browser_snapshot"
-              ? JSON.stringify(
-                  ++snapshotCount === 1
-                    ? { denied: true, reason: "read denied" }
-                    : { ok: true, text: "Saved" },
-                )
+              ? JSON.stringify({ ok: true, text: "Saved" })
               : JSON.stringify({ ok: true }),
         }));
       },
@@ -2493,7 +2488,6 @@ test("Agent requires a read-only observation after a browser mutation", async ()
 
     assert.deepEqual(executedTools, [
       "browser_click",
-      "browser_snapshot",
       "browser_snapshot",
     ]);
     assert.equal(result.status, "completed");
@@ -3005,6 +2999,131 @@ test("Agent blocks one unchanged invalid click retry and continues with correcte
   }
 });
 
+test("Agent blocks changed arguments that still violate the same max-length constraint", async () => {
+  const toolCallResponse = (
+    id: string,
+    name: string,
+    argumentsValue: Record<string, unknown>,
+  ) => ({
+    choices: [
+      {
+        message: {
+          content: "",
+          tool_calls: [
+            {
+              id,
+              type: "function",
+              function: {
+                name,
+                arguments: JSON.stringify(argumentsValue),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  const responses = [
+    toolCallResponse(
+      "css-too-long-1",
+      "browser_apply_css_patch",
+      { patchId: "css-too-long-1", css: "a".repeat(11) },
+    ),
+    toolCallResponse(
+      "css-too-long-2",
+      "browser_apply_css_patch",
+      { patchId: "css-too-long-2", css: "b".repeat(12) },
+    ),
+    toolCallResponse(
+      "css-corrected",
+      "browser_apply_css_patch",
+      { patchId: "css-corrected", css: "body{}" },
+    ),
+    { choices: [{ message: { content: "样式已应用。" } }] },
+    toolCallResponse("verify-css", "browser_snapshot", {}),
+    { choices: [{ message: { content: "样式已应用并验证。" } }] },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+    (body) => requestBodies.push(body),
+  );
+  const executedIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 10,
+        autoContinueAfterToolRoundLimit: true,
+      },
+      messages: [],
+      input: "应用临时 CSS 并验证。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-css-length-recovery",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_apply_css_patch",
+            description: "Apply a reversible CSS patch.",
+            parameters: {
+              type: "object",
+              properties: {
+                patchId: { type: "string" },
+                css: { type: "string", maxLength: 10 },
+              },
+              required: ["css"],
+              additionalProperties: false,
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "browser_snapshot",
+            description: "Read the current page.",
+            parameters: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content:
+            call.id === "css-too-long-1"
+              ? JSON.stringify({
+                  error:
+                    "browser_apply_css_patch arguments invalid: css: string length 11 exceeds maximum 10 characters",
+                })
+              : JSON.stringify({ ok: true }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.deepEqual(executedIds, [
+      "css-too-long-1",
+      "css-corrected",
+      "verify-css",
+    ]);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /验证/);
+    assert.match(JSON.stringify(requestBodies[2]), /maximum 10 characters/);
+  } finally {
+    restore();
+  }
+});
+
 test("Agent terminates an unchanged invalid mutation branch after one corrective retry", async () => {
   const invalidClick = (id: string) => ({
     choices: [
@@ -3081,6 +3200,88 @@ test("Agent terminates an unchanged invalid mutation branch after one corrective
     assert.deepEqual(executedIds, ["invalid-branch-1"]);
     assert.equal(result.status, "blocked");
     assert.match(result.finalContent, /连续提交完全相同的参数/);
+  } finally {
+    restore();
+  }
+});
+
+test("Agent stops a changed-argument loop after two generic schema failures", async () => {
+  const invalidCall = (id: string, mode: string) => ({
+    choices: [
+      {
+        message: {
+          content: "",
+          tool_calls: [
+            {
+              id,
+              type: "function",
+              function: {
+                name: "browser_custom_action",
+                arguments: JSON.stringify({ mode }),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  const responses = [
+    invalidCall("cross-invalid-1", "a"),
+    invalidCall("cross-invalid-2", "b"),
+    invalidCall("cross-invalid-3", "c"),
+    invalidCall("cross-invalid-4", "d"),
+    { choices: [{ message: { content: "参数组合持续无效，已停止。" } }] },
+  ];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+  );
+  const executedIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 10,
+        autoContinueAfterToolRoundLimit: true,
+      },
+      messages: [],
+      input: "执行带跨字段约束的操作。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-cross-field-recovery",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_custom_action",
+            description: "Test a cross-field rule.",
+            parameters: {
+              type: "object",
+              properties: { mode: { type: "string" } },
+              required: ["mode"],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            error:
+              "browser_custom_action arguments invalid: mode and target must be supplied together",
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.deepEqual(executedIds, ["cross-invalid-1", "cross-invalid-2"]);
+    assert.equal(result.status, "blocked");
+    assert.match(result.finalContent, /参数|约束|停止/);
   } finally {
     restore();
   }

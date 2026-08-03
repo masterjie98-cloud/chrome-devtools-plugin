@@ -28,6 +28,27 @@ export interface AgentToolPreExecutionFailure {
   kind: AgentToolPreExecutionFailureKind;
   message: string;
   retryAfterProgress: boolean;
+  argumentConstraint?: AgentToolArgumentConstraint;
+}
+
+export interface AgentToolArgumentConstraint {
+  kind:
+    | "max_string_length"
+    | "min_string_length"
+    | "max_array_length"
+    | "min_array_length"
+    | "max_number"
+    | "min_number"
+    | "enum_values"
+    | "required_type"
+    | "forbidden_keys";
+  path: string;
+  maximum?: number;
+  minimum?: number;
+  inclusive?: boolean;
+  values?: Array<string | number | boolean>;
+  expected?: string;
+  keys?: string[];
 }
 
 export function getAgentToolPreExecutionFailure(
@@ -53,10 +74,12 @@ export function getAgentToolPreExecutionFailure(
       error,
     )
   ) {
+    const argumentConstraint = readAgentToolArgumentConstraint(error);
     return {
       kind: "invalid_arguments",
       message: error,
       retryAfterProgress: false,
+      ...(argumentConstraint ? { argumentConstraint } : {}),
     };
   }
   const recovery = classifyAgentFailureRecovery(error);
@@ -98,6 +121,185 @@ export function getAgentToolPreExecutionFailure(
     };
   }
   return null;
+}
+
+export function doesAgentToolCallViolateArgumentConstraint(
+  args: Record<string, unknown>,
+  failure: AgentToolPreExecutionFailure,
+): boolean {
+  const constraint = failure.argumentConstraint;
+  if (!constraint) {
+    return false;
+  }
+  const value = readArgumentPath(args, constraint.path);
+  switch (constraint.kind) {
+    case "max_string_length":
+      return (
+        typeof value === "string" &&
+        constraint.maximum !== undefined &&
+        value.length > constraint.maximum
+      );
+    case "min_string_length":
+      return (
+        typeof value === "string" &&
+        constraint.minimum !== undefined &&
+        value.length < constraint.minimum
+      );
+    case "max_array_length":
+      return (
+        Array.isArray(value) &&
+        constraint.maximum !== undefined &&
+        value.length > constraint.maximum
+      );
+    case "min_array_length":
+      return (
+        Array.isArray(value) &&
+        constraint.minimum !== undefined &&
+        value.length < constraint.minimum
+      );
+    case "max_number":
+      return violatesMaximum(value, constraint.maximum, constraint.inclusive);
+    case "min_number":
+      return violatesMinimum(value, constraint.minimum, constraint.inclusive);
+    case "enum_values":
+      return Boolean(
+        constraint.values &&
+          !constraint.values.some((candidate) => candidate === value),
+      );
+    case "required_type":
+      return !matchesRequiredType(value, constraint.expected);
+    case "forbidden_keys": {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return false;
+      }
+      return Boolean(
+        constraint.keys?.some((key) => key in (value as Record<string, unknown>)),
+      );
+    }
+  }
+}
+
+function readAgentToolArgumentConstraint(
+  error: string,
+): AgentToolArgumentConstraint | undefined {
+  const marker = "[argument_constraint=";
+  const markerStart = error.lastIndexOf(marker);
+  const markerEnd = error.lastIndexOf("]");
+  const structured =
+    markerStart >= 0 && markerEnd > markerStart
+      ? error.slice(markerStart + marker.length, markerEnd)
+      : undefined;
+  if (structured) {
+    try {
+      const parsed = JSON.parse(structured) as unknown;
+      if (isAgentToolArgumentConstraint(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Fall through to the legacy max-string parser.
+    }
+  }
+  const match = error.match(
+    /(?:arguments invalid:\s*|;\s*)([A-Za-z_$][\w$]*(?:(?:\[\d+\])|(?:\.[A-Za-z_$][\w$]*))*): string length \d+ exceeds maximum (\d+) characters/i,
+  );
+  if (!match) {
+    return undefined;
+  }
+  const path = match[1];
+  if (!path) {
+    return undefined;
+  }
+  const maximum = Number(match[2]);
+  return Number.isSafeInteger(maximum) && maximum >= 0
+      ? {
+        kind: "max_string_length",
+        path,
+        maximum,
+      }
+    : undefined;
+}
+
+function isAgentToolArgumentConstraint(
+  value: unknown,
+): value is AgentToolArgumentConstraint {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Partial<AgentToolArgumentConstraint>;
+  return (
+    typeof candidate.path === "string" &&
+    candidate.path.length > 0 &&
+    [
+      "max_string_length",
+      "min_string_length",
+      "max_array_length",
+      "min_array_length",
+      "max_number",
+      "min_number",
+      "enum_values",
+      "required_type",
+      "forbidden_keys",
+    ].includes(String(candidate.kind))
+  );
+}
+
+function violatesMaximum(
+  value: unknown,
+  maximum: number | undefined,
+  inclusive = true,
+): boolean {
+  return (
+    typeof value === "number" &&
+    maximum !== undefined &&
+    (inclusive ? value > maximum : value >= maximum)
+  );
+}
+
+function violatesMinimum(
+  value: unknown,
+  minimum: number | undefined,
+  inclusive = true,
+): boolean {
+  return (
+    typeof value === "number" &&
+    minimum !== undefined &&
+    (inclusive ? value < minimum : value <= minimum)
+  );
+}
+
+function matchesRequiredType(value: unknown, expected: string | undefined): boolean {
+  if (!expected) {
+    return true;
+  }
+  if (expected === "array") {
+    return Array.isArray(value);
+  }
+  if (expected === "object") {
+    return Boolean(value && typeof value === "object" && !Array.isArray(value));
+  }
+  if (expected === "integer") {
+    return Number.isInteger(value);
+  }
+  return typeof value === expected;
+}
+
+function readArgumentPath(
+  args: Record<string, unknown>,
+  path: string,
+): unknown {
+  if (path === "arguments") {
+    return args;
+  }
+  const segments = Array.from(
+    path.matchAll(/([^[.\]]+)|\[(\d+)\]/g),
+    (match) => match[1] ?? Number(match[2]),
+  );
+  return segments.reduce<unknown>((value, segment) => {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    return (value as Record<string | number, unknown>)[segment];
+  }, args);
 }
 
 export function isAgentToolResultDefinitelyNotExecuted(

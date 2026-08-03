@@ -15,6 +15,7 @@ import type {
 } from "../shared/dom";
 import { DEFAULT_COMPUTED_STYLE_PROPERTIES } from "../shared/dom";
 import {
+  createSemanticSnapshotDocumentKey,
   paginateSemanticSnapshot,
   type SemanticCheckedState,
   type SemanticSnapshotCandidate,
@@ -27,6 +28,17 @@ import {
   sanitizeUrl,
   truncateText,
 } from "../shared/sanitize";
+
+type SemanticSnapshotRuntime = typeof globalThis & {
+  __AI_DEVTOOLS_SEMANTIC_DOCUMENT_KEY__?: string;
+};
+
+const semanticSnapshotRuntime = globalThis as SemanticSnapshotRuntime;
+const semanticSnapshotDocumentKey =
+  semanticSnapshotRuntime.__AI_DEVTOOLS_SEMANTIC_DOCUMENT_KEY__ ??
+  createSemanticSnapshotDocumentKey();
+semanticSnapshotRuntime.__AI_DEVTOOLS_SEMANTIC_DOCUMENT_KEY__ =
+  semanticSnapshotDocumentKey;
 import { isAgentPointerHost } from "./agentPointer";
 import { classifyActionTarget } from "../shared/actionRisk";
 
@@ -134,7 +146,7 @@ export function getPageSnapshot(input: PageSnapshotInput = {}): PageSnapshot {
     semanticSnapshot: paginateSemanticSnapshot(
       observation.candidates,
       input,
-      `${location.href}\n${document.title}`,
+      `${semanticSnapshotDocumentKey}\n${location.href}\n${document.title}`,
       observation.truncated,
     ),
     timing: {

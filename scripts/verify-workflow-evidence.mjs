@@ -317,8 +317,13 @@ try {
   }
 
   const listedResources = await client.listResources();
-  const activityResource = listedResources.resources.find((resource) =>
-    resource.uri.endsWith("/activity-stream"),
+  const activitySessionPath = `/session/${encodeURIComponent(
+    target.sessionId,
+  )}/`;
+  const activityResource = listedResources.resources.find(
+    (resource) =>
+      resource.uri.includes(activitySessionPath) &&
+      resource.uri.endsWith("/activity-stream"),
   );
   if (!activityResource) {
     throw new Error("The selected session did not expose an activity-stream resource.");
@@ -865,13 +870,12 @@ async function selectTarget() {
           String(session.activeTarget?.url ?? "").startsWith(tabUrlPrefix),
       ) ?? sessions.find((session) => session?.browserConnected === true)
     : undefined;
-  if (
-    connected &&
-    typeof connected.sessionId === "string" &&
-    connected.selected !== true
-  ) {
-    await call("browser_set_session", { sessionId: connected.sessionId });
+  if (!connected || typeof connected.sessionId !== "string") {
+    throw new Error("No browser-connected Profile is available for the fixture.");
   }
+  // A fresh adapter may list the daemon's active fallback session as selected
+  // without yet owning an explicit resource/subscription binding.
+  await call("browser_set_session", { sessionId: connected.sessionId });
 
   const tabsResult = await call("browser_list_tabs", {});
   assertSuccess(tabsResult, "tab listing");
@@ -883,7 +887,10 @@ async function selectTarget() {
     throw new Error("The loopback workflow fixture is not open.");
   }
   await call("browser_set_target_tab", { tabId: target.id });
-  return target;
+  return {
+    ...target,
+    sessionId: connected.sessionId,
+  };
 }
 
 function findChildFrame(frames, nodeName) {

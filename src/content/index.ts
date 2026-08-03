@@ -26,6 +26,10 @@ import {
 } from "./domInspector";
 import { cancelElementPicker, startElementPicker } from "./elementPicker";
 import { presentAgentPointer } from "./agentPointer";
+import {
+  configurePageActivityEmitter,
+  setPageActivityMonitoring,
+} from "./pageActivityMonitor";
 import { applyCssPatch, removeCssPatch } from "./stylePatches";
 import { MESSAGE_TYPES, type ExtensionRequest } from "../shared/messages";
 import {
@@ -49,22 +53,21 @@ if (!contentRuntime.__AI_DEVTOOLS_CONTENT_SCRIPT_READY__) {
 function initializeContentScript(): void {
   announceTargetPage("load");
   configureDomActivityEmitter((entry) => {
-    sendRuntimeEvent(
-      makeEvent("content", MESSAGE_TYPES.CONTENT_DOM_ACTIVITY, {
-        kind: "dom",
-        observedAt: new Date().toISOString(),
-        summary: {
-          toRevision: entry.revision,
-          added: entry.added,
-          removed: entry.removed,
-          attributes: entry.attributes,
-          characterData: entry.characterData,
-          domSamples: entry.domSamples,
-          domSamplesOmitted: entry.domSamplesOmitted,
-        },
-      }),
-    );
+    sendPageActivity({
+      kind: "dom",
+      observedAt: new Date().toISOString(),
+      summary: {
+        toRevision: entry.revision,
+        added: entry.added,
+        removed: entry.removed,
+        attributes: entry.attributes,
+        characterData: entry.characterData,
+        domSamples: entry.domSamples,
+        domSamplesOmitted: entry.domSamplesOmitted,
+      },
+    });
   });
+  configurePageActivityEmitter(sendPageActivity);
 
   window.addEventListener("focus", () => announceTargetPage("focus"));
   document.addEventListener("visibilitychange", () => {
@@ -103,16 +106,22 @@ function handleContentRequest(request: ExtensionRequest) {
     case MESSAGE_TYPES.CONTENT_GET_PAGE_INFO:
       return okResponse(request, getPageSnapshot(request.payload));
     case MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR:
-      return okResponse(
-        request,
-        setDomActivityMonitoring(request.payload.enabled),
+      setDomActivityMonitoring(
+        request.payload.enabled && request.payload.includeDom !== false,
       );
+      setPageActivityMonitoring({
+        ...request.payload,
+        includeStyle: request.payload.includeStyle === true,
+        includeVisual: request.payload.includeVisual === true,
+        includeStorage: request.payload.includeStorage === true,
+      });
+      return okResponse(request, { enabled: request.payload.enabled });
     case MESSAGE_TYPES.CONTENT_QUERY_DOM:
       return okResponse(request, queryDom(request.payload));
     case MESSAGE_TYPES.CONTENT_START_ELEMENT_PICK:
       return okResponse(request, startElementPicker());
     case MESSAGE_TYPES.CONTENT_CANCEL_ELEMENT_PICK:
-      return okResponse(request, cancelElementPicker("request"));
+      return okResponse(request, cancelElementPicker("request", false));
     case MESSAGE_TYPES.CONTENT_HIGHLIGHT_ELEMENT:
       return okResponse(request, highlightElement(request.payload));
     case MESSAGE_TYPES.CONTENT_CLEAR_HIGHLIGHTS:
@@ -165,6 +174,14 @@ function handleContentRequest(request: ExtensionRequest) {
     default:
       return errorResponse(request, "UNSUPPORTED_CONTENT_MESSAGE", `Unsupported content message: ${request.type}`);
   }
+}
+
+function sendPageActivity(
+  event: import("../shared/browserActivity").BrowserActivityEventInput,
+): void {
+  sendRuntimeEvent(
+    makeEvent("content", MESSAGE_TYPES.CONTENT_DOM_ACTIVITY, event),
+  );
 }
 
 function announceTargetPage(reason: string): void {

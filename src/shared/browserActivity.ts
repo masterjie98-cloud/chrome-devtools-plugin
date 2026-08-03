@@ -1,15 +1,22 @@
 import type { ActiveTabSnapshot } from "./wsProtocol";
 import { redactSensitiveData } from "./sensitiveData";
 import { sanitizeActiveTabForMcp } from "./wsProtocol";
-import { sanitizeText, sanitizeUrl } from "./sanitize";
+import { sanitizeNetworkUrl, sanitizeText } from "./sanitize";
 
-export const BROWSER_ACTIVITY_STREAM_VERSION = "browser-activity-stream-v2";
+export const BROWSER_ACTIVITY_STREAM_VERSION = "browser-activity-stream-v3";
 
-export type BrowserActivityKind =
-  | "dom"
-  | "network"
-  | "console"
-  | "navigation";
+export const BROWSER_ACTIVITY_KINDS = [
+  "dom",
+  "network",
+  "console",
+  "navigation",
+  "style",
+  "visual",
+  "storage",
+  "realtime",
+] as const;
+
+export type BrowserActivityKind = (typeof BROWSER_ACTIVITY_KINDS)[number];
 
 export const BROWSER_ACTIVITY_EVENT_LIMITS: Readonly<
   Record<BrowserActivityKind, number>
@@ -18,6 +25,10 @@ export const BROWSER_ACTIVITY_EVENT_LIMITS: Readonly<
   network: 2_000,
   console: 500,
   navigation: 500,
+  style: 500,
+  visual: 250,
+  storage: 500,
+  realtime: 1_000,
 });
 
 export const BROWSER_ACTIVITY_EVENT_LIMIT = Object.values(
@@ -66,6 +77,13 @@ export interface BrowserActivityEvent {
     characterData?: number;
     domSamples?: BrowserActivityDomSample[];
     domSamplesOmitted?: number;
+    category?: string;
+    action?: string;
+    area?: string;
+    count?: number;
+    bytes?: number;
+    sampled?: number;
+    payloadPreview?: string;
     transportDroppedEvents?: number;
     reason?: string;
   };
@@ -150,6 +168,14 @@ export interface BrowserActivityStartInput {
   includeDom?: boolean;
   includeNetwork?: boolean;
   includeConsole?: boolean;
+  includeStyle?: boolean;
+  includeVisual?: boolean;
+  includeStorage?: boolean;
+  includeRealtime?: boolean;
+  includeRealtimePayloads?: boolean;
+  includeResponseBodies?: boolean;
+  maxResponseBodyBytes?: number;
+  visualSampleIntervalMs?: number;
   preserveLog?: boolean;
   maxNetworkEntries?: number;
 }
@@ -159,6 +185,12 @@ export interface BrowserActivityStatus {
   includeDom: boolean;
   includeNetwork: boolean;
   includeConsole: boolean;
+  includeStyle: boolean;
+  includeVisual: boolean;
+  includeStorage: boolean;
+  includeRealtime: boolean;
+  includeRealtimePayloads: boolean;
+  includeResponseBodies: boolean;
   tabId?: number;
   frameId?: number;
   documentId?: string;
@@ -189,7 +221,7 @@ export function sanitizeBrowserActivityEventInput(
     kind: input.kind,
     observedAt: normalizeTimestamp(input.observedAt),
     target: input.target
-      ? sanitizeActivityTarget(input.target)
+      ? sanitizeBrowserActivityTarget(input.target)
       : undefined,
     summary: {
       message: summary.message
@@ -253,6 +285,20 @@ export function sanitizeBrowserActivityEventInput(
           })
         : undefined,
       domSamplesOmitted: safeNonNegativeInteger(summary.domSamplesOmitted),
+      category: summary.category
+        ? sanitizeText(summary.category, 80)
+        : undefined,
+      action: summary.action ? sanitizeText(summary.action, 80) : undefined,
+      area: summary.area ? sanitizeText(summary.area, 80) : undefined,
+      count: safeNonNegativeInteger(summary.count),
+      bytes: safeNonNegativeInteger(summary.bytes),
+      sampled: safeNonNegativeInteger(summary.sampled),
+      payloadPreview: summary.payloadPreview
+        ? sanitizeText(
+            String(redactSensitiveData(summary.payloadPreview)),
+            1_000,
+          )
+        : undefined,
       transportDroppedEvents: safeNonNegativeInteger(
         summary.transportDroppedEvents,
       ),
@@ -292,12 +338,20 @@ export function buildBrowserActivityDigest(
     network: 0,
     console: 0,
     navigation: 0,
+    style: 0,
+    visual: 0,
+    storage: 0,
+    realtime: 0,
   };
   const transportDroppedEvents: Record<BrowserActivityKind, number> = {
     dom: 0,
     network: 0,
     console: 0,
     navigation: 0,
+    style: 0,
+    visual: 0,
+    storage: 0,
+    realtime: 0,
   };
   const domChanges = {
     events: 0,
@@ -401,6 +455,10 @@ export function buildBrowserActivityDigest(
     (event) =>
       (event.summary.transportDroppedEvents ?? 0) > 0 ||
       event.kind === "navigation" ||
+      event.kind === "style" ||
+      event.kind === "visual" ||
+      event.kind === "storage" ||
+      event.kind === "realtime" ||
       (event.kind === "console" &&
         (event.summary.level === "error" ||
           event.summary.level === "warning")),
@@ -429,7 +487,7 @@ export function buildBrowserActivityDigest(
       sequence: stream.latestSequence,
     },
     nextSequence: stream.latestSequence,
-    target: stream.target ? sanitizeActivityTarget(stream.target) : null,
+    target: stream.target ? sanitizeBrowserActivityTarget(stream.target) : null,
     retainedFromSequence: stream.retainedFromSequence,
     retainedToSequence: stream.retainedToSequence,
     droppedEvents: stream.droppedEvents,
@@ -482,20 +540,10 @@ function browserActivityNetworkPriority(
 }
 
 function sanitizeActivityUrl(value: string): string {
-  const sanitized = sanitizeUrl(value);
-  try {
-    const url = new URL(sanitized);
-    url.hash = "";
-    for (const key of Array.from(url.searchParams.keys())) {
-      url.searchParams.set(key, "[redacted]");
-    }
-    return sanitizeText(url.toString(), 2_000);
-  } catch {
-    return sanitizeText(sanitized.split("#", 1)[0] ?? "", 2_000);
-  }
+  return sanitizeNetworkUrl(value);
 }
 
-function sanitizeActivityTarget(
+export function sanitizeBrowserActivityTarget(
   target: ActiveTabSnapshot,
 ): ActiveTabSnapshot {
   const sanitized = sanitizeActiveTabForMcp(target);

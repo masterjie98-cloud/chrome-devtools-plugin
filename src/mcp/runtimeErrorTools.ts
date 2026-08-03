@@ -23,6 +23,7 @@ const inputSchema = z
     includeWarnings: z.boolean().optional(),
     includeRevoked: z.boolean().optional(),
     includeLocalExcerpt: z.boolean().optional(),
+    workspaceRoot: z.string().min(1).max(2_000).optional(),
   })
   .strict();
 
@@ -125,9 +126,25 @@ const browserResultSchema = z
 const workspaceMatchSchema = z
   .object({
     root: z.string(),
+    rootId: z.string(),
+    projectName: z.string(),
     path: z.string(),
+    absolutePath: z.string(),
+    fileUri: z.string(),
+    location: z.string(),
+    editorTargets: z.array(
+      z
+        .object({
+          editor: z.enum(["vscode", "cursor"]),
+          uri: z.string(),
+          command: z.string(),
+          arguments: z.array(z.string()),
+        })
+        .strict(),
+    ),
     score: z.number(),
     line: z.number().int().positive().optional(),
+    column: z.number().int().positive().optional(),
     reason: z.array(z.string()),
     excerpt: z.string().optional(),
     contentMatch: z.boolean().optional(),
@@ -164,6 +181,19 @@ const outputSchema = z
                 ]),
                 scannedFiles: z.number().int().nonnegative().optional(),
                 truncated: z.boolean().optional(),
+                selectedRootId: z.string().optional(),
+                rootCandidates: z.array(
+                  z
+                    .object({
+                      id: z.string(),
+                      name: z.string(),
+                      path: z.string(),
+                      markers: z.array(z.string()),
+                      selected: z.boolean(),
+                      matchScore: z.number(),
+                    })
+                    .strict(),
+                ),
                 matches: z.array(workspaceMatchSchema),
                 warnings: z.array(z.string()),
               })
@@ -227,6 +257,7 @@ export function registerRuntimeErrorDiagnosticsTool(
           browserResult,
           args.maxWorkspaceFrames ?? 12,
           args.includeLocalExcerpt !== false,
+          args.workspaceRoot,
         );
         return formatMcpToolResult(outputSchema.parse(result));
       } catch (error) {
@@ -248,6 +279,7 @@ export async function enrichRuntimeErrorsWithWorkspace(
   browserResult: BrowserRuntimeErrorsResult,
   maxWorkspaceFrames: number,
   includeLocalExcerpt: boolean,
+  workspaceRoot?: string,
 ): Promise<z.infer<typeof outputSchema>> {
   let workspaceBudget = maxWorkspaceFrames;
   let totalFrames = 0;
@@ -282,6 +314,7 @@ export async function enrichRuntimeErrorsWithWorkspace(
           workspace: {
             status: original ? "not_attempted" : "unmapped",
             confidence: "unmapped",
+            rootCandidates: [],
             matches: [],
             warnings: original
               ? ["Workspace lookup budget exhausted for this result."]
@@ -295,6 +328,8 @@ export async function enrichRuntimeErrorsWithWorkspace(
         lineNumber: original.lineNumber,
         expectedExcerpt: original.excerpt,
         includeExcerpt: includeLocalExcerpt,
+        columnNumber: original.columnNumber,
+        workspaceRoot,
         limit: 3,
       });
       const symbol = original.name ?? frame.generated.functionName;
@@ -303,6 +338,8 @@ export async function enrichRuntimeErrorsWithWorkspace(
           sourceHint: original.source,
           symbol,
           includeExcerpt: includeLocalExcerpt,
+          columnNumber: original.columnNumber,
+          workspaceRoot,
           limit: 3,
         });
       }
@@ -321,6 +358,10 @@ export async function enrichRuntimeErrorsWithWorkspace(
           confidence,
           scannedFiles: workspace.scannedFiles,
           truncated: workspace.truncated,
+          ...(workspace.selectedRootId
+            ? { selectedRootId: workspace.selectedRootId }
+            : {}),
+          rootCandidates: workspace.rootCandidates,
           matches: workspace.matches,
           warnings: workspace.warnings,
         } satisfies WorkspaceDiagnostics,

@@ -148,7 +148,14 @@ test("workspace normalization deduplicates, sorts, and bounds conversations", ()
         id: `conversation-${index}`,
         createdAt: `2026-07-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
         updatedAt: `2026-07-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
-        messages: [],
+        messages: [
+          {
+            id: `user-${index}`,
+            role: "user",
+            content: `检查对话 ${index}`,
+            createdAt: `2026-07-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+          },
+        ],
         draft: "",
       }),
   );

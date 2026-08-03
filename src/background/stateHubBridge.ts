@@ -2,6 +2,7 @@ import { executeToolCall } from "./toolDispatcher";
 import {
   getSelectedContentFrameSnapshot,
   queryActiveTab,
+  readTargetTabSnapshot,
 } from "./chromeApi";
 import { getTargetNavigationState } from "./targetNavigation";
 import type {
@@ -45,6 +46,7 @@ import {
   sanitizeBrowserActivityEventInput,
   type BrowserActivityEventInput,
   type BrowserActivityKind,
+  BROWSER_ACTIVITY_KINDS,
 } from "../shared/browserActivity";
 import { WS_CLIENT_IDENTITIES } from "../shared/wsClientIdentity";
 import {
@@ -70,6 +72,10 @@ class BackgroundStateHubBridge {
     network: 0,
     console: 0,
     navigation: 0,
+    style: 0,
+    visual: 0,
+    storage: 0,
+    realtime: 0,
   };
 
   constructor() {
@@ -299,6 +305,9 @@ class BackgroundStateHubBridge {
         executeToolCall(message.payload.call, {
           approvalRequired:
             message.payload.executionGrant.claims.approvalRequired,
+          target: executionGrantTargetSnapshot(
+            message.payload.executionGrant,
+          ),
         }),
         controller.signal,
       );
@@ -319,6 +328,14 @@ class BackgroundStateHubBridge {
         error: error instanceof Error ? error.message : "Browser tool failed.",
       });
     } finally {
+      if (!isTargetRoutingControlTool(message.payload.call.toolName)) {
+        const restoredUiTarget = await readActiveTargetSnapshot().catch(
+          () => undefined,
+        );
+        if (restoredUiTarget) {
+          this.sendActiveTab(restoredUiTarget);
+        }
+      }
       this.activeToolRequests.delete(message.requestId);
     }
   }
@@ -369,15 +386,17 @@ class BackgroundStateHubBridge {
     const [installationId, bridgeToken, activeTarget] = await Promise.all([
       getInstallationId(),
       getBridgeToken(),
-      readActiveTargetSnapshot(),
+      targetRoutingControl
+        ? readActiveTargetSnapshot()
+        : readExecutionGrantTargetSnapshot(grant),
     ]);
     if (!activeTarget && !targetRoutingControl) {
       return { ok: false, reason: "no executable browser target is available" };
     }
-    // The daemon can restart with persisted target state while this background
-    // worker keeps an unchanged local cache. Republish the browser-authoritative
-    // target before every grant check; local equality cannot prove daemon sync.
-    if (activeTarget) {
+    // Routing control calls operate on the UI selection. Task-bound calls use
+    // the exact Tab signed into the grant and must not republish it as the UI's
+    // current selection merely because another conversation is executing.
+    if (activeTarget && targetRoutingControl) {
       this.sendActiveTab(activeTarget);
     }
     const verification = await verifyExecutionGrant(bridgeToken, grant, {
@@ -396,11 +415,9 @@ class BackgroundStateHubBridge {
       return verification;
     }
     if (!targetRoutingControl) {
-      const targetAfterVerification = await readActiveTargetSnapshot();
+      const targetAfterVerification =
+        await readExecutionGrantTargetSnapshot(grant);
       if (!sameActiveTarget(activeTarget, targetAfterVerification)) {
-        if (targetAfterVerification) {
-          this.sendActiveTab(targetAfterVerification);
-        }
         return {
           ok: false,
           reason: "browser target changed while the execution grant was being verified",
@@ -489,6 +506,10 @@ class BackgroundStateHubBridge {
       network: 0,
       console: 0,
       navigation: 0,
+      style: 0,
+      visual: 0,
+      storage: 0,
+      realtime: 0,
     };
     let lossNoticesSent = false;
     const sendLossNotices = () => {
@@ -496,12 +517,7 @@ class BackgroundStateHubBridge {
         return;
       }
       lossNoticesSent = true;
-      for (const kind of [
-        "dom",
-        "network",
-        "console",
-        "navigation",
-      ] as const) {
+      for (const kind of BROWSER_ACTIVITY_KINDS) {
         const dropped = droppedActivityEvents[kind];
         if (dropped === 0) {
           continue;
@@ -666,6 +682,13 @@ function executionGrantTargetSnapshot(
     title: "",
     ...grant.claims.target,
   };
+}
+
+async function readExecutionGrantTargetSnapshot(
+  grant: SignedExecutionGrant,
+): Promise<ActiveTabSnapshot | undefined> {
+  const tabId = grant.claims.target.tabId;
+  return tabId === undefined ? undefined : readTargetTabSnapshot(tabId);
 }
 
 async function readActiveTargetSnapshot(): Promise<ActiveTabSnapshot | undefined> {

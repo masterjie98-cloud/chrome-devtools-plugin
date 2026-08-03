@@ -34,9 +34,9 @@ test("activity cursor advances from monitor start and incremental activity resul
       cursor: { streamId: "activity-a", sequence: 81 },
     },
   );
-  assert.deepEqual(
+  assert.equal(
     getActivityCursorUpdate("browser_activity_stop", { active: false }),
-    { kind: "clear" },
+    undefined,
   );
   assert.equal(
     getActivityCursorUpdate("browser_debug_activity", {

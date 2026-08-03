@@ -175,11 +175,64 @@ test("workspace bridge verifies the mapped local line against sourcesContent", a
     });
 
     assert.equal(result.matches[0]?.path, "src/mcp/workspaceTools.ts");
+    assert.equal(result.matches[0]?.absolutePath, path);
+    assert.equal(result.matches[0]?.fileUri.startsWith("file://"), true);
+    assert.equal(result.matches[0]?.location, `${path}:${lineNumber}:1`);
+    assert.equal(
+      result.matches[0]?.editorTargets.some(
+        (target) => target.editor === "vscode" && target.uri.startsWith("vscode://file"),
+      ),
+      true,
+    );
+    assert.equal(result.matches[0]?.rootId.startsWith("workspace-"), true);
     assert.equal(result.matches[0]?.line, lineNumber);
     assert.equal(result.matches[0]?.contentMatch, true);
     assert.equal(
       result.matches[0]?.reason.includes("mapped source content match"),
       true,
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.AI_DEVTOOLS_WORKSPACE_ROOTS;
+    } else {
+      process.env.AI_DEVTOOLS_WORKSPACE_ROOTS = previous;
+    }
+  }
+});
+
+test("workspace bridge selects only a configured project root and returns a direct locator", async () => {
+  const previous = process.env.AI_DEVTOOLS_WORKSPACE_ROOTS;
+  process.env.AI_DEVTOOLS_WORKSPACE_ROOTS = process.cwd();
+  try {
+    const discovery = await findWorkspaceSource({
+      sourceHint: "src/mcp/workspaceTools.ts",
+      lineNumber: 1,
+      columnNumber: 7,
+      limit: 1,
+    });
+    const root = discovery.rootCandidates[0];
+    assert.ok(root);
+    assert.equal(root.markers.includes("package.json"), true);
+
+    const selected = await findWorkspaceSource({
+      sourceHint: "src/mcp/workspaceTools.ts",
+      lineNumber: 1,
+      columnNumber: 7,
+      workspaceRoot: root.id,
+      limit: 1,
+    });
+    assert.equal(selected.selectedRootId, root.id);
+    assert.equal(selected.matches[0]?.rootId, root.id);
+    assert.equal(selected.matches[0]?.column, 7);
+    assert.equal(selected.matches[0]?.editorTargets[0]?.arguments[0], "--goto");
+    assert.equal(selected.matches[0]?.absolutePath.endsWith("/src/mcp/workspaceTools.ts"), true);
+
+    await assert.rejects(
+      findWorkspaceSource({
+        sourceHint: "workspaceTools.ts",
+        workspaceRoot: "/tmp/not-configured",
+      }),
+      /WORKSPACE_ROOT_NOT_CONFIGURED/,
     );
   } finally {
     if (previous === undefined) {

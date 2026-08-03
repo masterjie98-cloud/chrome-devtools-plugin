@@ -6,7 +6,6 @@ export const SANITIZE_LIMITS = {
   elementText: 1000,
   attributeValue: 320,
   domMutationValue: 4000,
-  cssPatch: 6000,
   queryResults: 100
 } as const;
 
@@ -103,6 +102,24 @@ export function sanitizeUrl(rawUrl: string): string {
     return truncateText(url.toString(), 1200);
   } catch {
     return sanitizeText(rawUrl, 1200);
+  }
+}
+
+export function sanitizeNetworkUrl(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return `${url.protocol}//`;
+    }
+    url.username = url.username ? "[REDACTED]" : "";
+    url.password = url.password ? "[REDACTED]" : "";
+    for (const key of Array.from(url.searchParams.keys())) {
+      url.searchParams.set(key, "[REDACTED]");
+    }
+    url.hash = "";
+    return truncateText(url.toString(), 2_000);
+  } catch {
+    return sanitizeText(rawUrl.split(/[?#]/, 1)[0] ?? "", 2_000);
   }
 }
 

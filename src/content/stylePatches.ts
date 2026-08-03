@@ -1,9 +1,19 @@
-import type { CssPatchInput, CssPatchResult, RemoveCssPatchInput, RemoveCssPatchResult } from "../shared/dom";
-import { SANITIZE_LIMITS, truncateText } from "../shared/sanitize";
+import {
+  MAX_CSS_PATCH_CHARS,
+  type CssPatchInput,
+  type CssPatchResult,
+  type RemoveCssPatchInput,
+  type RemoveCssPatchResult,
+} from "../shared/dom";
 
 const STYLE_NODE_PREFIX = "ai-devtools-assistant-css-patch-";
 
 export function applyCssPatch(input: CssPatchInput): CssPatchResult {
+  if (input.css.length > MAX_CSS_PATCH_CHARS) {
+    throw new Error(
+      `CSS patch exceeds the ${MAX_CSS_PATCH_CHARS}-character limit.`,
+    );
+  }
   const patchId = normalizePatchId(input.patchId);
   const styleId = `${STYLE_NODE_PREFIX}${patchId}`;
   const existing = document.getElementById(styleId);
@@ -11,7 +21,7 @@ export function applyCssPatch(input: CssPatchInput): CssPatchResult {
 
   style.id = styleId;
   style.dataset.aiDevtoolsPatchId = patchId;
-  style.textContent = truncateText(input.css, SANITIZE_LIMITS.cssPatch);
+  style.textContent = input.css;
 
   if (!existing) {
     document.documentElement.appendChild(style);

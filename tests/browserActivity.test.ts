@@ -447,3 +447,131 @@ test("browser activity digest reports transport queue loss without counting the 
     true,
   );
 });
+
+test("multiple Tabs retain independent activity streams and cursors", () => {
+  const hub = new BrowserStateHub();
+  const sessionId = "activity-multi-tab";
+  const first = {
+    url: "https://first.example.test/",
+    title: "First",
+    targetId: "101",
+    tabId: 101,
+  };
+  const second = {
+    url: "https://second.example.test/",
+    title: "Second",
+    targetId: "202",
+    tabId: 202,
+  };
+
+  hub.setCurrentTab(first, sessionId);
+  hub.setActivityActive(true, sessionId, first);
+  hub.addBrowserActivityEvent(
+    { kind: "network", target: first, summary: { method: "GET", url: first.url } },
+    sessionId,
+  );
+  const firstStream = hub.activityStreamPayload(sessionId, first.tabId);
+
+  hub.setCurrentTab(second, sessionId);
+  hub.setActivityActive(true, sessionId, second);
+  hub.addBrowserActivityEvent(
+    { kind: "console", target: second, summary: { message: "second tab" } },
+    sessionId,
+  );
+  const secondStream = hub.activityStreamPayload(sessionId, second.tabId);
+
+  assert.notEqual(firstStream.streamId, secondStream.streamId);
+  assert.equal(firstStream.latestSequence, 1);
+  assert.equal(secondStream.latestSequence, 1);
+  assert.equal(firstStream.events[0]?.target?.tabId, first.tabId);
+  assert.equal(secondStream.events[0]?.target?.tabId, second.tabId);
+
+  hub.setCurrentTab(first, sessionId);
+  assert.equal(hub.activityStreamPayload(sessionId).streamId, firstStream.streamId);
+  assert.equal(hub.activityStreamPayload(sessionId).active, true);
+});
+
+test("activity cursors survive daemon state restore without a false active status", () => {
+  const hub = new BrowserStateHub();
+  const sessionId = "activity-persistence";
+  const target = {
+    url: "https://persist.example.test/",
+    title: "Persist",
+    targetId: "303",
+    tabId: 303,
+  };
+  hub.setCurrentTab(target, sessionId);
+  hub.setActivityActive(true, sessionId, target);
+  hub.addBrowserActivityEvent(
+    {
+      kind: "navigation",
+      target,
+      summary: { url: target.url, reason: "document-request" },
+    },
+    sessionId,
+  );
+  const before = hub.activityStreamPayload(sessionId);
+
+  const restored = new BrowserStateHub();
+  restored.restorePersistentState(hub.toPersistentState());
+  const after = restored.activityStreamPayload(sessionId, target.tabId);
+
+  assert.equal(after.streamId, before.streamId);
+  assert.equal(after.latestSequence, before.latestSequence);
+  assert.equal(after.events.length, 1);
+  assert.equal(after.active, false);
+});
+
+test("extended page activity kinds remain independently retained and sanitized", () => {
+  const hub = new BrowserStateHub();
+  const sessionId = "activity-page-changes";
+  const target = {
+    url: "https://changes.example.test/?token=secret",
+    title: "Changes",
+    targetId: "404",
+    tabId: 404,
+  };
+  hub.setCurrentTab(target, sessionId);
+  hub.setActivityActive(true, sessionId, target);
+  for (const event of [
+    {
+      kind: "style" as const,
+      summary: { category: "cssom", action: "insertRule" },
+    },
+    {
+      kind: "visual" as const,
+      summary: { category: "canvas-2d", action: "drawImage", sampled: 1 },
+    },
+    {
+      kind: "storage" as const,
+      summary: { category: "indexeddb-records", action: "put" },
+    },
+    {
+      kind: "realtime" as const,
+      summary: {
+        category: "websocket",
+        action: "frame-received",
+        bytes: 42,
+        payloadPreview: "authorization=Bearer secret-value",
+      },
+    },
+  ]) {
+    hub.addBrowserActivityEvent({ ...event, target }, sessionId);
+  }
+
+  const stream = hub.activityStreamPayload(sessionId, target.tabId);
+  const digest = buildBrowserActivityDigest(stream, 0);
+  assert.deepEqual(
+    stream.events.map((event) => event.kind),
+    ["style", "visual", "storage", "realtime"],
+  );
+  assert.equal(digest.counts.style, 1);
+  assert.equal(digest.counts.visual, 1);
+  assert.equal(digest.counts.storage, 1);
+  assert.equal(digest.counts.realtime, 1);
+  assert.equal(
+    JSON.stringify(stream).includes("secret-value"),
+    false,
+  );
+  assert.equal(stream.target?.url.includes("token=%5BREDACTED%5D"), true);
+});

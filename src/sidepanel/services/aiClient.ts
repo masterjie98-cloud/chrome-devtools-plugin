@@ -168,6 +168,9 @@ const CHAT_COMPLETION_IDLE_TIMEOUT_MS = 120000;
 const EXACT_TOOL_EXCHANGE_CONTEXT_LIMIT = 12;
 const OLDER_TOOL_EXCHANGE_SUMMARY_CHAR_LIMIT = 20000;
 const TOOL_RESULT_CONTEXT_CHAR_LIMIT = 1200;
+const CONTEXT_BUDGET_SAFETY_TOKENS = 2_048;
+const DEFAULT_OUTPUT_RESERVE_TOKENS = 8_192;
+const MIN_RETAINED_MESSAGE_CHARS = 512;
 const TINY_TRANSPARENT_PNG_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 export const EXTENSION_WEB_SEARCH_TOOL: AiFunctionToolDefinition = {
@@ -715,6 +718,281 @@ function appendPortableToolSummary(
   }
 }
 
+export interface AiContextBudgetReport {
+  contextWindowTokens: number;
+  outputReserveTokens: number;
+  safetyReserveTokens: number;
+  inputBudgetTokens: number;
+  estimatedInputTokens: number;
+  omittedMessageCount: number;
+  compactedMessageCount: number;
+}
+
+export function fitMessagesToContextWindow(
+  inputMessages: OpenAiChatMessage[],
+  config: Pick<AiConfig, "contextWindowTokens" | "maxOutputTokens">,
+  tools: unknown[] = [],
+): { messages: OpenAiChatMessage[]; report: AiContextBudgetReport } {
+  const contextWindowTokens = Math.max(8_192, config.contextWindowTokens);
+  const outputReserveTokens = Math.min(
+    Math.max(128, config.maxOutputTokens ?? DEFAULT_OUTPUT_RESERVE_TOKENS),
+    Math.max(128, contextWindowTokens - CONTEXT_BUDGET_SAFETY_TOKENS - 1_024),
+  );
+  const inputBudgetTokens = Math.max(
+    1_024,
+    contextWindowTokens - outputReserveTokens - CONTEXT_BUDGET_SAFETY_TOKENS,
+  );
+  const toolTokens = estimateJsonTokens(tools);
+  const messageBudgetTokens = inputBudgetTokens - toolTokens;
+  if (messageBudgetTokens < 1_024) {
+    throw new Error(
+      `AI_CONTEXT_BUDGET_EXCEEDED: tool schemas require about ${toolTokens} tokens, leaving less than 1024 input tokens inside the configured ${contextWindowTokens}-token context window. Increase Context window or expose fewer tools.`,
+    );
+  }
+
+  let messages = inputMessages.map(cloneOpenAiMessage);
+  let omittedMessageCount = 0;
+  let compactedMessageCount = 0;
+  while (estimateMessagesTokens(messages) > messageBudgetTokens) {
+    const pinned = pinnedContextMessageIndexes(messages);
+    const unit = contextMessageUnits(messages).find(
+      (candidate) => !candidate.some((index) => pinned.has(index)),
+    );
+    if (!unit) {
+      break;
+    }
+    const removeIndexes = new Set(unit);
+    omittedMessageCount += removeIndexes.size;
+    messages = messages.filter((_, index) => !removeIndexes.has(index));
+  }
+
+  while (estimateMessagesTokens(messages) > messageBudgetTokens) {
+    const lastUserIndex = findLastMessageIndex(messages, "user");
+    const candidateIndex = messages.findIndex(
+      (message, index) =>
+        index !== lastUserIndex &&
+        message.role !== "system" &&
+        messageContentCharLength(message.content) > MIN_RETAINED_MESSAGE_CHARS,
+    );
+    if (candidateIndex < 0) {
+      break;
+    }
+    const message = messages[candidateIndex]!;
+    const excessTokens =
+      estimateMessagesTokens(messages) - messageBudgetTokens;
+    const currentChars = messageContentCharLength(message.content);
+    const targetChars = Math.max(
+      MIN_RETAINED_MESSAGE_CHARS,
+      currentChars - Math.max(512, Math.ceil(excessTokens * 4)),
+    );
+    message.content = compactMessageContent(message.content, targetChars);
+    compactedMessageCount += 1;
+  }
+
+  const estimatedInputTokens = toolTokens + estimateMessagesTokens(messages);
+  if (estimatedInputTokens > inputBudgetTokens) {
+    throw new Error(
+      `AI_CONTEXT_BUDGET_EXCEEDED: estimated input is ${estimatedInputTokens} tokens but the configured input budget is ${inputBudgetTokens}. Increase Context window, reduce Max output, History, page context, or enabled tools.`,
+    );
+  }
+
+  return {
+    messages,
+    report: {
+      contextWindowTokens,
+      outputReserveTokens,
+      safetyReserveTokens: CONTEXT_BUDGET_SAFETY_TOKENS,
+      inputBudgetTokens,
+      estimatedInputTokens,
+      omittedMessageCount,
+      compactedMessageCount,
+    },
+  };
+}
+
+export function estimateOpenAiRequestTokens(
+  messages: OpenAiChatMessage[],
+  tools: unknown[] = [],
+): number {
+  return estimateMessagesTokens(messages) + estimateJsonTokens(tools);
+}
+
+function contextMessageUnits(messages: OpenAiChatMessage[]): number[][] {
+  const units: number[][] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!;
+    const unit = [index];
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      while (messages[index + 1]?.role === "tool") {
+        index += 1;
+        unit.push(index);
+      }
+    }
+    units.push(unit);
+  }
+  return units;
+}
+
+function pinnedContextMessageIndexes(
+  messages: OpenAiChatMessage[],
+): Set<number> {
+  const pinned = new Set<number>();
+  messages.forEach((message, index) => {
+    if (message.role === "system") {
+      pinned.add(index);
+    }
+  });
+  const lastUserIndex = findLastMessageIndex(messages, "user");
+  if (lastUserIndex >= 0) {
+    pinned.add(lastUserIndex);
+  }
+  const lastToolIndex = findLastMessageIndex(messages, "tool");
+  if (lastToolIndex >= 0) {
+    pinned.add(lastToolIndex);
+    for (let index = lastToolIndex - 1; index >= 0; index -= 1) {
+      pinned.add(index);
+      if (messages[index]?.role === "assistant") {
+        break;
+      }
+    }
+  }
+  return pinned;
+}
+
+function findLastMessageIndex(
+  messages: OpenAiChatMessage[],
+  role: OpenAiChatMessage["role"],
+): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === role) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function cloneOpenAiMessage(message: OpenAiChatMessage): OpenAiChatMessage {
+  return {
+    ...message,
+    content: Array.isArray(message.content)
+      ? message.content.map((part) =>
+          part.type === "text"
+            ? { ...part }
+            : { ...part, image_url: { ...part.image_url } },
+        )
+      : message.content,
+    tool_calls: message.tool_calls?.map((call) => ({
+      ...call,
+      function: { ...call.function },
+    })),
+  };
+}
+
+function compactMessageContent(
+  content: OpenAiMessageContent | null | undefined,
+  maxChars: number,
+): OpenAiMessageContent | null | undefined {
+  if (typeof content === "string") {
+    return compactTextForBudget(content, maxChars);
+  }
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  const textParts = content.filter(
+    (part): part is OpenAiTextPart => part.type === "text",
+  );
+  const originalTextLength = textParts.reduce(
+    (total, part) => total + part.text.length,
+    0,
+  );
+  if (originalTextLength <= maxChars) {
+    return content;
+  }
+  let remaining = maxChars;
+  return content.map((part) => {
+    if (part.type !== "text") {
+      return part;
+    }
+    const partBudget = Math.max(
+      0,
+      Math.min(part.text.length, Math.floor((part.text.length / originalTextLength) * maxChars)),
+    );
+    const boundedBudget = Math.min(remaining, partBudget);
+    remaining -= boundedBudget;
+    return { ...part, text: compactTextForBudget(part.text, boundedBudget) };
+  });
+}
+
+function compactTextForBudget(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  if (maxChars < 80) {
+    return value.slice(0, Math.max(0, maxChars));
+  }
+  const marker = `\n...[context compacted ${value.length - maxChars} chars]...\n`;
+  const available = Math.max(0, maxChars - marker.length);
+  const head = Math.ceil(available * 0.6);
+  return `${value.slice(0, head)}${marker}${value.slice(-(available - head))}`;
+}
+
+function messageContentCharLength(
+  content: OpenAiMessageContent | null | undefined,
+): number {
+  if (typeof content === "string") {
+    return content.length;
+  }
+  return (content ?? []).reduce(
+    (total, part) => total + (part.type === "text" ? part.text.length : 0),
+    0,
+  );
+}
+
+function estimateMessagesTokens(messages: OpenAiChatMessage[]): number {
+  return messages.reduce((total, message) => {
+    let tokens = 4;
+    if (typeof message.content === "string") {
+      tokens += estimateTextTokens(message.content);
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        tokens +=
+          part.type === "text" ? estimateTextTokens(part.text) : 1_500;
+      }
+    }
+    if (message.reasoning_content) {
+      tokens += estimateTextTokens(message.reasoning_content);
+    }
+    if (message.tool_calls) {
+      tokens += estimateJsonTokens(message.tool_calls);
+    }
+    if (message.name) {
+      tokens += estimateTextTokens(message.name);
+    }
+    return total + tokens;
+  }, 2);
+}
+
+function estimateJsonTokens(value: unknown): number {
+  try {
+    return estimateTextTokens(JSON.stringify(value));
+  } catch {
+    return 0;
+  }
+}
+
+function estimateTextTokens(value: string): number {
+  let asciiChars = 0;
+  let nonAsciiChars = 0;
+  for (const character of value) {
+    if (character.codePointAt(0)! <= 0x7f) {
+      asciiChars += 1;
+    } else {
+      nonAsciiChars += 1;
+    }
+  }
+  return Math.ceil(asciiChars / 4 + nonAsciiChars + 1);
+}
+
 async function requestChatCompletion(params: {
   config: AiConfig;
   messages: OpenAiChatMessage[];
@@ -732,6 +1010,11 @@ async function requestChatCompletion(params: {
       ]
     : [];
   const advertisedTools = providerTools.map(toProviderCompatibleToolSchema);
+  const fittedContext = fitMessagesToContextWindow(
+    params.messages,
+    params.config,
+    advertisedTools,
+  );
   const toolParsingPolicy: ToolParsingPolicy = {
     allowFormalToolCalls: params.enableTools,
     allowPseudoToolCalls:
@@ -742,7 +1025,7 @@ async function requestChatCompletion(params: {
     model: params.config.model,
     temperature: params.config.temperature,
     max_tokens: params.config.maxOutputTokens,
-    messages: params.messages,
+    messages: fittedContext.messages,
     tools: advertisedTools.length > 0 ? advertisedTools : undefined,
     tool_choice: params.enableTools ? (params.toolChoice ?? "auto") : undefined,
     stream: true,
@@ -757,13 +1040,13 @@ async function requestChatCompletion(params: {
   }
 
   const controller = new AbortController();
-  let timeoutId: number | undefined;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const abortFromCaller = () => controller.abort();
   const resetIdleTimeout = () => {
     if (timeoutId !== undefined) {
-      window.clearTimeout(timeoutId);
+      globalThis.clearTimeout(timeoutId);
     }
-    timeoutId = window.setTimeout(
+    timeoutId = globalThis.setTimeout(
       () => controller.abort(),
       CHAT_COMPLETION_IDLE_TIMEOUT_MS,
     );
@@ -844,7 +1127,7 @@ async function requestChatCompletion(params: {
     throw error;
   } finally {
     if (timeoutId !== undefined) {
-      window.clearTimeout(timeoutId);
+      globalThis.clearTimeout(timeoutId);
     }
     params.abortSignal?.removeEventListener("abort", abortFromCaller);
   }
@@ -883,7 +1166,7 @@ async function probeChatCompletion(
   body: Record<string, unknown>,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(
+  const timeoutId = globalThis.setTimeout(
     () => controller.abort(),
     CAPABILITY_PROBE_TIMEOUT_MS,
   );
@@ -916,7 +1199,7 @@ async function probeChatCompletion(
           : "探测请求失败";
     return { ok: false, error: message };
   } finally {
-    window.clearTimeout(timeoutId);
+    globalThis.clearTimeout(timeoutId);
   }
 }
 
@@ -2548,7 +2831,7 @@ function buildSystemPrompt(config: AiConfig, context: AiChatContext): string {
           "Fast execution mode is enabled. No page screenshot is attached automatically when the user sends a message. Begin with browser_observe mode=interactive and a bounded sourceLimit. When multiple current-page targets and values are already known, use one browser_act so independent fill/select actions run as a local batch and ordered clicks/waits stay explicit barriers; do not spend one model round per field. Verify with browser_verify. During Observe, call browser_take_screenshot yourself only when current visual geometry, layout, occlusion, or rendering would materially reduce task uncertainty; pure DOM, text, style-value, and Network tasks should not capture an image by default. After visual observation is explicitly activated, use only the latest checkpoint after navigation, overlays, large DOM changes, uncertain action outcomes, or final visual criteria.",
         ]
       : []),
-    "Arbitrary page-side JavaScript execution is disabled until a deadline-bound isolated executor is available.",
+    "When the user explicitly asks to test a page function, evaluate JavaScript, or debug execution, browser_evaluate and browser_debugger_breakpoint/browser_debugger_control are available behind non-reusable high-risk approval. Use bounded expressions and return only necessary serializable results; never hide arbitrary execution inside another tool.",
     "For continuous current-Tab monitoring, call browser_activity_start once and save activityCursor.streamId plus activityCursor.sequence. For each later user request asking what changed, call browser_debug_activity exactly once with those values as afterStreamId and afterSequence, summarize every retained event in that returned window, and let the client commit activity.nextCursor only after the final summary succeeds. If cursorStatus is events_dropped, explicitly report missedEvents. If transportDroppedEvents contains non-zero counts, explicitly report the local daemon transport gap. Describe the summary as partial after either condition. Never call browser_debug_activity again in the same response, even when the result is empty. Never suggest omitting afterSequence to recover full history; no-argument mode reads only a recent legacy snapshot. Incremental mode omits legacy Network/Console snapshots and returns bounded URL, DOM, Network, and Console aggregates only.",
     activityCursorInstruction,
     "For one action likely to send a request, call browser_network_start_recording before the action, then call browser_network_requests with digestOnly=true once after the action barrier. Use its activityDigest with DOM, route, and visual evidence; repeated heartbeat-like GET/HEAD groups are noise, not proof of progress. Request raw rows or request/response bodies only when the user explicitly needs detailed Network debugging.",

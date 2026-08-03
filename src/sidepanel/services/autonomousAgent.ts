@@ -55,6 +55,7 @@ import {
   MAX_AGENT_TOOL_BATCH_SIZE,
 } from "./agentExecutionStrategy";
 import {
+  doesAgentToolCallViolateArgumentConstraint,
   getAgentToolDataLossNotice,
   getAgentToolPreExecutionFailure,
   isAgentToolApprovalDenied,
@@ -100,6 +101,7 @@ interface RepeatedReadOnlyObservation {
 }
 
 interface FailedPreExecutionToolCall {
+  toolName: string;
   failure: AgentToolPreExecutionFailure;
   progressVersion: number;
   blockedRetries: number;
@@ -166,6 +168,7 @@ export async function runAutonomousAgentSession(
     params.input,
     undefined,
     params.executionBinding,
+    params.assistantMessageId,
   );
   let context = params.context;
   const activeAttachments = [...params.attachments];
@@ -456,17 +459,20 @@ export async function runAutonomousAgentSession(
         }
 
         const signature = getToolCallSignature(toolCall);
-        const priorFailure = failedPreExecutionToolCalls.get(signature);
+        const priorFailure = findFailedPreExecutionToolCall(
+          toolCall,
+          failedPreExecutionToolCalls,
+        );
         if (
           priorFailure &&
-          (!priorFailure.failure.retryAfterProgress ||
-            priorFailure.progressVersion === executionProgressVersion)
+          (!priorFailure.record.failure.retryAfterProgress ||
+            priorFailure.record.progressVersion === executionProgressVersion)
         ) {
-          priorFailure.blockedRetries += 1;
-          const terminal = priorFailure.blockedRetries > 1;
+          priorFailure.record.blockedRetries += 1;
+          const terminal = priorFailure.record.blockedRetries > 1;
           const reason = describeRepeatedPreExecutionFailure(
             toolCall,
-            priorFailure,
+            priorFailure.record,
             terminal,
           );
           (terminal ? blockedRepeatResults : replanBlockedResults).push({
@@ -492,10 +498,10 @@ export async function runAutonomousAgentSession(
           return false;
         }
         if (
-          priorFailure?.failure.retryAfterProgress &&
-          priorFailure.progressVersion < executionProgressVersion
+          priorFailure?.record.failure.retryAfterProgress &&
+          priorFailure.record.progressVersion < executionProgressVersion
         ) {
-          failedPreExecutionToolCalls.delete(signature);
+          failedPreExecutionToolCalls.delete(priorFailure.signature);
         }
         const seenCount = seenToolSignatures.get(signature) ?? 0;
         seenToolSignatures.set(signature, seenCount + 1);
@@ -1658,12 +1664,12 @@ function withStatusTicks<T>(
   const startedAt = Date.now();
   onTick(0);
 
-  const timer = window.setInterval(() => {
+  const timer = globalThis.setInterval(() => {
     onTick(Math.max(1, Math.round((Date.now() - startedAt) / 1000)));
   }, intervalMs);
 
   return run().finally(() => {
-    window.clearInterval(timer);
+    globalThis.clearInterval(timer);
   });
 }
 
@@ -2126,6 +2132,7 @@ function recordPreExecutionToolResults(
     const failure = getAgentToolPreExecutionFailure(result.content);
     if (failure) {
       failures.set(signature, {
+        toolName: toolCall.name,
         failure,
         progressVersion: nextProgressVersion,
         blockedRetries: failures.get(signature)?.blockedRetries ?? 0,
@@ -2144,11 +2151,45 @@ function describeRepeatedPreExecutionFailure(
 ): string {
   const recovery =
     record.failure.kind === "invalid_arguments"
-      ? "检查工具参数 schema，并提供有效 selector，或把最新 targetRef 填入 ref 参数"
+      ? `按工具 schema 修正错误指出的字段和约束。上一次错误：${record.failure.message}`
       : "先重新观察或等待页面稳定，再基于新证据修改目标";
   return terminal
-    ? `工具 ${toolCall.name} 在执行前失败后仍连续提交完全相同的参数。Agent 已停止这个重复分支；${recovery}。`
-    : `已阻止工具 ${toolCall.name} 使用完全相同参数重复执行。上一次调用未执行；${recovery}，然后继续原任务。`;
+    ? `工具 ${toolCall.name} 连续提交完全相同的参数，或修改后仍违反同一执行前约束。Agent 已停止这个重复分支；${recovery}。`
+    : `已阻止工具 ${toolCall.name} 再次提交完全相同的参数，或修改后仍违反同一执行前约束。上一次调用未执行；${recovery}，然后继续原任务。`;
+}
+
+function findFailedPreExecutionToolCall(
+  toolCall: AiRequestedToolCall,
+  failures: Map<string, FailedPreExecutionToolCall>,
+): { record: FailedPreExecutionToolCall; signature: string } | undefined {
+  const signature = getToolCallSignature(toolCall);
+  const exact = failures.get(signature);
+  if (exact) {
+    return { record: exact, signature };
+  }
+  for (const [failedSignature, record] of failures) {
+    if (
+      record.toolName === toolCall.name &&
+      doesAgentToolCallViolateArgumentConstraint(
+        toolCall.arguments,
+        record.failure,
+      )
+    ) {
+      return { record, signature: failedSignature };
+    }
+  }
+  const repeatedGenericValidationFailures = [...failures.entries()].filter(
+    ([, record]) =>
+      record.toolName === toolCall.name &&
+      record.failure.kind === "invalid_arguments" &&
+      !record.failure.argumentConstraint,
+  );
+  if (repeatedGenericValidationFailures.length >= 2) {
+    const [failedSignature, record] =
+      repeatedGenericValidationFailures.at(-1)!;
+    return { record, signature: failedSignature };
+  }
+  return undefined;
 }
 
 function isNoProgressObservationBatch(

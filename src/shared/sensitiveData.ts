@@ -18,8 +18,10 @@ const SENSITIVE_FIELD_NAMES = new Set([
   "clientsecret",
   "cookie",
   "password",
+  "postdata",
   "proxyauthorization",
   "refreshtoken",
+  "requestpostdata",
   "responsebodybase64",
   "secret",
   "setcookie",
@@ -65,7 +67,16 @@ export function redactHeaderCollection(value: unknown): unknown {
 }
 
 function redactValue(value: unknown, parentKey: string): unknown {
-  if (SENSITIVE_FIELD_NAMES.has(normalizeFieldName(parentKey))) {
+  const normalizedParentKey = normalizeFieldName(parentKey);
+  if (
+    normalizedParentKey === "cookie" &&
+    isValueOmittedCookieMetadata(value)
+  ) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, redactValue(entry, key)]),
+    );
+  }
+  if (SENSITIVE_FIELD_NAMES.has(normalizedParentKey)) {
     return REDACTED;
   }
   if (isHeaderField(parentKey)) {
@@ -89,6 +100,21 @@ function isHeaderField(key: string): boolean {
 
 function normalizeFieldName(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function isValueOmittedCookieMetadata(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    value.valueIncluded === false &&
+    !Object.prototype.hasOwnProperty.call(value, "value") &&
+    typeof value.name === "string" &&
+    typeof value.domain === "string" &&
+    typeof value.path === "string" &&
+    typeof value.secure === "boolean" &&
+    typeof value.httpOnly === "boolean"
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

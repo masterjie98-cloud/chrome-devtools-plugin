@@ -7,6 +7,7 @@ import {
   MAX_AGENT_TOOL_BATCH_SIZE,
 } from "../src/sidepanel/services/agentExecutionStrategy";
 import {
+  doesAgentToolCallViolateArgumentConstraint,
   getAgentToolPreExecutionFailure,
   isAgentToolResultDefinitelyNotExecuted,
   isSuccessfulAgentToolResultContent,
@@ -123,6 +124,95 @@ test("tool result success classification rejects failed and skipped states", () 
     )?.retryAfterProgress,
     true,
   );
+});
+
+test("argument failures preserve reusable max-length constraints", () => {
+  const failure = getAgentToolPreExecutionFailure(
+    JSON.stringify({
+      error:
+        "browser_apply_css_patch arguments invalid: css: string length 12 exceeds maximum 10 characters",
+    }),
+  );
+  assert.ok(failure);
+  assert.deepEqual(failure.argumentConstraint, {
+    kind: "max_string_length",
+    path: "css",
+    maximum: 10,
+  });
+  assert.equal(
+    doesAgentToolCallViolateArgumentConstraint({ css: "b".repeat(11) }, failure),
+    true,
+  );
+  assert.equal(
+    doesAgentToolCallViolateArgumentConstraint({ css: "body{}" }, failure),
+    false,
+  );
+});
+
+test("argument failures preserve reusable array, number, enum and type constraints", () => {
+  const cases: Array<{
+    constraint: Record<string, unknown>;
+    invalid: Record<string, unknown>;
+    valid: Record<string, unknown>;
+  }> = [
+    {
+      constraint: { kind: "max_array_length", path: "items", maximum: 2 },
+      invalid: { items: [1, 2, 3] },
+      valid: { items: [1, 2] },
+    },
+    {
+      constraint: {
+        kind: "min_number",
+        path: "timeoutMs",
+        minimum: 100,
+        inclusive: true,
+      },
+      invalid: { timeoutMs: 50 },
+      valid: { timeoutMs: 100 },
+    },
+    {
+      constraint: {
+        kind: "enum_values",
+        path: "mode",
+        values: ["compact", "full"],
+      },
+      invalid: { mode: "all" },
+      valid: { mode: "compact" },
+    },
+    {
+      constraint: { kind: "required_type", path: "limit", expected: "number" },
+      invalid: { limit: "10" },
+      valid: { limit: 10 },
+    },
+    {
+      constraint: {
+        kind: "forbidden_keys",
+        path: "arguments",
+        keys: ["unknown"],
+      },
+      invalid: { unknown: true },
+      valid: { known: true },
+    },
+  ];
+
+  for (const entry of cases) {
+    const failure = getAgentToolPreExecutionFailure(
+      JSON.stringify({
+        error:
+          `browser_tool arguments invalid: bad value ` +
+          `[argument_constraint=${JSON.stringify(entry.constraint)}]`,
+      }),
+    );
+    assert.ok(failure);
+    assert.equal(
+      doesAgentToolCallViolateArgumentConstraint(entry.invalid, failure),
+      true,
+    );
+    assert.equal(
+      doesAgentToolCallViolateArgumentConstraint(entry.valid, failure),
+      false,
+    );
+  }
 });
 
 function toolCall(

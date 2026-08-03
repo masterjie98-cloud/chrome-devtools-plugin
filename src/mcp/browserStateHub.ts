@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   DomElementInfo,
   DomSummaryNode,
@@ -35,16 +36,19 @@ import {
   sanitizePageSnapshotForMcp,
   sanitizeScreenshotForMcp,
 } from "../shared/wsProtocol";
-import { sanitizeText } from "../shared/sanitize";
+import { sanitizeText, sanitizeUrl } from "../shared/sanitize";
 import { createMessageId } from "../shared/messaging";
 import { createResourceTargetKey } from "./resourceRouting";
 import {
   BROWSER_ACTIVITY_EVENT_LIMITS,
+  BROWSER_ACTIVITY_EVENT_LIMIT,
   BROWSER_ACTIVITY_STREAM_VERSION,
   sanitizeBrowserActivityEventInput,
+  sanitizeBrowserActivityTarget,
   type BrowserActivityEvent,
   type BrowserActivityEventInput,
   type BrowserActivityKind,
+  BROWSER_ACTIVITY_KINDS,
   type BrowserActivityStreamSnapshot,
 } from "../shared/browserActivity";
 
@@ -55,19 +59,19 @@ export interface BrowserSession {
   browserConnectedAt?: string;
   uiConnectedAt?: string;
   currentTab?: ActiveTabSnapshot;
+  /**
+   * Latest browser-authoritative target snapshot for each observed Tab.
+   * `currentTab` is only the UI selection; tool tasks may stay pinned to a
+   * different Tab while the user switches windows or conversations.
+   */
+  targetsByTabId: Map<number, ActiveTabSnapshot>;
   selectedElement?: DomElementInfo;
   domSnapshot?: string;
   pageContext?: PageSnapshot;
   consoleLogs: unknown[];
   networkRequests: unknown[];
-  activityActive: boolean;
-  activityTarget?: ActiveTabSnapshot;
-  activityStreamId: string;
-  activityStartedAt: string;
-  activitySequence: number;
-  activityDroppedEvents: number;
-  activityEventCounts: Record<BrowserActivityKind, number>;
-  activityEvents: BrowserActivityEvent[];
+  activityStreams: Map<number, BrowserActivityStreamState>;
+  activityFallbackStream: BrowserActivityStreamState;
   screenshots: ScreenshotSnapshot[];
   lastScreenshot?: ScreenshotSnapshot;
   pluginConversation: PluginChatMessageSnapshot[];
@@ -130,11 +134,36 @@ export interface PersistedBrowserSessionState {
   pluginConversation: PluginChatMessageSnapshot[];
   currentConversationId: string;
   collaborationWorkspace: CollaborationWorkspaceSnapshot;
+  agentSessions?: AgentSessionSnapshot[];
+  activityStreams?: PersistedBrowserActivityStreamState[];
   lastAgentConclusion?: BrowserSession["lastAgentConclusion"];
   createdAt: number;
   lastSeenAt: number;
   stateUpdatedAt: number;
   revision: number;
+}
+
+interface BrowserActivityStreamState {
+  streamId: string;
+  startedAt: string;
+  active: boolean;
+  target?: ActiveTabSnapshot;
+  sequence: number;
+  droppedEvents: number;
+  eventCounts: Record<BrowserActivityKind, number>;
+  events: BrowserActivityEvent[];
+  updatedAt: number;
+}
+
+interface PersistedBrowserActivityStreamState {
+  tabId: number;
+  streamId: string;
+  startedAt: string;
+  target?: ActiveTabSnapshot;
+  sequence: number;
+  droppedEvents: number;
+  events: BrowserActivityEvent[];
+  updatedAt: number;
 }
 
 export interface PersistedBrowserState {
@@ -157,10 +186,16 @@ export interface BrowserSessionSummary {
 const DEFAULT_SESSION_ID = "default";
 const SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_SCREENSHOTS = 20;
+const MAX_PERSISTED_ACTIVITY_STREAMS = 8;
+const MAX_TRACKED_TARGETS = 64;
 
 export class BrowserStateHub {
   readonly sessions = new Map<string, BrowserSession>();
   private activeSessionId = DEFAULT_SESSION_ID;
+  private readonly taskTargetContext = new AsyncLocalStorage<{
+    sessionId: string;
+    target: ActiveTabSnapshot;
+  }>();
   private readonly persistenceListeners = new Set<
     (state: PersistedBrowserState) => void
   >();
@@ -279,6 +314,31 @@ export class BrowserStateHub {
     this.notifyPersistence();
   }
 
+  targetSnapshot(
+    sessionId: string,
+    tabId: number | undefined,
+  ): ActiveTabSnapshot | undefined {
+    if (tabId === undefined) {
+      return undefined;
+    }
+    const target = this.ensureSession(sessionId).targetsByTabId.get(tabId);
+    return target ? structuredClone(target) : undefined;
+  }
+
+  runWithTaskTarget<T>(
+    sessionId: string,
+    target: ActiveTabSnapshot | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (!target) {
+      return operation();
+    }
+    return this.taskTargetContext.run(
+      { sessionId, target: structuredClone(target) },
+      operation,
+    );
+  }
+
   async waitForCurrentTabAfterBrowserConnect(
     sessionId: string,
     options: { timeoutMs?: number; signal?: AbortSignal } = {},
@@ -381,28 +441,41 @@ export class BrowserStateHub {
     target?: ActiveTabSnapshot,
   ): void {
     const session = this.markStateUpdated(sessionId);
-    if (
-      !active &&
-      session.activityTarget?.tabId !== undefined &&
-      target?.tabId !== undefined &&
-      target.tabId !== session.activityTarget.tabId
-    ) {
+    const normalizedTarget = target
+      ? sanitizeBrowserActivityTarget(target)
+      : session.currentTab
+        ? sanitizeBrowserActivityTarget(session.currentTab)
+        : undefined;
+    const tabId = normalizedTarget?.tabId;
+    if (tabId === undefined) {
+      if (active) {
+        session.activityFallbackStream = createActivityStreamState(
+          session.stateUpdatedAt,
+          normalizedTarget,
+          true,
+        );
+      } else {
+        session.activityFallbackStream.active = false;
+        session.activityFallbackStream.updatedAt = session.stateUpdatedAt;
+      }
+      this.notifyPersistence();
       return;
     }
     if (active) {
-      session.activityTarget = target
-        ? sanitizeActiveTabForMcp(target)
-        : session.currentTab
-          ? structuredClone(session.currentTab)
-          : undefined;
-      session.activityStreamId = createActivityStreamId();
-      session.activityStartedAt = new Date(session.stateUpdatedAt).toISOString();
-      session.activitySequence = 0;
-      session.activityDroppedEvents = 0;
-      session.activityEventCounts = emptyActivityEventCounts();
-      session.activityEvents = [];
+      session.activityStreams.set(
+        tabId,
+        createActivityStreamState(session.stateUpdatedAt, normalizedTarget, true),
+      );
+      trimActivityStreams(session);
+      this.notifyPersistence();
+      return;
     }
-    session.activityActive = active;
+    const stream = session.activityStreams.get(tabId);
+    if (stream) {
+      stream.active = false;
+      stream.updatedAt = session.stateUpdatedAt;
+      this.notifyPersistence();
+    }
   }
 
   addBrowserActivityEvent(
@@ -411,34 +484,38 @@ export class BrowserStateHub {
   ): BrowserActivityEvent | undefined {
     const session = this.markStateUpdated(sessionId);
     const sanitized = sanitizeBrowserActivityEventInput(input);
-    if (
-      session.activityTarget?.tabId !== undefined &&
-      sanitized.target?.tabId !== session.activityTarget.tabId
-    ) {
+    const tabId = sanitized.target?.tabId ?? session.currentTab?.tabId;
+    const stream =
+      tabId === undefined
+        ? session.activityFallbackStream
+        : session.activityStreams.get(tabId);
+    if (!stream) {
       return undefined;
     }
-    if (!session.activityActive && sanitized.summary.reason !== "monitoring-stopped") {
+    if (!stream.active && sanitized.summary.reason !== "monitoring-stopped") {
       return undefined;
     }
-    session.activitySequence += 1;
+    stream.sequence += 1;
     const event: BrowserActivityEvent = {
       ...sanitized,
       observedAt: sanitized.observedAt ?? new Date(this.clock()).toISOString(),
-      sequence: session.activitySequence,
+      sequence: stream.sequence,
     };
-    session.activityEvents.push(event);
-    session.activityEventCounts[event.kind] += 1;
+    stream.events.push(event);
+    stream.eventCounts[event.kind] += 1;
+    stream.updatedAt = session.stateUpdatedAt;
     const kindLimit = BROWSER_ACTIVITY_EVENT_LIMITS[event.kind];
-    if (session.activityEventCounts[event.kind] > kindLimit) {
-      const oldestKindIndex = session.activityEvents.findIndex(
+    if (stream.eventCounts[event.kind] > kindLimit) {
+      const oldestKindIndex = stream.events.findIndex(
         (candidate) => candidate.kind === event.kind,
       );
       if (oldestKindIndex >= 0) {
-        session.activityEvents.splice(oldestKindIndex, 1);
-        session.activityEventCounts[event.kind] -= 1;
+        stream.events.splice(oldestKindIndex, 1);
+        stream.eventCounts[event.kind] -= 1;
       }
-      session.activityDroppedEvents += 1;
+      stream.droppedEvents += 1;
     }
+    this.notifyPersistence();
     return structuredClone(event);
   }
 
@@ -538,6 +615,22 @@ export class BrowserStateHub {
         pluginConversation: session.pluginConversation,
         currentConversationId: session.currentConversationId,
         collaborationWorkspace: session.collaborationWorkspace,
+        agentSessions: session.agentSessions
+          .slice(-20)
+          .map(sanitizeAgentSession),
+        activityStreams: [...session.activityStreams.entries()]
+          .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
+          .slice(0, MAX_PERSISTED_ACTIVITY_STREAMS)
+          .map(([tabId, stream]) => ({
+            tabId,
+            streamId: stream.streamId,
+            startedAt: stream.startedAt,
+            target: stream.target,
+            sequence: stream.sequence,
+            droppedEvents: stream.droppedEvents,
+            events: structuredClone(stream.events),
+            updatedAt: stream.updatedAt,
+          })),
         lastAgentConclusion: session.lastAgentConclusion,
         createdAt: session.createdAt,
         lastSeenAt: session.lastSeenAt,
@@ -565,6 +658,13 @@ export class BrowserStateHub {
       const pageContext = persisted.pageContext
         ? sanitizePageSnapshotForMcp(persisted.pageContext)
         : undefined;
+      const recoveredAgentSessions = (persisted.agentSessions ?? []).map(
+        (agentSession) =>
+          recoverPersistedAgentSession(
+            agentSession,
+            new Date(this.clock()).toISOString(),
+          ),
+      );
       const session: BrowserSession = {
         sessionId: persisted.sessionId,
         browserConnected: false,
@@ -572,6 +672,7 @@ export class BrowserStateHub {
         currentTab: persisted.currentTab
           ? sanitizeActiveTabForMcp(persisted.currentTab)
           : undefined,
+        targetsByTabId: new Map(),
         selectedElement: persisted.selectedElement
           ? sanitizeElementForMcp(persisted.selectedElement)
           : undefined,
@@ -579,14 +680,8 @@ export class BrowserStateHub {
         pageContext,
         consoleLogs: [],
         networkRequests: [],
-        activityActive: false,
-        activityTarget: undefined,
-        activityStreamId: createActivityStreamId(),
-        activityStartedAt: new Date(this.clock()).toISOString(),
-        activitySequence: 0,
-        activityDroppedEvents: 0,
-        activityEventCounts: emptyActivityEventCounts(),
-        activityEvents: [],
+        activityStreams: restoreActivityStreams(persisted.activityStreams),
+        activityFallbackStream: createActivityStreamState(this.clock()),
         screenshots,
         lastScreenshot: screenshots.at(-1),
         pluginConversation,
@@ -595,7 +690,8 @@ export class BrowserStateHub {
           persisted.collaborationWorkspace,
         ),
         lastPluginMessage: pluginConversation.at(-1),
-        agentSessions: [],
+        agentSessions: recoveredAgentSessions,
+        activeAgentSession: undefined,
         lastAgentConclusion: persisted.lastAgentConclusion
           ? {
               ...persisted.lastAgentConclusion,
@@ -613,6 +709,12 @@ export class BrowserStateHub {
           : undefined,
         revision: persisted.revision,
       };
+      if (session.currentTab?.tabId !== undefined) {
+        session.targetsByTabId.set(
+          session.currentTab.tabId,
+          structuredClone(session.currentTab),
+        );
+      }
       this.sessions.set(session.sessionId, session);
     }
     this.ensureSession(DEFAULT_SESSION_ID);
@@ -623,6 +725,15 @@ export class BrowserStateHub {
 
   snapshot(sessionId = this.activeSessionId): BrowserStateSnapshot {
     const session = this.ensureSession(sessionId);
+    const taskTargetContext = this.taskTargetContext.getStore();
+    const taskTarget =
+      taskTargetContext?.sessionId === session.sessionId
+        ? taskTargetContext.target.tabId !== undefined
+          ? session.targetsByTabId.get(taskTargetContext.target.tabId) ??
+            taskTargetContext.target
+          : taskTargetContext.target
+        : undefined;
+    const effectiveCurrentTab = taskTarget ?? session.currentTab;
     const lastSeenAt = new Date(session.lastSeenAt).toISOString();
     const stateUpdatedAt = new Date(session.stateUpdatedAt).toISOString();
     const artifactCapturedAt = session.lastScreenshot?.capturedAt;
@@ -633,14 +744,17 @@ export class BrowserStateHub {
       uiConnected: session.uiConnected,
       browserConnectedAt: session.browserConnectedAt,
       uiConnectedAt: session.uiConnectedAt,
-      activeTab: session.currentTab,
-      currentTab: session.currentTab,
+      activeTab: effectiveCurrentTab,
+      currentTab: effectiveCurrentTab,
       selectedElement: session.selectedElement,
       domSnapshot: session.domSnapshot,
       pageContext: session.pageContext,
       consoleLogs: session.consoleLogs,
       networkRequests: session.networkRequests,
-      activityStream: this.activityStreamSnapshot(session),
+      activityStream: this.activityStreamSnapshot(
+        session,
+        effectiveCurrentTab?.tabId,
+      ),
       screenshots: session.screenshots,
       lastScreenshot: session.lastScreenshot,
       pluginConversation: session.pluginConversation,
@@ -686,8 +800,11 @@ export class BrowserStateHub {
     };
   }
 
-  activityStreamPayload(sessionId?: string): BrowserActivityStreamSnapshot {
-    return this.activityStreamSnapshot(this.ensureSession(sessionId));
+  activityStreamPayload(
+    sessionId?: string,
+    tabId?: number,
+  ): BrowserActivityStreamSnapshot {
+    return this.activityStreamSnapshot(this.ensureSession(sessionId), tabId);
   }
 
   selectedElementPayload(sessionId?: string): unknown {
@@ -761,16 +878,11 @@ export class BrowserStateHub {
       sessionId,
       browserConnected: false,
       uiConnected: false,
+      targetsByTabId: new Map(),
       consoleLogs: [],
       networkRequests: [],
-      activityActive: false,
-      activityTarget: undefined,
-      activityStreamId: createActivityStreamId(),
-      activityStartedAt: new Date(now).toISOString(),
-      activitySequence: 0,
-      activityDroppedEvents: 0,
-      activityEventCounts: emptyActivityEventCounts(),
-      activityEvents: [],
+      activityStreams: new Map(),
+      activityFallbackStream: createActivityStreamState(now),
       screenshots: [],
       pluginConversation: [],
       currentConversationId: createConversationId(),
@@ -793,23 +905,37 @@ export class BrowserStateHub {
 
   private activityStreamSnapshot(
     session: BrowserSession,
+    preferredTabId?: number,
   ): BrowserActivityStreamSnapshot {
-    const first = session.activityEvents[0];
-    const last = session.activityEvents.at(-1);
+    const selectedTabId = preferredTabId ?? session.currentTab?.tabId;
+    const selectedTabStream =
+      selectedTabId === undefined
+        ? undefined
+        : session.activityStreams.get(selectedTabId);
+    const stream =
+      selectedTabStream ??
+      [...session.activityStreams.values()].sort(
+        (left, right) =>
+          Number(right.active) - Number(left.active) ||
+          right.updatedAt - left.updatedAt,
+      )[0] ??
+      session.activityFallbackStream;
+    const first = stream.events[0];
+    const last = stream.events.at(-1);
     return {
       version: BROWSER_ACTIVITY_STREAM_VERSION,
       sessionId: session.sessionId,
-      streamId: session.activityStreamId,
-      startedAt: session.activityStartedAt,
-      active: session.activityActive,
-      target: session.activityTarget ?? null,
-      latestSequence: session.activitySequence,
+      streamId: stream.streamId,
+      startedAt: stream.startedAt,
+      active: stream.active,
+      target: stream.target ?? null,
+      latestSequence: stream.sequence,
       retainedFromSequence: first?.sequence ?? null,
       retainedToSequence: last?.sequence ?? null,
-      droppedEvents: session.activityDroppedEvents,
+      droppedEvents: stream.droppedEvents,
       retentionLimits: { ...BROWSER_ACTIVITY_EVENT_LIMITS },
-      events: structuredClone(session.activityEvents),
-      updatedAt: new Date(session.stateUpdatedAt).toISOString(),
+      events: structuredClone(stream.events),
+      updatedAt: new Date(stream.updatedAt).toISOString(),
     };
   }
 
@@ -859,6 +985,20 @@ export class BrowserStateHub {
           title: nextTab.title,
           revision: session.revision,
         };
+    if (session.currentTab.tabId !== undefined) {
+      session.targetsByTabId.delete(session.currentTab.tabId);
+      session.targetsByTabId.set(
+        session.currentTab.tabId,
+        structuredClone(session.currentTab),
+      );
+      while (session.targetsByTabId.size > MAX_TRACKED_TARGETS) {
+        const oldestTabId = session.targetsByTabId.keys().next().value;
+        if (oldestTabId === undefined) {
+          break;
+        }
+        session.targetsByTabId.delete(oldestTabId);
+      }
+    }
   }
 }
 
@@ -939,6 +1079,74 @@ function createActivityStreamId(): string {
   return `activity-${createMessageId()}`;
 }
 
+function createActivityStreamState(
+  now: number,
+  target?: ActiveTabSnapshot,
+  active = false,
+): BrowserActivityStreamState {
+  return {
+    streamId: createActivityStreamId(),
+    startedAt: new Date(now).toISOString(),
+    active,
+    target,
+    sequence: 0,
+    droppedEvents: 0,
+    eventCounts: emptyActivityEventCounts(),
+    events: [],
+    updatedAt: now,
+  };
+}
+
+function trimActivityStreams(session: BrowserSession): void {
+  if (session.activityStreams.size <= MAX_PERSISTED_ACTIVITY_STREAMS) {
+    return;
+  }
+  const removable = [...session.activityStreams.entries()]
+    .filter(([, stream]) => !stream.active)
+    .sort((left, right) => left[1].updatedAt - right[1].updatedAt);
+  while (
+    session.activityStreams.size > MAX_PERSISTED_ACTIVITY_STREAMS &&
+    removable.length > 0
+  ) {
+    const [tabId] = removable.shift()!;
+    session.activityStreams.delete(tabId);
+  }
+}
+
+function restoreActivityStreams(
+  persisted: PersistedBrowserActivityStreamState[] | undefined,
+): Map<number, BrowserActivityStreamState> {
+  const streams = new Map<number, BrowserActivityStreamState>();
+  for (const candidate of persisted ?? []) {
+    const events = candidate.events.map((event) => {
+      const sanitized = sanitizeBrowserActivityEventInput(event);
+      return {
+        ...sanitized,
+        observedAt: sanitized.observedAt ?? event.observedAt,
+        sequence: event.sequence,
+      } satisfies BrowserActivityEvent;
+    });
+    const eventCounts = emptyActivityEventCounts();
+    for (const event of events) {
+      eventCounts[event.kind] += 1;
+    }
+    streams.set(candidate.tabId, {
+      streamId: candidate.streamId,
+      startedAt: candidate.startedAt,
+      active: false,
+      target: candidate.target
+        ? sanitizeBrowserActivityTarget(candidate.target)
+        : undefined,
+      sequence: candidate.sequence,
+      droppedEvents: candidate.droppedEvents,
+      eventCounts,
+      events,
+      updatedAt: candidate.updatedAt,
+    });
+  }
+  return streams;
+}
+
 function parsePersistentBrowserState(value: unknown): PersistedBrowserState {
   if (!isRecord(value)) {
     throw new Error("Persisted browser state must be an object.");
@@ -995,6 +1203,8 @@ function parsePersistedSession(value: unknown): PersistedBrowserSessionState {
   }
   return {
     ...(value as unknown as PersistedBrowserSessionState),
+    agentSessions: parsePersistedAgentSessions(value.agentSessions),
+    activityStreams: parsePersistedActivityStreams(value.activityStreams),
     collaborationWorkspace:
       value.collaborationWorkspace === undefined
         ? createEmptyCollaborationWorkspace()
@@ -1002,6 +1212,186 @@ function parsePersistedSession(value: unknown): PersistedBrowserSessionState {
     lastSeenAt,
     stateUpdatedAt,
   };
+}
+
+function parsePersistedAgentSessions(
+  value: unknown,
+): AgentSessionSnapshot[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value.slice(-20).flatMap((candidate): AgentSessionSnapshot[] => {
+    if (!isPersistedAgentSession(candidate)) {
+      return [];
+    }
+    try {
+      return [sanitizeAgentSession(candidate)];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function isPersistedAgentSession(
+  value: unknown,
+): value is AgentSessionSnapshot {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    value.id.length <= 200 &&
+    ["running", "completed", "blocked", "failed", "cancelled"].includes(
+      String(value.status),
+    ) &&
+    typeof value.input === "string" &&
+    typeof value.startedAt === "string" &&
+    Number.isFinite(Date.parse(value.startedAt)) &&
+    typeof value.updatedAt === "string" &&
+    Number.isFinite(Date.parse(value.updatedAt)) &&
+    (value.completedAt === undefined ||
+      (typeof value.completedAt === "string" &&
+        Number.isFinite(Date.parse(value.completedAt)))) &&
+    (value.finalContent === undefined ||
+      typeof value.finalContent === "string") &&
+    (value.assistantMessageId === undefined ||
+      (typeof value.assistantMessageId === "string" &&
+        value.assistantMessageId.length <= 200)) &&
+    (value.visibleContent === undefined ||
+      typeof value.visibleContent === "string") &&
+    (value.executionOwner === undefined ||
+      ["sidepanel", "extension_background", "daemon"].includes(
+        String(value.executionOwner),
+      )) &&
+    isRecord(value.taskState) &&
+    Array.isArray(value.events) &&
+    value.events.length <= 80 &&
+    value.events.every(isPersistedAgentSessionEvent) &&
+    (value.executionBinding === undefined ||
+      isPersistedAgentExecutionBinding(value.executionBinding))
+  );
+}
+
+function isPersistedAgentExecutionBinding(value: unknown): boolean {
+  const target =
+    isRecord(value) && isRecord(value.target) ? value.target : undefined;
+  return (
+    isRecord(value) &&
+    typeof value.taskId === "string" &&
+    typeof value.conversationId === "string" &&
+    target !== undefined &&
+    Number.isSafeInteger(target.tabId) &&
+    (target.tabId as number) >= 0 &&
+    (target.windowId === undefined ||
+      Number.isSafeInteger(target.windowId)) &&
+    ["targetId", "title", "url"].every(
+      (key) => target[key] === undefined || typeof target[key] === "string",
+    )
+  );
+}
+
+function isPersistedAgentSessionEvent(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    ![
+      "started",
+      "context",
+      "tool_calls",
+      "tool_results",
+      "completed",
+      "blocked",
+      "failed",
+      "cancelled",
+    ].includes(String(value.type)) ||
+    typeof value.createdAt !== "string" ||
+    !Number.isFinite(Date.parse(value.createdAt)) ||
+    typeof value.summary !== "string"
+  ) {
+    return false;
+  }
+  if (value.data === undefined) {
+    return true;
+  }
+  if (!isRecord(value.data)) {
+    return false;
+  }
+  return (
+    (value.data.contextReadError === undefined ||
+      typeof value.data.contextReadError === "string") &&
+    (value.data.toolCalls === undefined ||
+      (Array.isArray(value.data.toolCalls) &&
+        value.data.toolCalls.every(
+          (toolCall) =>
+            isRecord(toolCall) &&
+            typeof toolCall.id === "string" &&
+            typeof toolCall.name === "string" &&
+            isRecord(toolCall.arguments),
+        ))) &&
+    (value.data.toolResults === undefined ||
+      (Array.isArray(value.data.toolResults) &&
+        value.data.toolResults.every(
+          (toolResult) =>
+            isRecord(toolResult) &&
+            typeof toolResult.toolCallId === "string" &&
+            typeof toolResult.name === "string" &&
+            typeof toolResult.content === "string",
+        )))
+  );
+}
+
+function parsePersistedActivityStreams(
+  value: unknown,
+): PersistedBrowserActivityStreamState[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value
+    .slice(0, MAX_PERSISTED_ACTIVITY_STREAMS)
+    .flatMap((candidate): PersistedBrowserActivityStreamState[] => {
+      if (
+        !isRecord(candidate) ||
+        !Number.isSafeInteger(candidate.tabId) ||
+        (candidate.tabId as number) < 0 ||
+        typeof candidate.streamId !== "string" ||
+        !candidate.streamId.startsWith("activity-") ||
+        typeof candidate.startedAt !== "string" ||
+        !Number.isFinite(Date.parse(candidate.startedAt)) ||
+        !Number.isSafeInteger(candidate.sequence) ||
+        (candidate.sequence as number) < 0 ||
+        !Number.isSafeInteger(candidate.droppedEvents) ||
+        (candidate.droppedEvents as number) < 0 ||
+        !isSafeTimestamp(candidate.updatedAt) ||
+        !Array.isArray(candidate.events) ||
+        candidate.events.length > BROWSER_ACTIVITY_EVENT_LIMIT ||
+        !candidate.events.every(isPersistedBrowserActivityEvent) ||
+        (candidate.target !== undefined &&
+          !isActiveTabSnapshot(candidate.target))
+      ) {
+        return [];
+      }
+      return [candidate as unknown as PersistedBrowserActivityStreamState];
+    });
+}
+
+function isPersistedBrowserActivityEvent(
+  value: unknown,
+): value is BrowserActivityEvent {
+  return (
+    isRecord(value) &&
+    Number.isSafeInteger(value.sequence) &&
+    (value.sequence as number) > 0 &&
+    BROWSER_ACTIVITY_KINDS.includes(
+      String(value.kind) as BrowserActivityKind,
+    ) &&
+    typeof value.observedAt === "string" &&
+    isRecord(value.summary)
+  );
 }
 
 function stateTimeMetadata(snapshot: BrowserStateSnapshot) {
@@ -1128,6 +1518,10 @@ function emptyActivityEventCounts(): Record<BrowserActivityKind, number> {
     network: 0,
     console: 0,
     navigation: 0,
+    style: 0,
+    visual: 0,
+    storage: 0,
+    realtime: 0,
   };
 }
 
@@ -1140,13 +1534,43 @@ function sanitizeAgentSession(
 ): AgentSessionSnapshot {
   return {
     ...session,
+    id: sanitizeText(session.id, 200),
+    assistantMessageId: session.assistantMessageId
+      ? sanitizeText(session.assistantMessageId, 200)
+      : undefined,
     input: sanitizeText(session.input, 4000),
     finalContent: session.finalContent
       ? sanitizeText(session.finalContent, 12000)
       : undefined,
+    visibleContent: session.visibleContent
+      ? sanitizeText(session.visibleContent, 12000)
+      : undefined,
+    executionBinding: session.executionBinding
+      ? {
+          taskId: sanitizeText(session.executionBinding.taskId, 200),
+          conversationId: sanitizeText(
+            session.executionBinding.conversationId,
+            200,
+          ),
+          target: {
+            tabId: session.executionBinding.target.tabId,
+            windowId: session.executionBinding.target.windowId,
+            targetId: session.executionBinding.target.targetId
+              ? sanitizeText(session.executionBinding.target.targetId, 200)
+              : undefined,
+            title: session.executionBinding.target.title
+              ? sanitizeText(session.executionBinding.target.title, 500)
+              : undefined,
+            url: session.executionBinding.target.url
+              ? sanitizeUrl(session.executionBinding.target.url)
+              : undefined,
+          },
+        }
+      : undefined,
     taskState: sanitizeAgentTaskState(session.taskState),
     events: session.events.slice(-80).map((event) => ({
       ...event,
+      id: sanitizeText(event.id, 200),
       summary: sanitizeText(event.summary, 1200),
       data: event.data
         ? {
@@ -1168,6 +1592,43 @@ function sanitizeAgentToolCalls(
     ...sanitizeAgentToolCallForPersistence(toolCall),
     name: sanitizeText(toolCall.name, 160),
   }));
+}
+
+function recoverPersistedAgentSession(
+  session: AgentSessionSnapshot,
+  recoveredAt: string,
+): AgentSessionSnapshot {
+  const sanitized = sanitizeAgentSession(session);
+  if (sanitized.status !== "running") {
+    return sanitized;
+  }
+
+  const recoveryMessage =
+    "Daemon 重启前该 Agent 仍在运行，原执行环境已经结束。任务快照已保留；请回到对应对话，重新读取页面状态后决定继续或终止。";
+  return sanitizeAgentSession({
+    ...sanitized,
+    status: "blocked",
+    updatedAt: recoveredAt,
+    completedAt: recoveredAt,
+    finalContent: recoveryMessage,
+    taskState: {
+      ...sanitized.taskState,
+      revision: sanitized.taskState.revision + 1,
+      phase: "blocked",
+      activeAction: undefined,
+      blockers: [...sanitized.taskState.blockers, recoveryMessage].slice(-20),
+      updatedAt: recoveredAt,
+    },
+    events: [
+      ...sanitized.events,
+      {
+        id: `daemon-recovery-${sanitizeText(sanitized.id, 160)}`,
+        type: "blocked" as const,
+        createdAt: recoveredAt,
+        summary: recoveryMessage,
+      },
+    ].slice(-80),
+  });
 }
 
 function sanitizeAgentToolResults(

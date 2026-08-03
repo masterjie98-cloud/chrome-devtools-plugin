@@ -4,9 +4,10 @@ import {
 } from "../../shared/mcpTools";
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
 
-export type ActivityCursorUpdate =
-  | { kind: "set"; cursor: BrowserActivityCursor }
-  | { kind: "clear" };
+export type ActivityCursorUpdate = {
+  kind: "set";
+  cursor: BrowserActivityCursor;
+};
 
 export function shouldDeferActivityCursorUpdate(toolName: string): boolean {
   return (
@@ -25,9 +26,6 @@ export function getActivityCursorUpdate(
   data: unknown,
 ): ActivityCursorUpdate | undefined {
   const normalizedName = normalizeMcpToolName(toolName);
-  if (normalizedName === MCP_TOOL_NAMES.BROWSER_ACTIVITY_STOP) {
-    return { kind: "clear" };
-  }
   if (!isRecord(data)) {
     return undefined;
   }

@@ -81,6 +81,13 @@ export interface SemanticSnapshotCollection {
 export const DEFAULT_SEMANTIC_SNAPSHOT_LIMIT = 50;
 export const MAX_SEMANTIC_SNAPSHOT_LIMIT = 100;
 
+export function createSemanticSnapshotDocumentKey(): string {
+  const randomId =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `document-${randomId}`;
+}
+
 export function paginateSemanticSnapshot(
   candidates: SemanticSnapshotCandidate[],
   input: SemanticSnapshotInput,

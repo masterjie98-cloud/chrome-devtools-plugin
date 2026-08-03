@@ -16,6 +16,8 @@ import {
   listCookies,
   navigateActiveTab,
   queryActiveTab,
+  queryForegroundTab,
+  readTargetTabSnapshot,
   reloadActiveTab,
   resizeActiveWindow,
   sendTabRequest,
@@ -23,6 +25,7 @@ import {
   selectTargetFrame,
   setCookie,
   waitForRegisteredContentFrames,
+  withTemporaryTargetTab,
   type ContentFrameAddress,
 } from "./chromeApi";
 import { getTargetNavigationState } from "./targetNavigation";
@@ -60,11 +63,14 @@ import {
   listProxyRules,
   listNetworkRequests,
   manageJavaScriptBreakpoint,
+  prepareJavaScriptDialogHandling,
   prepareFetchDebugger,
   removeProxyRule,
   resolveGeneratedSourceLocation,
+  startActivityDebuggerForTab,
   startRuntimeErrorMonitoring,
   startNetworkDebugger,
+  stopActivityDebuggerForTab,
   stopRuntimeErrorMonitoring,
   stopNetworkDebugger,
   upsertProxyRule,
@@ -86,7 +92,11 @@ import {
   type RequestOf,
   type ResponsePayloadMap,
 } from "../shared/messages";
-import { createMessageId } from "../shared/messaging";
+import {
+  createMessageId,
+  makeEvent,
+  sendRuntimeEvent,
+} from "../shared/messaging";
 import { attachPageSnapshotProvenance } from "../shared/pageSnapshotProvenance";
 import {
   TOOL_NAMES,
@@ -123,7 +133,17 @@ import type {
   PageSnapshotTarget,
   ScreenshotCaptureInput,
 } from "../shared/dom";
+import type { ActiveTabSnapshot } from "../shared/wsProtocol";
+import { executionTargetMismatchFields } from "../shared/executionGrant";
 import { locateElementSource } from "./sourceLocator";
+import {
+  installMainWorldActivityHooks,
+  uninstallMainWorldActivityHooks,
+} from "./pageActivityHooks";
+import {
+  elementPickerBindingTracker,
+  type ElementPickerBinding,
+} from "./elementPickerLifecycle";
 
 type ContentRequestType =
   | typeof MESSAGE_TYPES.CONTENT_GET_PAGE_INFO
@@ -157,21 +177,65 @@ const screenshotBaselines = new Map<
   string,
   { dataUrl: string; capturedAt: string }
 >();
-let activityStatus = {
-  active: false,
-  includeDom: false,
-  includeNetwork: false,
-  includeConsole: false,
-} as import("../shared/browserActivity").BrowserActivityStatus;
-let activityTarget:
-  | import("../shared/wsProtocol").ActiveTabSnapshot
-  | undefined;
+const activityStatusByTabId = new Map<
+  number,
+  import("../shared/browserActivity").BrowserActivityStatus
+>();
+const activityTargetsByTabId = new Map<
+  number,
+  import("../shared/wsProtocol").ActiveTabSnapshot
+>();
+const activityHookTokensByTabId = new Map<number, string>();
 
 export interface ToolExecutionAuthorization {
   approvalRequired: boolean;
+  target?: ActiveTabSnapshot;
 }
 
-export async function executeToolCall(
+let toolExecutionTail: Promise<void> = Promise.resolve();
+
+export function executeToolCall(
+  call: AnyToolCall,
+  authorization?: ToolExecutionAuthorization,
+): Promise<ToolExecutionResult> {
+  const execute = () => executeToolCallSerialized(call, authorization);
+  const result = toolExecutionTail.then(execute, execute);
+  toolExecutionTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+async function executeToolCallSerialized(
+  call: AnyToolCall,
+  authorization?: ToolExecutionAuthorization,
+): Promise<ToolExecutionResult> {
+  const target = authorization?.target;
+  if (
+    target?.tabId !== undefined &&
+    !isTargetRoutingControlTool(call.toolName)
+  ) {
+    const liveTarget = await readTargetTabSnapshot(target.tabId);
+    if (!liveTarget) {
+      throw new Error(
+        `STALE_CONTEXT: task target Tab ${target.tabId} is closed or no longer scriptable.`,
+      );
+    }
+    const mismatchFields = executionTargetMismatchFields(target, liveTarget);
+    if (mismatchFields.length > 0) {
+      throw new Error(
+        `STALE_CONTEXT: task target changed before browser execution (fields=${mismatchFields.join(",")}).`,
+      );
+    }
+    return withTemporaryTargetTab(target.tabId, () =>
+      executeToolCallUnlocked(call, authorization),
+    );
+  }
+  return executeToolCallUnlocked(call, authorization);
+}
+
+async function executeToolCallUnlocked(
   call: AnyToolCall,
   authorization?: ToolExecutionAuthorization,
 ): Promise<ToolExecutionResult> {
@@ -247,18 +311,12 @@ export async function executeToolCall(
     case TOOL_NAMES.DOM_START_ELEMENT_PICK:
       return {
         toolName: normalizedCall.toolName,
-        data: await forwardContentRequest(
-          MESSAGE_TYPES.CONTENT_START_ELEMENT_PICK,
-          {},
-        ),
+        data: await startElementPickerForCurrentTarget(),
       };
     case TOOL_NAMES.DOM_CANCEL_ELEMENT_PICK:
       return {
         toolName: normalizedCall.toolName,
-        data: await forwardContentRequest(
-          MESSAGE_TYPES.CONTENT_CANCEL_ELEMENT_PICK,
-          {},
-        ),
+        data: await cancelTrackedElementPicker("cancelled"),
       };
     case TOOL_NAMES.DOM_HIGHLIGHT_ELEMENT:
       return {
@@ -310,11 +368,26 @@ export async function executeToolCall(
         toolName: normalizedCall.toolName,
         data: await listTargetTabs(),
       };
-    case TOOL_NAMES.BROWSER_SET_TARGET_TAB:
+    case TOOL_NAMES.BROWSER_SET_TARGET_TAB: {
+      const data = await selectTargetTab(normalizedCall.args);
+      let dialogHandlingPreparationError: string | undefined;
+      try {
+        await prepareJavaScriptDialogHandling(data.selectedTab.id);
+      } catch (error) {
+        dialogHandlingPreparationError =
+          error instanceof Error ? error.message : String(error);
+      }
       return {
         toolName: normalizedCall.toolName,
-        data: await selectTargetTab(normalizedCall.args),
+        data: {
+          ...data,
+          dialogHandlingPrepared: dialogHandlingPreparationError === undefined,
+          ...(dialogHandlingPreparationError
+            ? { dialogHandlingPreparationError }
+            : {}),
+        },
       };
+    }
     case TOOL_NAMES.BROWSER_LIST_FRAMES:
       return {
         toolName: normalizedCall.toolName,
@@ -709,48 +782,86 @@ export async function executeToolCall(
   }
 }
 
+function isTargetRoutingControlTool(toolName: string): boolean {
+  return (
+    toolName === TOOL_NAMES.BROWSER_LIST_TABS ||
+    toolName === TOOL_NAMES.BROWSER_SET_TARGET_TAB
+  );
+}
+
 async function startBrowserActivity(
   input: import("../shared/browserActivity").BrowserActivityStartInput,
 ): Promise<import("../shared/browserActivity").BrowserActivityStatus> {
   const includeDom = input.includeDom !== false;
   const includeNetwork = input.includeNetwork !== false;
   const includeConsole = input.includeConsole !== false;
+  const includeStyle = input.includeStyle !== false;
+  const includeVisual = input.includeVisual !== false;
+  const includeStorage = input.includeStorage !== false;
+  const includeRealtime = input.includeRealtime !== false;
+  const includeRealtimePayloads = input.includeRealtimePayloads === true;
+  const includeResponseBodies = input.includeResponseBodies === true;
   const tab = await queryActiveTab();
   if (!tab?.id) {
     throw new Error("No active tab is available.");
   }
   const frame = getSelectedContentFrameSnapshot(tab.id);
-  let networkObservationSessionId: string | undefined;
-  let runtimeErrorCursor:
-    | { streamId: string; sequence: number }
-    | undefined;
-  if (includeNetwork) {
-    const network = await startNetworkDebugger({
-      preserveLog: input.preserveLog === true,
-      maxEntries: input.maxNetworkEntries ?? 2_000,
+  const debuggerStatus =
+    includeNetwork || includeConsole || includeRealtime || includeResponseBodies
+      ? await startActivityDebuggerForTab(tab.id, {
+          includeNetwork,
+          includeConsole,
+          includeRealtime,
+          includeRealtimePayloads,
+          includeResponseBodies,
+          maxResponseBodyBytes: input.maxResponseBodyBytes ?? 32_768,
+          preserveLog: input.preserveLog === true,
+          maxNetworkEntries: input.maxNetworkEntries ?? 2_000,
+        })
+      : {};
+  const includeContentActivity =
+    includeDom || includeStyle || includeVisual || includeStorage;
+  const hookToken = createMessageId();
+  if (includeContentActivity) {
+    activityHookTokensByTabId.set(tab.id, hookToken);
+    await setContentActivityMonitoringForTab(tab.id, {
+      enabled: true,
+      includeDom,
+      includeStyle,
+      includeVisual,
+      includeStorage,
+      visualSampleIntervalMs: input.visualSampleIntervalMs ?? 1_000,
+      hookToken,
     });
-    networkObservationSessionId = network.observationSessionId;
+    await installMainWorldActivityHooksForTab(tab.id, {
+      token: hookToken,
+      includeStyle,
+      includeVisual,
+      includeStorage,
+    });
   }
-  if (includeConsole) {
-    runtimeErrorCursor = await startRuntimeErrorMonitoring(
-      input.preserveLog === true,
-    );
-  }
-  if (includeDom) {
-    await setDomActivityMonitoringForTab(tab.id, true);
-  }
-  activityStatus = {
+  const activityStatus = {
     active: true,
     includeDom,
     includeNetwork,
     includeConsole,
+    includeStyle,
+    includeVisual,
+    includeStorage,
+    includeRealtime,
+    includeRealtimePayloads,
+    includeResponseBodies,
     tabId: tab.id,
     frameId: frame?.frameId ?? getSelectedContentFrame(tab.id).frameId,
     documentId: frame?.documentId,
-    networkObservationSessionId,
-    runtimeErrorCursor,
+    networkObservationSessionId: debuggerStatus.networkObservationSessionId,
+    runtimeErrorCursor: debuggerStatus.runtimeErrorCursor,
   };
-  activityTarget = toBrowserActivityTarget(tab);
+  const activityTarget = toBrowserActivityTarget(tab);
+  activityStatusByTabId.set(tab.id, activityStatus);
+  if (activityTarget) {
+    activityTargetsByTabId.set(tab.id, activityTarget);
+  }
   emitDebuggerActivityLifecycle(
     true,
     activityTarget,
@@ -762,26 +873,58 @@ async function startBrowserActivity(
 async function stopBrowserActivity(): Promise<
   import("../shared/browserActivity").BrowserActivityStatus
 > {
-  if (activityStatus.includeDom) {
+  const tab = await queryActiveTab();
+  const tabId = tab?.id;
+  const activityStatus =
+    tabId === undefined ? undefined : activityStatusByTabId.get(tabId);
+  if (!activityStatus || tabId === undefined) {
+    return {
+      active: false,
+      includeDom: false,
+      includeNetwork: false,
+      includeConsole: false,
+      includeStyle: false,
+      includeVisual: false,
+      includeStorage: false,
+      includeRealtime: false,
+      includeRealtimePayloads: false,
+      includeResponseBodies: false,
+      ...(tabId !== undefined ? { tabId } : {}),
+    };
+  }
+  if (
+    activityStatus.includeDom ||
+    activityStatus.includeStyle ||
+    activityStatus.includeVisual ||
+    activityStatus.includeStorage
+  ) {
     if (activityStatus.tabId !== undefined) {
-      await setDomActivityMonitoringForTab(
+      await setContentActivityMonitoringForTab(activityStatus.tabId, {
+        enabled: false,
+      }).catch(() => undefined);
+      await uninstallMainWorldActivityHooksForTab(
         activityStatus.tabId,
-        false,
       ).catch(() => undefined);
     }
   }
-  if (activityStatus.includeNetwork) {
-    await stopNetworkDebugger().catch(() => undefined);
+  if (
+    activityStatus.includeNetwork ||
+    activityStatus.includeConsole ||
+    activityStatus.includeRealtime ||
+    activityStatus.includeResponseBodies
+  ) {
+    await stopActivityDebuggerForTab(tabId).catch(() => undefined);
   }
-  if (activityStatus.includeConsole) {
-    stopRuntimeErrorMonitoring();
-  }
-  activityStatus = {
+  const stoppedStatus = {
     ...activityStatus,
     active: false,
   };
+  activityStatusByTabId.delete(tabId);
+  activityHookTokensByTabId.delete(tabId);
+  const activityTarget = activityTargetsByTabId.get(tabId);
+  activityTargetsByTabId.delete(tabId);
   emitDebuggerActivityLifecycle(false, activityTarget);
-  return { ...activityStatus };
+  return stoppedStatus;
 }
 
 function toBrowserActivityTarget(
@@ -811,18 +954,39 @@ export async function restoreBrowserActivityForContentFrame(
   frame: ContentFrameAddress,
 ): Promise<void> {
   if (
-    !activityStatus.active ||
-    !activityStatus.includeDom ||
-    activityStatus.tabId !== tabId
+    !activityStatusByTabId.get(tabId)?.active ||
+    !hasContentActivity(activityStatusByTabId.get(tabId))
   ) {
     return;
   }
-  await sendActivityMonitorRequest(tabId, frame, true);
+  const status = activityStatusByTabId.get(tabId)!;
+  const hookToken = activityHookTokensByTabId.get(tabId) ?? createMessageId();
+  activityHookTokensByTabId.set(tabId, hookToken);
+  await sendActivityMonitorRequest(tabId, frame, {
+    enabled: true,
+    includeDom: status.includeDom,
+    includeStyle: status.includeStyle,
+    includeVisual: status.includeVisual,
+    includeStorage: status.includeStorage,
+    visualSampleIntervalMs: 1_000,
+    hookToken,
+  });
+  await installMainWorldActivityHooksForTab(tabId, {
+    token: hookToken,
+    includeStyle: status.includeStyle,
+    includeVisual: status.includeVisual,
+    includeStorage: status.includeStorage,
+  });
 }
 
-async function setDomActivityMonitoringForTab(
+type ContentActivityMonitorPayload = Extract<
+  import("../shared/messages").ExtensionRequest,
+  { type: typeof MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR }
+>["payload"];
+
+async function setContentActivityMonitoringForTab(
   tabId: number,
-  enabled: boolean,
+  payload: ContentActivityMonitorPayload,
 ): Promise<void> {
   let frames = listRegisteredContentFrames(tabId);
   if (frames.length === 0) {
@@ -830,10 +994,10 @@ async function setDomActivityMonitoringForTab(
   }
   if (frames.length === 0) {
     const frame = getSelectedContentFrame(tabId);
-    if (enabled && !frame.documentId) {
+    if (payload.enabled && !frame.documentId) {
       await injectContentScript(tabId, frame);
     }
-    await sendActivityMonitorRequest(tabId, frame, enabled);
+    await sendActivityMonitorRequest(tabId, frame, payload);
     return;
   }
   const results = await Promise.allSettled(
@@ -841,12 +1005,12 @@ async function setDomActivityMonitoringForTab(
       sendActivityMonitorRequest(
         tabId,
         { frameId: frame.frameId, documentId: frame.documentId },
-        enabled,
+        payload,
       ),
     ),
   );
   if (
-    enabled &&
+    payload.enabled &&
     results.every((result) => result.status === "rejected")
   ) {
     throw new Error(
@@ -858,18 +1022,53 @@ async function setDomActivityMonitoringForTab(
 async function sendActivityMonitorRequest(
   tabId: number,
   frame: ContentFrameAddress,
-  enabled: boolean,
+  payload: ContentActivityMonitorPayload,
 ): Promise<void> {
   const request = {
     id: createMessageId(),
     source: "background",
     type: MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR,
-    payload: { enabled },
+    payload,
   } as RequestOf<typeof MESSAGE_TYPES.CONTENT_SET_ACTIVITY_MONITOR>;
   const response = await sendTabRequest(tabId, request, frame);
   if (!response.ok) {
     throw new Error(response.error.message);
   }
+}
+
+function hasContentActivity(
+  status:
+    | import("../shared/browserActivity").BrowserActivityStatus
+    | undefined,
+): boolean {
+  return Boolean(
+    status?.includeDom ||
+      status?.includeStyle ||
+      status?.includeVisual ||
+      status?.includeStorage,
+  );
+}
+
+async function installMainWorldActivityHooksForTab(
+  tabId: number,
+  options: Parameters<typeof installMainWorldActivityHooks>[0],
+): Promise<void> {
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    world: "MAIN",
+    func: installMainWorldActivityHooks,
+    args: [options],
+  });
+}
+
+async function uninstallMainWorldActivityHooksForTab(
+  tabId: number,
+): Promise<void> {
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    world: "MAIN",
+    func: uninstallMainWorldActivityHooks,
+  });
 }
 
 async function readMultiFramePageSnapshot(
@@ -2128,6 +2327,126 @@ async function forwardContentRequest<T extends ContentRequestType>(
   payload: RequestOf<T>["payload"],
 ): Promise<ResponsePayloadMap[T]> {
   return (await forwardContentRequestWithTarget(type, payload)).payload;
+}
+
+async function startElementPickerForCurrentTarget(): Promise<{
+  started: boolean;
+}> {
+  const response = await forwardContentRequestWithTarget(
+    MESSAGE_TYPES.CONTENT_START_ELEMENT_PICK,
+    {},
+  );
+  if (response.target.tabId === undefined) {
+    throw new Error(
+      "ELEMENT_PICKER_TARGET_UNAVAILABLE: the active picker target has no Tab identity.",
+    );
+  }
+  elementPickerBindingTracker.remember({
+    tabId: response.target.tabId,
+    frameId: response.target.frameId ?? 0,
+    ...(response.target.documentId
+      ? { documentId: response.target.documentId }
+      : {}),
+  });
+  const foregroundTab = await queryForegroundTab();
+  if (foregroundTab?.id !== response.target.tabId) {
+    const staleBinding =
+      foregroundTab?.id === undefined
+        ? elementPickerBindingTracker.take()
+        : elementPickerBindingTracker.takeWhenForegroundChanges(
+            foregroundTab.id,
+          );
+    if (staleBinding) {
+      await cancelElementPickerBinding(
+        staleBinding,
+        "foreground-tab-changed-during-start",
+      );
+    }
+    return { started: false };
+  }
+  return response.payload;
+}
+
+async function cancelTrackedElementPicker(
+  reason: string,
+): Promise<{ cancelled: boolean }> {
+  const binding = elementPickerBindingTracker.take();
+  if (!binding) {
+    try {
+      return await forwardContentRequest(
+        MESSAGE_TYPES.CONTENT_CANCEL_ELEMENT_PICK,
+        {},
+      );
+    } finally {
+      publishElementPickerCancellation(reason);
+    }
+  }
+  return cancelElementPickerBinding(binding, reason);
+}
+
+async function cancelElementPickerBinding(
+  binding: ElementPickerBinding,
+  reason: string,
+): Promise<{ cancelled: boolean }> {
+  const request = {
+    id: createMessageId(),
+    source: "background",
+    type: MESSAGE_TYPES.CONTENT_CANCEL_ELEMENT_PICK,
+    payload: {},
+  } as RequestOf<typeof MESSAGE_TYPES.CONTENT_CANCEL_ELEMENT_PICK>;
+  try {
+    const response = await sendTabRequest(binding.tabId, request, {
+      frameId: binding.frameId,
+      ...(binding.documentId ? { documentId: binding.documentId } : {}),
+    });
+    if (response.ok) {
+      return response.payload;
+    }
+    return { cancelled: true };
+  } finally {
+    publishElementPickerCancellation(reason);
+  }
+}
+
+export async function cancelElementPickerForForegroundTab(
+  nextTabId: number,
+): Promise<void> {
+  const binding =
+    elementPickerBindingTracker.takeWhenForegroundChanges(nextTabId);
+  if (!binding) {
+    return;
+  }
+  await cancelElementPickerBinding(binding, "foreground-tab-changed");
+}
+
+export function invalidateElementPickerDocument(
+  tabId: number,
+  reason: "target-navigation" | "target-tab-closed",
+): void {
+  if (!elementPickerBindingTracker.takeWhenDocumentInvalidates(tabId)) {
+    return;
+  }
+  publishElementPickerCancellation(reason);
+}
+
+export function completeElementPickerFromContent(
+  tabId: number,
+  frameId: number,
+  documentId?: string,
+): void {
+  elementPickerBindingTracker.completeFromContent(
+    tabId,
+    frameId,
+    documentId,
+  );
+}
+
+function publishElementPickerCancellation(reason: string): void {
+  sendRuntimeEvent(
+    makeEvent("background", MESSAGE_TYPES.CONTENT_SELECTION_CANCELLED, {
+      reason,
+    }),
+  );
 }
 
 interface ForwardedContentResponse<T extends ContentRequestType> {

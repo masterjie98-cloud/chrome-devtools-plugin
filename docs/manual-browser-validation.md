@@ -138,7 +138,7 @@ Failure conditions:
 ### 3.3 Verify Network, conversation, and audit pagination
 
 1. Start Network recording, load enough fixture requests for at least two pages,
-   then stop recording. Call `browser_network_list_requests` with `limit: 2`,
+   then stop recording. Call `browser_network_requests` with `limit: 2`,
    follow `nextCursor`, and confirm no request repeats. Start recording and
    produce a new request before reusing that cursor. Expected:
    `STALE_PAGINATION_CURSOR`.
@@ -413,7 +413,7 @@ recording and approve that reversible instrumentation action, then click
    `manual_mutation_cookie=manual-mutation-value` and `browser_cookie_delete`
    for that name. Each mutation must pause for its own confirmation.
 4. Stop Network recording and locate `sensitive-fixture.json` with
-   `browser_network_list_requests`. Request metadata/details as supported.
+   `browser_network_requests`. Request metadata/details as supported.
    Expected: `Authorization` is redacted and the `access_token` query value is
    redacted in returned/audited URLs; neither marker appears in audit rows.
 5. Deny the first `browser_network_get_response_body` request, then repeat and

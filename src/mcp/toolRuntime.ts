@@ -39,6 +39,7 @@ import {
   type SemanticProjectionField,
 } from "../shared/semanticSnapshot";
 import {
+  MAX_CSS_PATCH_CHARS,
   SUPPORTED_COMPUTED_STYLE_PROPERTIES,
   type ComputedStyleProperty,
   type DomQueryInput,
@@ -962,7 +963,7 @@ const consoleMessagesSchema = z.object({
 
 const applyCssPatchSchema = z.object({
   patchId: z.string().min(1).optional(),
-  css: z.string().min(1).max(6000),
+  css: z.string().min(1).max(MAX_CSS_PATCH_CHARS),
 });
 
 const setDomValueSchema = z
@@ -987,13 +988,31 @@ const networkStartSchema = z.object({
   maxEntries: z.number().int().min(10).max(5000).optional(),
 });
 
-const activityStartSchema = z.object({
-  includeDom: z.boolean().optional(),
-  includeNetwork: z.boolean().optional(),
-  includeConsole: z.boolean().optional(),
-  preserveLog: z.boolean().optional(),
-  maxNetworkEntries: z.number().int().min(10).max(2000).optional(),
-});
+const activityStartSchema = z
+  .object({
+    includeDom: z.boolean().optional(),
+    includeNetwork: z.boolean().optional(),
+    includeConsole: z.boolean().optional(),
+    includeStyle: z.boolean().optional(),
+    includeVisual: z.boolean().optional(),
+    includeStorage: z.boolean().optional(),
+    includeRealtime: z.boolean().optional(),
+    includeRealtimePayloads: z.boolean().optional(),
+    includeResponseBodies: z.boolean().optional(),
+    maxResponseBodyBytes: z.number().int().min(1_024).max(120_000).optional(),
+    visualSampleIntervalMs: z.number().int().min(500).max(10_000).optional(),
+    preserveLog: z.boolean().optional(),
+    maxNetworkEntries: z.number().int().min(10).max(2000).optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.includeRealtimePayloads !== true || value.includeRealtime !== false,
+    {
+      path: ["includeRealtimePayloads"],
+      message: "includeRealtimePayloads requires includeRealtime",
+    },
+  );
 
 const networkListSchema = z.object({
   cursor: z
@@ -1479,10 +1498,6 @@ export async function executeMcpToolData(
       return readBrowserStatus(context.sessionId);
     case MCP_TOOL_NAMES.BROWSER_ACTIVITY_START: {
       const stateBeforeStart = getBrowserStateSnapshot(context.sessionId);
-      assertActivityMonitorTargetAvailable(
-        stateBeforeStart.activityStream,
-        stateBeforeStart.activeTab,
-      );
       const previousStreamId = stateBeforeStart.activityStream.streamId;
       const status = await proxyBrowserTool(pluginBridge, {
         id: createMessageId(),
@@ -3680,21 +3695,6 @@ async function waitForActivityStreamRestart(
   }
 }
 
-function assertActivityMonitorTargetAvailable(
-  stream: ReturnType<typeof getBrowserStateSnapshot>["activityStream"],
-  selectedTarget: import("../shared/wsProtocol").ActiveTabSnapshot | undefined,
-): void {
-  if (
-    stream.active &&
-    stream.target?.tabId !== undefined &&
-    selectedTarget?.tabId !== stream.target.tabId
-  ) {
-    throw new Error(
-      `ACTIVITY_MONITOR_CONFLICT: Tab ${stream.target.tabId} already owns the active page monitor. Stop that monitor explicitly before starting one for Tab ${selectedTarget?.tabId ?? "unknown"}; the existing stream was not replaced.`,
-    );
-  }
-}
-
 function assertActivityMonitorTargetMatches(
   stream: ReturnType<typeof getBrowserStateSnapshot>["activityStream"],
   selectedTarget: import("../shared/wsProtocol").ActiveTabSnapshot,
@@ -3744,8 +3744,148 @@ export function parseMcpToolArgs(
     return parsed.data as Record<string, unknown>;
   }
 
-  const detail = parsed.error.issues.map((issue) => issue.message).join("; ");
+  const detail = parsed.error.issues
+    .map((issue) => {
+      const path = formatValidationPath(issue.path);
+      const value = readValidationPath(rawArgs, issue.path);
+      const constraint = serializeArgumentValidationConstraint(
+        issue as unknown as Record<string, unknown>,
+        path,
+        value,
+      );
+      if (
+        issue.code === "too_big" &&
+        "origin" in issue &&
+        issue.origin === "string" &&
+        "maximum" in issue &&
+        typeof issue.maximum === "number" &&
+        typeof value === "string"
+      ) {
+        const recovery =
+          toolName === MCP_TOOL_NAMES.BROWSER_APPLY_CSS_PATCH && path === "css"
+            ? "; split at complete CSS rule or at-rule boundaries and use distinct patchId values"
+            : "";
+        return `${path}: string length ${value.length} exceeds maximum ${issue.maximum} characters${recovery}${constraint}`;
+      }
+      return `${path}: ${issue.message}${constraint}`;
+    })
+    .join("; ");
   throw new Error(`${toolName} arguments invalid: ${detail}`);
+}
+
+function serializeArgumentValidationConstraint(
+  issue: Record<string, unknown>,
+  path: string,
+  value: unknown,
+): string {
+  const code = issue.code;
+  const origin = issue.origin;
+  const maximum = issue.maximum;
+  const minimum = issue.minimum;
+  let constraint: Record<string, unknown> | undefined;
+
+  if (code === "too_big" && typeof maximum === "number") {
+    constraint = {
+      kind:
+        origin === "string"
+          ? "max_string_length"
+          : origin === "array"
+            ? "max_array_length"
+            : "max_number",
+      path,
+      maximum,
+      inclusive: issue.inclusive !== false,
+    };
+  } else if (code === "too_small" && typeof minimum === "number") {
+    constraint = {
+      kind:
+        origin === "string"
+          ? "min_string_length"
+          : origin === "array"
+            ? "min_array_length"
+            : "min_number",
+      path,
+      minimum,
+      inclusive: issue.inclusive !== false,
+    };
+  } else if (
+    code === "invalid_value" &&
+    Array.isArray(issue.values) &&
+    issue.values.length > 0
+  ) {
+    constraint = {
+      kind: "enum_values",
+      path,
+      values: issue.values
+        .slice(0, 20)
+        .filter(
+          (entry): entry is string | number | boolean =>
+            typeof entry === "string" ||
+            typeof entry === "number" ||
+            typeof entry === "boolean",
+        )
+        .map((entry) =>
+          typeof entry === "string" ? entry.slice(0, 100) : entry,
+        ),
+    };
+  } else if (code === "invalid_type" && typeof issue.expected === "string") {
+    constraint = {
+      kind: "required_type",
+      path,
+      expected: issue.expected.slice(0, 80),
+    };
+  } else if (
+    code === "unrecognized_keys" &&
+    Array.isArray(issue.keys)
+  ) {
+    constraint = {
+      kind: "forbidden_keys",
+      path,
+      keys: issue.keys
+        .filter((entry): entry is string => typeof entry === "string")
+        .slice(0, 20)
+        .map((entry) => entry.slice(0, 100)),
+    };
+  }
+
+  if (!constraint) {
+    return "";
+  }
+  if (origin === "array" && Array.isArray(value)) {
+    constraint.actualLength = value.length;
+  } else if (origin === "string" && typeof value === "string") {
+    constraint.actualLength = value.length;
+  } else if (typeof value === "number" && Number.isFinite(value)) {
+    constraint.actual = value;
+  }
+  return ` [argument_constraint=${JSON.stringify(constraint)}]`;
+}
+
+function formatValidationPath(path: readonly PropertyKey[]): string {
+  if (path.length === 0) {
+    return "arguments";
+  }
+  return path.reduce<string>(
+    (result, segment) =>
+      typeof segment === "number"
+        ? `${result}[${segment}]`
+        : result
+          ? `${result}.${String(segment)}`
+          : String(segment),
+    "",
+  );
+}
+
+function readValidationPath(
+  root: unknown,
+  path: readonly PropertyKey[],
+): unknown {
+  return path.reduce<unknown>((value, segment) => {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    return (value as Record<PropertyKey, unknown>)[segment];
+  }, root);
 }
 
 export function readPluginConversationPage(

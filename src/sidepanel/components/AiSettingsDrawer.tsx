@@ -30,10 +30,22 @@ import {
 } from "../../shared/bridgeCredentials";
 import { getInstallationId } from "../../shared/extensionIdentity";
 import {
+  acknowledgeUpdateNotice,
+  fetchUpdateNotice,
+  getRunningExtensionVersion,
+  shouldPromptExtensionReload,
+  type UpdateNotice,
+} from "../../shared/updateNotice";
+import type {
+  LocalServiceStatusResultPayload,
+  LocalUpdateCheckResultPayload,
+} from "../../shared/wsProtocol";
+import {
   getAiProviderOrigin,
   hasAiProviderOriginChanged,
   validateAiProviderUrl,
 } from "../services/aiEndpointPolicy";
+import { mcpBridge } from "../services/mcpBridge";
 
 interface AiSettingsDrawerProps {
   open: boolean;
@@ -84,6 +96,36 @@ export function AiSettingsDrawer({
   const [installationId, setInstallationId] = useState("");
   const [savingBridge, setSavingBridge] = useState(false);
   const [submitError, setSubmitError] = useState<string>();
+  const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
+  const [promptReload, setPromptReload] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [runningUpdate, setRunningUpdate] = useState(false);
+  const [updateCheck, setUpdateCheck] =
+    useState<LocalUpdateCheckResultPayload | null>(null);
+  const [localService, setLocalService] =
+    useState<LocalServiceStatusResultPayload | null>(null);
+  const [localServiceLoading, setLocalServiceLoading] = useState(false);
+  const [localServiceSaving, setLocalServiceSaving] = useState(false);
+  const runningVersion = getRunningExtensionVersion();
+  const daemonConnected = bridgeConnected || mcpBridge.isConnected();
+
+  const refreshLocalServiceStatus = async () => {
+    if (!mcpBridge.isConnected()) {
+      setLocalService(null);
+      return null;
+    }
+    setLocalServiceLoading(true);
+    try {
+      const status = await mcpBridge.getLocalServiceStatus();
+      setLocalService(status);
+      return status;
+    } catch {
+      setLocalService(null);
+      return null;
+    } finally {
+      setLocalServiceLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (open) {
@@ -91,8 +133,77 @@ export function AiSettingsDrawer({
       setLocalState(profilesState);
       void getBridgeToken().then(setBridgeToken);
       void getInstallationId().then(setInstallationId);
+      void (async () => {
+        const notice = await fetchUpdateNotice();
+        setUpdateNotice(notice);
+        setPromptReload(await shouldPromptExtensionReload(notice));
+      })();
+      void refreshLocalServiceStatus();
     }
-  }, [open, profilesState]);
+  }, [open, profilesState, daemonConnected]);
+
+  const refreshDiskNotice = async () => {
+    const notice = await fetchUpdateNotice();
+    setUpdateNotice(notice);
+    setPromptReload(await shouldPromptExtensionReload(notice));
+    return notice;
+  };
+
+  const checkForUpdates = async () => {
+    setCheckingUpdate(true);
+    try {
+      await refreshDiskNotice();
+      if (!daemonConnected) {
+        message.info(
+          "Daemon 未连接：请先启动已安装的 Daemon；尚未安装的用户需先手动下载 Release ZIP。",
+        );
+        return;
+      }
+      const result = await mcpBridge.checkLocalUpdate();
+      setUpdateCheck(result);
+      if (!result.ok) {
+        message.error(result.error || "检查更新失败。");
+        return;
+      }
+      if (result.updateAvailable) {
+        if (result.autoUpdateSupported === false) {
+          message.error(result.message || "发现新版本，但 Release 缺少安全更新资产。");
+        } else {
+          message.warning(result.message || "发现可用更新。");
+        }
+      } else {
+        message.success(result.message || "已是最新。");
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "检查更新失败。");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const runDaemonUpdate = async () => {
+    if (!daemonConnected) {
+      message.warning("请先启动并连接 daemon；尚未安装时请先下载 Release ZIP。");
+      return;
+    }
+    setRunningUpdate(true);
+    try {
+      const result = await mcpBridge.runLocalUpdate();
+      if (!result.ok) {
+        message.error(result.error || "Daemon 更新失败。");
+        return;
+      }
+      await refreshDiskNotice();
+      setPromptReload(true);
+      message.success(
+        `更新完成 ${result.currentVersion ?? ""} → ${result.newVersion ?? ""}。请重载扩展；daemon 即将重启。`,
+      );
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "Daemon 更新失败。");
+    } finally {
+      setRunningUpdate(false);
+    }
+  };
 
   const activeProfile = localState.profiles.find(
     (p) => p.id === localState.activeProfileId,
@@ -219,7 +330,7 @@ export function AiSettingsDrawer({
   return (
     <Drawer
       title="AI 配置"
-      width={440}
+      width={480}
       open={open}
       onClose={onClose}
       destroyOnClose
@@ -271,6 +382,151 @@ export function AiSettingsDrawer({
           连接
         </Typography.Text>
 
+        <div className="settings-connection-status" style={{ marginBottom: 12 }}>
+          <div className="settings-connection-status__header">
+            <div>
+              <Typography.Text strong>本地版本与更新</Typography.Text>
+              <Typography.Paragraph type="secondary">
+                已连接的 daemon 会按安装模式更新：开发目录使用 git，Release ZIP 安装会下载、校验、覆盖并重启。
+              </Typography.Paragraph>
+            </div>
+            <Tag color={daemonConnected ? "green" : "default"}>
+              {daemonConnected ? "Daemon 已连接" : "Daemon 未连接"}
+            </Tag>
+          </div>
+          <div className="settings-connection-status__grid">
+            <span>扩展版本</span>
+            <Typography.Text code>v{runningVersion}</Typography.Text>
+            <span>磁盘版本</span>
+            <Typography.Text code>
+              {updateNotice?.version ? `v${updateNotice.version}` : "—"}
+            </Typography.Text>
+          </div>
+          {!daemonConnected ? (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginTop: 12 }}
+              message="仅扩展模式不能自动更新"
+              description={
+                <Space direction="vertical" size={4}>
+                  <Typography.Text>
+                    已安装用户请先启动 daemon；尚未安装的用户请手动下载最新 Release ZIP。
+                  </Typography.Text>
+                  <Typography.Text code copyable={{ text: "npm run update:local" }}>
+                    npm run update:local
+                  </Typography.Text>
+                  <Typography.Text type="secondary">
+                    上述命令仅用于 git clone 的开发目录。ZIP 安装不需要 git 或重新构建。
+                  </Typography.Text>
+                </Space>
+              }
+            />
+          ) : null}
+          {daemonConnected && updateCheck?.updateAvailable ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 12 }}
+              message="发现可用更新"
+              description={updateCheck.message}
+            />
+          ) : null}
+          {promptReload && updateNotice ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 12 }}
+              message="代码已更新，请重载扩展"
+              description={`磁盘 ${updateNotice.version} 已就绪。点「重载扩展」或到 chrome://extensions 重新加载。`}
+            />
+          ) : null}
+          <Space direction="vertical" style={{ width: "100%", marginTop: 12 }} size={8}>
+            <Button block loading={checkingUpdate} onClick={() => void checkForUpdates()}>
+              {daemonConnected ? "检查更新" : "查看更新说明 / 检查重载"}
+            </Button>
+            <Button
+              block
+              type="primary"
+              disabled={
+                !daemonConnected ||
+                (updateCheck?.updateAvailable === true &&
+                  updateCheck.autoUpdateSupported === false)
+              }
+              loading={runningUpdate}
+              onClick={() => void runDaemonUpdate()}
+            >
+              由 Daemon 执行更新
+            </Button>
+            <Button
+              block
+              disabled={!promptReload || !updateNotice}
+              onClick={() => {
+                if (!updateNotice) {
+                  return;
+                }
+                void (async () => {
+                  await acknowledgeUpdateNotice(updateNotice);
+                  chrome.runtime.reload();
+                })();
+              }}
+            >
+              重载扩展
+            </Button>
+          </Space>
+          {daemonConnected && localService?.ok && localService.supported ? (
+            <div style={{ marginTop: 16 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 12,
+                }}
+              >
+                <div>
+                  <Typography.Text strong>macOS 开机自启（LaunchAgent）</Typography.Text>
+                  <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                    {localService.message ||
+                      "由 daemon 注册/取消 LaunchAgent；仅 macOS 显示。"}
+                  </Typography.Paragraph>
+                </div>
+                <Switch
+                  checked={Boolean(localService.registered)}
+                  loading={localServiceLoading || localServiceSaving}
+                  onChange={(enabled) => {
+                    void (async () => {
+                      setLocalServiceSaving(true);
+                      try {
+                        const result =
+                          await mcpBridge.setLocalServiceAutostart(enabled);
+                        if (!result.ok) {
+                          message.error(result.error || "修改开机自启失败。");
+                          await refreshLocalServiceStatus();
+                          return;
+                        }
+                        message.success(
+                          result.message ||
+                            (enabled ? "已开启开机自启" : "已关闭开机自启"),
+                        );
+                        await refreshLocalServiceStatus();
+                      } catch (error) {
+                        message.error(
+                          error instanceof Error
+                            ? error.message
+                            : "修改开机自启失败。",
+                        );
+                      } finally {
+                        setLocalServiceSaving(false);
+                      }
+                    })();
+                  }}
+                />
+              </div>
+            </div>
+          ) : null}
+        </div>
+
         <div className="settings-connection-status">
           <div className="settings-connection-status__header">
             <div>
@@ -279,7 +535,7 @@ export function AiSettingsDrawer({
                 这里只确认扩展与本地 daemon；Codex/Claude/Cursor 是否已注册需在对应客户端检查。
               </Typography.Paragraph>
             </div>
-            <Tag color={bridgeConnected ? "success" : "default"}>
+            <Tag color={bridgeConnected ? "green" : "default"}>
               {bridgeConnected ? "Bridge 已连接" : "Bridge 未连接"}
             </Tag>
           </div>
@@ -293,9 +549,18 @@ export function AiSettingsDrawer({
               {pageContextSynced ? "已同步" : "等待首次观察"}
             </Typography.Text>
             <span>MCP 客户端</span>
-            <Typography.Text>
-              在项目目录运行 <Typography.Text code copyable={{ text: "npm run client:config" }}>npm run client:config</Typography.Text>
-            </Typography.Text>
+            <div className="settings-connection-status__command">
+              <Typography.Text type="secondary">
+                在项目目录运行（或先双击 setup-local 脚手架生成配置）：
+              </Typography.Text>
+              <Typography.Text
+                code
+                copyable={{ text: "npm run client:config" }}
+                className="settings-command-code"
+              >
+                npm run client:config
+              </Typography.Text>
+            </div>
           </div>
         </div>
 
@@ -385,6 +650,14 @@ export function AiSettingsDrawer({
 
           <Form.Item label="Max output" name="maxOutputTokens">
             <InputNumber min={128} max={65536} step={256} placeholder="auto" />
+          </Form.Item>
+
+          <Form.Item
+            label="Context window"
+            name="contextWindowTokens"
+            tooltip="当前 Provider/模型支持的总上下文 Token 数。插件会预留输出空间，并在请求前压缩旧历史和旧工具结果，避免上下文溢出。"
+          >
+            <InputNumber min={8192} max={2000000} step={8192} />
           </Form.Item>
 
           <Form.Item
@@ -648,6 +921,8 @@ function syncFormToState(
     model: (values.model ?? "").trim(),
     temperature: values.temperature ?? DEFAULT_AI_CONFIG.temperature,
     maxHistory: values.maxHistory ?? DEFAULT_AI_CONFIG.maxHistory,
+    contextWindowTokens:
+      values.contextWindowTokens ?? DEFAULT_AI_CONFIG.contextWindowTokens,
     maxOutputTokens: values.maxOutputTokens || undefined,
     supportsVision: values.supportsVision ?? activeConfig.supportsVision,
     supportsWebSearch:

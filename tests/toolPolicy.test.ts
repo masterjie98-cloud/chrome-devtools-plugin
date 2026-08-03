@@ -173,4 +173,14 @@ test("dynamic approval modes distinguish cleanup, task grants, and decision barr
       .approvalMode,
     "decision_barrier",
   );
+  assert.equal(
+    getToolPolicy(MCP_TOOL_NAMES.BROWSER_ACTIVITY_START).approvalMode,
+    "task_grant",
+  );
+  const bodyCapture = getToolPolicy(MCP_TOOL_NAMES.BROWSER_ACTIVITY_START, {
+    includeResponseBodies: true,
+  });
+  assert.equal(bodyCapture.approvalMode, "decision_barrier");
+  assert.equal(bodyCapture.dataSensitivity, "raw_body");
+  assert.equal(bodyCapture.sensitive, true);
 });

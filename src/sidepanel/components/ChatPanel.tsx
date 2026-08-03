@@ -50,17 +50,13 @@ import {
 } from "../../shared/collaborationTasks";
 import type { ActiveTabSnapshot } from "../../shared/wsProtocol";
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
-import {
-  formatAgentRunBudgetAmount,
-  type AgentRunBudgetExtensionDecision,
-  type AgentRunBudgetExtensionRequest,
-} from "../../shared/agentRunBudget";
 import type {
   ExecutionApprovalMode,
   ToolApprovalDecision,
 } from "../agentRunApprovals";
 import { getChatShortcutState } from "../chatShortcutState";
 import { getAssistantDisplayContent } from "../services/assistantContent";
+import { findActivityMonitorAnchorMessageId } from "../services/activityMonitorAnchor";
 import type { BackgroundConversationWork } from "../services/backgroundConversationWork";
 import type {
   ChatImageAttachment,
@@ -71,6 +67,7 @@ import type {
   PendingToolApproval,
   QueuedChatSubmission,
 } from "../types";
+import { LocalUpdateAlert, useLocalUpdateStatus } from "./LocalUpdateBanner";
 import { MarkdownContent } from "./MarkdownContent";
 
 interface ChatPanelProps {
@@ -89,11 +86,10 @@ interface ChatPanelProps {
   contextLabel: string;
   streamingMessageId?: string;
   pendingToolApprovals: PendingToolApproval[];
-  pendingBudgetExtension?: AgentRunBudgetExtensionRequest | null;
   executionApprovalMode: ExecutionApprovalMode;
   executionApprovalScopeLabel?: string;
   activeExecutionBinding?: ExecutionTaskBinding;
-  backgroundConversationWork?: BackgroundConversationWork;
+  backgroundConversationWork: BackgroundConversationWork[];
   selectedToolTarget?: ActiveTabSnapshot;
   foregroundTab?: BrowserTargetTab;
   activityMonitor?: {
@@ -143,9 +139,6 @@ interface ChatPanelProps {
     approvalId: string,
     decision: ToolApprovalDecision,
   ) => void;
-  onResolveBudgetExtension: (
-    decision: AgentRunBudgetExtensionDecision,
-  ) => void;
   onChangeExecutionApprovalMode: (mode: ExecutionApprovalMode) => void;
   onFocusExecutionTarget: (tabId: number) => void;
   onRestartActivityMonitor: () => void;
@@ -175,7 +168,6 @@ export function ChatPanel({
   contextLabel,
   streamingMessageId,
   pendingToolApprovals,
-  pendingBudgetExtension,
   executionApprovalMode,
   executionApprovalScopeLabel,
   activeExecutionBinding,
@@ -207,7 +199,6 @@ export function ChatPanel({
   onForkMessage,
   onDraftChange,
   onResolveToolApproval,
-  onResolveBudgetExtension,
   onChangeExecutionApprovalMode,
   onFocusExecutionTarget,
   onRestartActivityMonitor,
@@ -227,9 +218,18 @@ export function ChatPanel({
   const [composerFocused, setComposerFocused] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string>();
   const [historyOpen, setHistoryOpen] = useState(false);
+  const activityMonitorAnchorMessageId = useMemo(
+    () =>
+      activityMonitor
+        ? findActivityMonitorAnchorMessageId(messages, activityMonitor.cursor)
+        : undefined,
+    [activityMonitor, messages],
+  );
   const [historyQuery, setHistoryQuery] = useState("");
   const [delegatedInboxOpen, setDelegatedInboxOpen] = useState(false);
   const [backgroundWorkOpen, setBackgroundWorkOpen] = useState(false);
+  const localUpdateStatus = useLocalUpdateStatus();
+  const { runningVersion, daemonConnected, updateAvailable } = localUpdateStatus;
   const [activeApprovalId, setActiveApprovalId] = useState<string>();
   const [editingMessageId, setEditingMessageId] = useState<string>();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -273,7 +273,7 @@ export function ChatPanel({
   }, [delegatedInboxTasks.length]);
 
   useEffect(() => {
-    if (!backgroundConversationWork) {
+    if (backgroundConversationWork.length === 0) {
       setBackgroundWorkOpen(false);
     }
   }, [backgroundConversationWork]);
@@ -577,17 +577,6 @@ export function ChatPanel({
             )}
           </div>
         ) : null}
-        {activityMonitor ? (
-          <ActivityMonitorBar
-            cursor={activityMonitor.cursor}
-            target={activityMonitor.target}
-            health={activityMonitor.health}
-            latestSequence={activityMonitor.latestSequence}
-            action={activityMonitor.action}
-            onRestart={onRestartActivityMonitor}
-            onStop={onStopActivityMonitor}
-          />
-        ) : null}
       </div>
     );
   };
@@ -603,20 +592,29 @@ export function ChatPanel({
               ? "AI 已就绪"
               : "需要配置 AI"}
         </Tag>
+        <Tag color={daemonConnected || hubConnected ? "green" : "default"}>
+          {daemonConnected || hubConnected ? "Daemon 已连接" : "Daemon 未连接"}
+        </Tag>
         <Tag className="context-status-tag">{contextLabel}</Tag>
-        {!hubConnected ? <Tag>Hub 离线</Tag> : null}
+        <Tag>v{runningVersion}</Tag>
+        {updateAvailable ? <Tag color="warning">有更新</Tag> : null}
         <div className="chat-status-actions">
-          {backgroundConversationWork ? (
+          {backgroundConversationWork.length > 0 ? (
             <Tooltip
               title={
-                backgroundConversationWork.pendingApprovalCount
-                  ? `其他对话有 ${backgroundConversationWork.pendingApprovalCount} 条待审批`
-                  : "其他对话正在后台执行"
+                backgroundConversationWork.reduce(
+                  (total, work) => total + work.pendingApprovalCount,
+                  0,
+                )
+                  ? `其他对话有 ${backgroundConversationWork.reduce((total, work) => total + work.pendingApprovalCount, 0)} 条待审批`
+                  : `${backgroundConversationWork.length} 个其他对话正在后台执行`
               }
             >
               <Button
                 className={`background-work-trigger ${
-                  backgroundConversationWork.pendingApprovalCount
+                  backgroundConversationWork.some(
+                    (work) => work.pendingApprovalCount > 0,
+                  )
                     ? "is-attention"
                     : ""
                 }`}
@@ -625,12 +623,17 @@ export function ChatPanel({
                 icon={<ClockCircleOutlined />}
                 onClick={() => setBackgroundWorkOpen(true)}
                 aria-label={
-                  backgroundConversationWork.pendingApprovalCount
-                    ? `打开后台任务，${backgroundConversationWork.pendingApprovalCount} 条待审批`
+                  backgroundConversationWork.some(
+                    (work) => work.pendingApprovalCount > 0,
+                  )
+                    ? `打开后台任务，${backgroundConversationWork.reduce((total, work) => total + work.pendingApprovalCount, 0)} 条待审批`
                     : "打开后台任务，1 个对话正在执行"
                 }
               >
-                {backgroundConversationWork.pendingApprovalCount || 1}
+                {backgroundConversationWork.reduce(
+                  (total, work) => total + work.pendingApprovalCount,
+                  0,
+                ) || backgroundConversationWork.length}
               </Button>
             </Tooltip>
           ) : null}
@@ -679,6 +682,7 @@ export function ChatPanel({
           </Tooltip>
         </div>
         </div>
+        <LocalUpdateAlert status={localUpdateStatus} />
         {activeExecutionBinding ? (
           <ExecutionTargetBar
             target={activeExecutionBinding.target}
@@ -793,6 +797,18 @@ export function ChatPanel({
                   {message.attachments?.length
                     ? renderImageAttachments(message.attachments)
                     : null}
+                  {activityMonitor &&
+                  message.id === activityMonitorAnchorMessageId ? (
+                    <ActivityMonitorBar
+                      cursor={activityMonitor.cursor}
+                      target={activityMonitor.target}
+                      health={activityMonitor.health}
+                      latestSequence={activityMonitor.latestSequence}
+                      action={activityMonitor.action}
+                      onRestart={onRestartActivityMonitor}
+                      onStop={onStopActivityMonitor}
+                    />
+                  ) : null}
                 </>
               )}
             </article>
@@ -860,12 +876,6 @@ export function ChatPanel({
       </div>
 
       <div className="chat-bottom-stack">
-        {pendingBudgetExtension ? (
-          <AgentBudgetExtensionCard
-            request={pendingBudgetExtension}
-            onResolve={onResolveBudgetExtension}
-          />
-        ) : null}
         {activeApproval ? (
           <div className="tool-approval-stack">
             {pendingToolApprovals.length > 1 ? (
@@ -1154,7 +1164,7 @@ export function ChatPanel({
         open={backgroundWorkOpen}
         onClose={() => setBackgroundWorkOpen(false)}
       >
-        {backgroundConversationWork ? (
+        {backgroundConversationWork.length > 0 ? (
           <>
             <Typography.Paragraph
               type="secondary"
@@ -1162,46 +1172,48 @@ export function ChatPanel({
             >
               其他聊天上下文可以继续运行，但执行状态和审批不会混入当前对话。
             </Typography.Paragraph>
+            {backgroundConversationWork.map((work) => (
             <section
+              key={work.conversationId}
               className="background-work-card"
-              aria-label={`后台任务：${backgroundConversationWork.conversationTitle}`}
+              aria-label={`后台任务：${work.conversationTitle}`}
             >
               <div className="background-work-card-header">
                 <div className="background-work-card-heading">
                   <span className="background-work-card-label">
                     其他聊天上下文
                   </span>
-                  <strong title={backgroundConversationWork.conversationTitle}>
-                    {backgroundConversationWork.conversationTitle}
+                  <strong title={work.conversationTitle}>
+                    {work.conversationTitle}
                   </strong>
                 </div>
                 <Tag
                   color={
-                    backgroundConversationWork.pendingApprovalCount
+                    work.pendingApprovalCount
                       ? "orange"
                       : "processing"
                   }
                 >
-                  {backgroundConversationWork.pendingApprovalCount
-                    ? `待审批 ${backgroundConversationWork.pendingApprovalCount}`
+                  {work.pendingApprovalCount
+                    ? `待审批 ${work.pendingApprovalCount}`
                     : "执行中"}
                 </Tag>
               </div>
               <div className="background-work-card-body">
                 <span>
                   目标 Tab：{" "}
-                  {backgroundConversationWork.target.title?.trim() ||
+                  {work.target.title?.trim() ||
                     formatTaskTargetHost(
-                      backgroundConversationWork.target.url,
+                      work.target.url,
                     ) ||
-                    backgroundConversationWork.target.tabId}
+                    work.target.tabId}
                 </span>
-                {backgroundConversationWork.queuedCount ? (
+                {work.queuedCount ? (
                   <span>
-                    同一对话还有 {backgroundConversationWork.queuedCount} 条待发送
+                    同一对话还有 {work.queuedCount} 条待发送
                   </span>
                 ) : null}
-                {backgroundConversationWork.pendingApprovalCount ? (
+                {work.pendingApprovalCount ? (
                   <div className="background-work-attention">
                     任务正在原对话等待你的决定，未批准的操作不会执行。
                   </div>
@@ -1211,7 +1223,7 @@ export function ChatPanel({
                 <Popconfirm
                   title="停止并删除这个后台对话？"
                   description={
-                    backgroundConversationWork.recoverableDelegatedTask
+                    work.recoverableDelegatedTask
                       ? "本地 Agent 会停止；未结束的 MCP 任务将移入 Codex 收件箱等待恢复。"
                       : "本地 Agent 会停止，当前对话和排队消息会从本地删除。"
                   }
@@ -1221,7 +1233,7 @@ export function ChatPanel({
                   onConfirm={() => {
                     if (
                       onDeleteConversation(
-                        backgroundConversationWork.conversationId,
+                        work.conversationId,
                       )
                     ) {
                       setBackgroundWorkOpen(false);
@@ -1235,7 +1247,7 @@ export function ChatPanel({
                   onClick={() => {
                     if (
                       onOpenConversation(
-                        backgroundConversationWork.conversationId,
+                        work.conversationId,
                       )
                     ) {
                       setBackgroundWorkOpen(false);
@@ -1246,6 +1258,7 @@ export function ChatPanel({
                 </Button>
               </div>
             </section>
+            ))}
           </>
         ) : (
           <Empty
@@ -1485,66 +1498,6 @@ function getRetrySourceAttachmentCount(
     }
   }
   return 0;
-}
-
-function AgentBudgetExtensionCard({
-  request,
-  onResolve,
-}: {
-  request: AgentRunBudgetExtensionRequest;
-  onResolve: (decision: AgentRunBudgetExtensionDecision) => void;
-}) {
-  const titleId = `agent-budget-title-${request.kind}`;
-  const descriptionId = `agent-budget-description-${request.kind}`;
-  const cardRef = useRef<HTMLElement>(null);
-
-  useEffect(() => {
-    cardRef.current?.focus({ preventScroll: true });
-  }, [request.kind, request.limit]);
-
-  return (
-    <section
-      ref={cardRef}
-      className="agent-budget-extension-card"
-      role="alertdialog"
-      aria-live="assertive"
-      aria-labelledby={titleId}
-      aria-describedby={descriptionId}
-      tabIndex={-1}
-    >
-      <div className="agent-budget-extension-heading">
-        <div className="tool-approval-title">
-          <ClockCircleOutlined />
-          <span id={titleId}>任务需要更多执行额度</span>
-        </div>
-        <Tag color="blue">{request.label}</Tag>
-      </div>
-      <div className="agent-budget-extension-body">
-        <Typography.Paragraph
-          id={descriptionId}
-          className="agent-budget-extension-copy"
-        >
-          当前任务和工具结果均已保留。你可以增加
-          {formatAgentRunBudgetAmount(request.kind, request.increment)} 后从当前步骤继续，
-          或停止调用工具并基于已有结果总结。
-        </Typography.Paragraph>
-        <div className="agent-budget-extension-meter" role="note">
-          已用 {formatAgentRunBudgetAmount(request.kind, request.used)} · 当前上限{" "}
-          {formatAgentRunBudgetAmount(request.kind, request.limit)} · 继续后上限{" "}
-          {formatAgentRunBudgetAmount(request.kind, request.nextLimit)}
-        </div>
-        <Typography.Text type="secondary">
-          该确认不会自动消失；具体页面写操作仍按原权限规则审批。
-        </Typography.Text>
-        <div className="agent-budget-extension-actions">
-          <Button onClick={() => onResolve("summarize")}>停止并总结</Button>
-          <Button type="primary" onClick={() => onResolve("continue")}>
-            增加额度并继续
-          </Button>
-        </div>
-      </div>
-    </section>
-  );
 }
 
 function ToolApprovalCard({
@@ -1804,6 +1757,8 @@ function ActivityMonitorBar({
         : health === "restarted"
           ? "监听流已变化，需要重启"
           : "页面监听已停止";
+  const restartLabel =
+    health === "stopped" ? "重新开始页面变化监听" : "重启页面变化监听";
 
   return (
     <section
@@ -1818,7 +1773,13 @@ function ActivityMonitorBar({
         </span>
       </span>
       <div className="activity-monitor-actions">
-        <Tooltip title="在当前绑定 Tab 上重新建立一条干净监听流">
+        <Tooltip
+          title={
+            health === "stopped"
+              ? "在当前绑定 Tab 上重新开始监听"
+              : "在当前绑定 Tab 上重新建立一条干净监听流"
+          }
+        >
           <Button
             size="small"
             type="text"
@@ -1826,20 +1787,22 @@ function ActivityMonitorBar({
             loading={action === "restart"}
             disabled={Boolean(action)}
             onClick={onRestart}
-            aria-label="重启页面变化监听"
+            aria-label={restartLabel}
           />
         </Tooltip>
-        <Tooltip title="停止这条页面变化监听">
-          <Button
-            size="small"
-            type="text"
-            icon={<StopOutlined />}
-            loading={action === "stop"}
-            disabled={Boolean(action)}
-            onClick={onStop}
-            aria-label="停止页面变化监听"
-          />
-        </Tooltip>
+        {health === "active" ? (
+          <Tooltip title="停止这条页面变化监听">
+            <Button
+              size="small"
+              type="text"
+              icon={<StopOutlined />}
+              loading={action === "stop"}
+              disabled={Boolean(action)}
+              onClick={onStop}
+              aria-label="停止页面变化监听"
+            />
+          </Tooltip>
+        ) : null}
       </div>
     </section>
   );

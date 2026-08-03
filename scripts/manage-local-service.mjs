@@ -18,18 +18,26 @@ const plistPath = resolve(
   `${label}.plist`,
 );
 const serverPath = resolve(serverPathValue || "dist/daemon/server.js");
-const logDir = resolve(
-  homedir(),
-  "Library",
-  "Logs",
-  "ai-devtools-assistant",
-);
+const logDir =
+  process.platform === "win32"
+    ? resolve(
+        process.env.LOCALAPPDATA?.trim() || homedir(),
+        "AI DevTools Assistant",
+        "logs",
+      )
+    : resolve(
+        homedir(),
+        "Library",
+        "Logs",
+        "ai-devtools-assistant",
+      );
 const stdoutPath = resolve(logDir, "daemon.log");
 const stderrPath = resolve(logDir, "daemon.error.log");
+const windowsStartupPath = resolveWindowsStartupPath();
 
-if (process.platform !== "darwin") {
+if (process.platform !== "darwin" && process.platform !== "win32") {
   process.stderr.write(
-    "Local service installation currently supports macOS launchd only. Use npm run daemon:start on this platform.\n",
+    "Local service installation supports macOS launchd and Windows Startup only.\n",
   );
   process.exitCode = 1;
 } else if (!["print", "install", "uninstall"].includes(action)) {
@@ -40,6 +48,10 @@ if (process.platform !== "darwin") {
 }
 
 async function main() {
+  if (process.platform === "win32") {
+    await manageWindowsStartup();
+    return;
+  }
   const plist = renderPlist({
     label,
     nodePath: process.execPath,
@@ -91,6 +103,77 @@ async function main() {
     if (error?.code !== "ENOENT") throw error;
   });
   process.stdout.write(`Uninstalled ${label} and removed ${plistPath}.\n`);
+}
+
+async function manageWindowsStartup() {
+  if (!windowsStartupPath) {
+    throw new Error("APPDATA is unavailable; cannot resolve the Windows Startup folder.");
+  }
+  const launcher = renderWindowsLauncher({
+    nodePath: process.execPath,
+    serverPath,
+    stdoutPath,
+    stderrPath,
+  });
+  if (action === "print" || dryRun) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          action,
+          dryRun,
+          startupPath: windowsStartupPath,
+          serverPath,
+          label,
+        },
+        null,
+        2,
+      )}\n${launcher}`,
+    );
+    return;
+  }
+  if (action === "install") {
+    await access(serverPath).catch(() => {
+      throw new Error(`Missing ${serverPath}. Build or reinstall the daemon first.`);
+    });
+    await mkdir(dirname(windowsStartupPath), { recursive: true });
+    await mkdir(logDir, { recursive: true });
+    await writeFile(windowsStartupPath, launcher, "utf8");
+    process.stdout.write(`Installed Windows Startup launcher at ${windowsStartupPath}.\n`);
+    return;
+  }
+  await unlink(windowsStartupPath).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+  process.stdout.write(`Removed Windows Startup launcher ${windowsStartupPath}.\n`);
+}
+
+function resolveWindowsStartupPath() {
+  if (process.platform !== "win32") {
+    return null;
+  }
+  const appData = process.env.APPDATA?.trim();
+  if (!appData) {
+    return null;
+  }
+  return resolve(
+    appData,
+    "Microsoft",
+    "Windows",
+    "Start Menu",
+    "Programs",
+    "Startup",
+    "AI DevTools Assistant Daemon.cmd",
+  );
+}
+
+function renderWindowsLauncher({ nodePath, serverPath, stdoutPath, stderrPath }) {
+  const quote = (value) => `"${String(value).replaceAll('"', '""')}"`;
+  return [
+    "@echo off",
+    `start \"\" /b ${quote(nodePath)} ${quote(serverPath)} 1>>${quote(stdoutPath)} 2>>${quote(stderrPath)}`,
+    "exit /b 0",
+    "",
+  ].join("\r\n");
 }
 
 function runLaunchctl(args, ignoreFailure = false) {

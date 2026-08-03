@@ -13,6 +13,7 @@ import {
   AGENT_TASK_PHASES,
   AGENT_TASK_STATE_VERSION,
 } from "../shared/agentTaskState";
+import { BROWSER_ACTIVITY_KINDS } from "../shared/browserActivity";
 
 const rectSchema = z.object({
   x: z.number(),
@@ -269,12 +270,17 @@ const agentTaskStateSchema = z
 
 const agentSessionSchema = z.object({
   id: z.string().min(1),
+  assistantMessageId: z.string().min(1).max(200).optional(),
   status: z.enum(["running", "completed", "blocked", "failed", "cancelled"]),
   input: z.string(),
   startedAt: z.string(),
   updatedAt: z.string(),
   completedAt: z.string().optional(),
   finalContent: z.string().optional(),
+  visibleContent: z.string().max(12_000).optional(),
+  executionOwner: z
+    .enum(["sidepanel", "extension_background", "daemon"])
+    .optional(),
   executionBinding: z
     .object({
       taskId: z.string().min(1).max(200),
@@ -351,6 +357,127 @@ const collaborationWorkspaceSchema = z
     version: z.literal(COLLABORATION_WORKSPACE_VERSION),
     revision: z.number().int().nonnegative(),
     items: z.array(collaborationItemSchema).max(MAX_COLLABORATION_ITEMS),
+  })
+  .strict();
+
+const daemonAgentAttachmentSchema = z
+  .object({
+    id: z.string().min(1).max(200),
+    name: z.string().min(1).max(500),
+    mimeType: z.string().min(1).max(100),
+    dataUrl: z.string().max(7 * 1024 * 1024),
+    createdAt: z.string().max(64),
+    source: z.enum(["upload", "screenshot"]),
+    visualPurpose: z.literal("fast_checkpoint").optional(),
+    savedAs: z.string().max(1_000).optional(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const daemonAgentConfigSchema = z
+  .object({
+    apiUrl: z.string().min(1).max(2_000),
+    apiKey: z.string().max(16_384),
+    model: z.string().min(1).max(300),
+    temperature: z.number().min(0).max(2),
+    maxHistory: z.number().int().min(0).max(200),
+    contextWindowTokens: z.number().int().min(4_096).max(10_000_000),
+    maxOutputTokens: z.number().int().min(1).max(1_000_000).optional(),
+    supportsVision: z.boolean(),
+    includeImageHistory: z.boolean(),
+    fastAgentMode: z.boolean(),
+    autoReadPage: z.boolean(),
+    enableTools: z.boolean(),
+    allowPseudoToolCalls: z.boolean(),
+    maxToolRounds: z.number().int().min(0).max(200),
+    autoContinueAfterToolRoundLimit: z.boolean(),
+    includePageContext: z.boolean(),
+    includeDomSummary: z.boolean(),
+    includeSelectedElement: z.boolean(),
+    visibleTextLimit: z.number().int().min(0).max(100_000),
+    domSummaryLimit: z.number().int().min(0).max(500_000),
+    supportsWebSearch: z.boolean(),
+    enableWebSearch: z.boolean(),
+    capabilityDetection: z
+      .object({
+        checkedAt: z.string().max(64).optional(),
+        visionError: z.string().max(2_000).optional(),
+        webSearchError: z.string().max(2_000).optional(),
+      })
+      .strict(),
+  })
+  .strict();
+
+const daemonAgentStartSchema = z
+  .object({
+    runId: z.string().min(1).max(200),
+    conversationId: z.string().min(1).max(200),
+    assistantMessageId: z.string().min(1).max(200),
+    config: daemonAgentConfigSchema,
+    messages: z
+      .array(
+        z
+          .object({
+            id: z.string().min(1).max(200),
+            role: z.enum(["user", "assistant", "tool"]),
+            content: z.string().max(500_000),
+            createdAt: z.string().max(64),
+            source: z.enum(["user", "extension_ai", "mcp_ai", "system"]).optional(),
+            delegatedTaskId: z.string().max(200).optional(),
+            toolName: z.string().max(200).optional(),
+            status: z.string().max(500).optional(),
+            attachments: z.array(daemonAgentAttachmentSchema).max(8).optional(),
+          })
+          .strict(),
+      )
+      .max(200),
+    input: z.string().min(1).max(500_000),
+    attachments: z.array(daemonAgentAttachmentSchema).max(8),
+    context: z
+      .object({
+        pageSnapshot: pageContextSchema.optional(),
+        selectedElement: selectedElementSchema.optional(),
+        collaborationWorkspace: collaborationWorkspaceSchema.optional(),
+        activityCursor: z
+          .object({
+            streamId: z.string().min(1).max(200),
+            sequence: z.number().int().nonnegative(),
+          })
+          .strict()
+          .optional(),
+        contextReadError: z.string().max(2_000).optional(),
+      })
+      .strict(),
+    tools: z
+      .array(
+        z
+          .object({
+            type: z.enum(["function", "builtin_function"]),
+            function: z
+              .object({
+                name: z.string().min(1).max(200),
+                description: z.string().max(20_000).optional(),
+                parameters: z.unknown(),
+              })
+              .strict(),
+          })
+          .strict(),
+      )
+      .max(200)
+      .optional(),
+    executionBinding: agentSessionSchema.shape.executionBinding,
+    runBudgetLimits: z
+      .object({
+        maxModelRequests: z.number().int().positive().max(1_000).optional(),
+        maxToolCalls: z.number().int().positive().max(2_000).optional(),
+        maxEffectfulToolCalls: z.number().int().positive().max(1_000).optional(),
+        maxSensitiveToolCalls: z.number().int().positive().max(1_000).optional(),
+        maxDurationMs: z.number().int().min(60_000).max(7 * 24 * 60 * 60_000).optional(),
+      })
+      .strict()
+      .optional(),
+    egressDestinations: z.array(z.string().min(1).max(500)).max(10),
   })
   .strict();
 
@@ -452,6 +579,20 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
     }),
   }),
   baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.DAEMON_AGENT_START),
+    payload: daemonAgentStartSchema,
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.DAEMON_AGENT_CANCEL),
+    payload: z
+      .object({
+        runId: z.string().min(1).max(200),
+        conversationId: z.string().min(1).max(200),
+        reason: z.string().max(500).optional(),
+      })
+      .strict(),
+  }),
+  baseMessageSchema.extend({
     command: z.literal(WS_COMMANDS.COLLABORATION_ITEM_UPSERT),
     payload: z
       .object({
@@ -474,7 +615,7 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
       .object({
         event: z
           .object({
-            kind: z.enum(["dom", "network", "console", "navigation"]),
+            kind: z.enum(BROWSER_ACTIVITY_KINDS),
             observedAt: z.string().max(64).optional(),
             target: activeTabSchema.optional(),
             summary: z
@@ -521,6 +662,13 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
                   .max(12)
                   .optional(),
                 domSamplesOmitted: z.number().int().nonnegative().optional(),
+                category: z.string().max(80).optional(),
+                action: z.string().max(80).optional(),
+                area: z.string().max(80).optional(),
+                count: z.number().int().nonnegative().optional(),
+                bytes: z.number().int().nonnegative().optional(),
+                sampled: z.number().int().nonnegative().optional(),
+                payloadPreview: z.string().max(1_000).optional(),
                 transportDroppedEvents: z
                   .number()
                   .int()
@@ -633,6 +781,26 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
         details: z.unknown().optional(),
       }),
     ]),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.LOCAL_UPDATE_CHECK),
+    payload: z.object({}).strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.LOCAL_UPDATE),
+    payload: z.object({}).strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.LOCAL_SERVICE_STATUS),
+    payload: z.object({}).strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.LOCAL_SERVICE_SET),
+    payload: z
+      .object({
+        enabled: z.boolean(),
+      })
+      .strict(),
   }),
 ]);
 

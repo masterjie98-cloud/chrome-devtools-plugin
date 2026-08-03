@@ -1,7 +1,14 @@
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { PageSnapshot, ScreenshotCaptureResult } from "../shared/dom";
 import type { AgentSessionSnapshot } from "../shared/agentSession";
+import type {
+  DaemonAgentEventPayload,
+  DaemonAgentStartPayload,
+} from "../shared/daemonAgent";
 import { createMessageId } from "../shared/messaging";
 import {
   isExposedMcpToolName,
@@ -69,10 +76,24 @@ import {
   ExecutionBrokerError,
   protocolErrorCode,
 } from "../daemon/executionBroker";
+import { executeWithExternalCancellation } from "../daemon/externalCancellation";
 import { ArtifactStore } from "../daemon/artifacts/store";
 import { externalizeLargeJsonResult } from "../daemon/artifacts/externalize";
 import { DaemonStateStore } from "../daemon/store/stateStore";
 import type { RedactedAuditEvent } from "../daemon/store/stateStore";
+import {
+  checkLocalUpdate,
+  resolveProjectRootFromDaemon,
+  runLocalUpdate,
+} from "../daemon/localUpdate";
+import {
+  getLocalServiceStatus,
+  setLocalServiceAutostart,
+} from "../daemon/localService";
+import {
+  DaemonAgentRunner,
+  type DaemonAgentToolRequest,
+} from "../daemon/agentRunner";
 import {
   pluginToMcpMessageSchema,
   type ValidPluginToMcpMessage,
@@ -208,6 +229,11 @@ type ApprovalResolver = (
   payload: ApprovalResponsePayload,
 ) => void;
 
+type DaemonAgentCommandHandler = (
+  socket: WebSocket,
+  message: ValidPluginToMcpMessage,
+) => Promise<boolean>;
+
 interface PendingBrowserToolRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -284,6 +310,7 @@ export function startPluginWebSocketServer(
   const protocolViolations = new Map<WebSocket, ProtocolViolationState>();
   const connectionLastActivity = new Map<WebSocket, number>();
   const executionBroker = new ExecutionBroker();
+  const daemonAgentRunner = new DaemonAgentRunner();
   const artifactStore = options.artifactStore ?? new ArtifactStore();
   const unsubscribePersistence = options.stateStore
     ? browserStateHub.subscribePersistence((state) => {
@@ -421,6 +448,8 @@ export function startPluginWebSocketServer(
         options.stateStore,
         reportProtocolViolation,
         additionalMcpBackend,
+        (agentSocket, agentMessage) =>
+          handleDaemonAgentCommand(agentSocket, agentMessage),
       );
     });
 
@@ -513,6 +542,7 @@ export function startPluginWebSocketServer(
   return {
     ready: () => readyPromise,
     close: async () => {
+      daemonAgentRunner.close();
       unsubscribePersistence();
       await new Promise<void>((resolve, reject) => {
         rejectAllPendingToolRequests(
@@ -609,16 +639,22 @@ export function startPluginWebSocketServer(
     );
     const internalEffect = getInternalToolEffect(normalizedCall.toolName);
     const currentSession = browserStateHub.snapshot(resolvedSessionId);
+    const trackedAuthorizedTarget = authorization.target?.tabId !== undefined
+      ? browserStateHub.targetSnapshot(
+          resolvedSessionId,
+          authorization.target.tabId,
+        ) ?? authorization.target
+      : currentSession.currentTab;
     const targetMismatchFields = authorizationTargetMismatchFields(
       authorization.target,
-      currentSession.currentTab,
+      trackedAuthorizedTarget,
     );
     const followsAuthorizedPageEffect =
       canFollowAuthorizedPageEffectForRead(
         authorization.pageEffectDispatchAttempted === true,
         internalEffect?.mutationScope,
         authorization.target,
-        currentSession.currentTab,
+        trackedAuthorizedTarget,
       );
     if (targetMismatchFields.length > 0 && !followsAuthorizedPageEffect) {
       throw new ExecutionBrokerError(
@@ -646,7 +682,7 @@ export function startPluginWebSocketServer(
       argumentsSha256: await hashExecutionArguments(normalizedCall.args),
       approvalRequired: authorization.approvalRequired,
       approvalId: authorization.approvalId,
-      target: executionGrantTarget(currentSession.currentTab),
+      target: executionGrantTarget(trackedAuthorizedTarget),
       issuedAt: issuedAt.toISOString(),
       expiresAt: expiresAt.toISOString(),
     });
@@ -758,7 +794,6 @@ export function startPluginWebSocketServer(
     );
     const requestedSnapshot = browserStateHub.snapshot(requesterSessionId);
     const requestedRevision = requestedSnapshot.revision;
-    const requestedTarget = requestedSnapshot.currentTab;
     const requesterConnectionId =
       connectionIds.get(requester) ?? "unknown-connection";
     const requesterRequestId = authorizationOptions.requestId ?? createId();
@@ -768,6 +803,15 @@ export function startPluginWebSocketServer(
       taskId: requestedSnapshot.currentConversationId,
       egressDestinations: defaultTaskEgressDestinations(role, clientName),
     };
+    const requestedTarget = taskContext.target
+      ? browserStateHub.targetSnapshot(
+          requesterSessionId,
+          taskContext.target.tabId,
+        ) ??
+        (requestedSnapshot.currentTab?.tabId === taskContext.target.tabId
+          ? requestedSnapshot.currentTab
+          : undefined)
+      : requestedSnapshot.currentTab;
     const taskBindingConversationId = resolveTaskBindingConversationId(
       role,
       clientConversationIds.get(requester),
@@ -862,6 +906,12 @@ export function startPluginWebSocketServer(
           clientName,
           connectionId: requesterConnectionId,
         },
+        taskContext: {
+          taskId: taskContext.taskId,
+          ...(taskContext.conversationId
+            ? { conversationId: taskContext.conversationId }
+            : {}),
+        },
         target: requestedTarget,
         preview: buildApprovalPreview(toolName, args, policy),
       },
@@ -932,9 +982,12 @@ export function startPluginWebSocketServer(
     }
 
     throwIfExecutionAborted(authorizationOptions.signal);
-    const approvedTarget = browserStateHub.snapshot(
-      requesterSessionId,
-    ).currentTab;
+    const approvedTarget = requestedTarget.tabId !== undefined
+      ? browserStateHub.targetSnapshot(
+          requesterSessionId,
+          requestedTarget.tabId,
+        ) ?? requestedTarget
+      : browserStateHub.snapshot(requesterSessionId).currentTab;
     const targetMismatchFields = authorizationTargetMismatchFields(
       requestedTarget,
       approvedTarget,
@@ -1253,7 +1306,10 @@ export function startPluginWebSocketServer(
     const sourceSessionId = clientSessionIds.get(sourceSocket);
     if (message.command === WS_COMMANDS.BROWSER_ACTIVITY_EVENT) {
       const activityStream =
-        browserStateHub.activityStreamPayload(sourceSessionId);
+        browserStateHub.activityStreamPayload(
+          sourceSessionId,
+          message.payload.event.target?.tabId,
+        );
       const update: McpToPluginMessage = {
         requestId: createMessageId(),
         command: WS_COMMANDS.BROWSER_ACTIVITY_UPDATED,
@@ -1296,6 +1352,225 @@ export function startPluginWebSocketServer(
       }
     }
   }
+
+  async function handleDaemonAgentCommand(
+    socket: WebSocket,
+    message: ValidPluginToMcpMessage,
+  ): Promise<boolean> {
+    if (message.command === WS_COMMANDS.DAEMON_AGENT_CANCEL) {
+      const sessionId = clientSessionIds.get(socket) ?? "default";
+      daemonAgentRunner.cancel(
+        sessionId,
+        message.payload.conversationId,
+        message.payload.runId,
+        message.payload.reason,
+      );
+      return true;
+    }
+    if (message.command !== WS_COMMANDS.DAEMON_AGENT_START) {
+      return false;
+    }
+
+    const sessionId = clientSessionIds.get(socket) ?? "default";
+    const startPayload = message.payload as unknown as DaemonAgentStartPayload;
+    try {
+      daemonAgentRunner.start(sessionId, startPayload, {
+        executeTool: (request) =>
+          executeDaemonAgentTool(
+            request,
+            startPayload.conversationId,
+          ),
+        emit: (event) => broadcastDaemonAgentEvent(sessionId, event),
+        persistSession: (event) => {
+          browserStateHub.setAgentSession(event.session, sessionId);
+          broadcastSessionSnapshot(sessionId, event.session);
+        },
+      });
+      sendRawMessage(socket, {
+        requestId: message.requestId,
+        command: WS_COMMANDS.DAEMON_AGENT_START_RESULT,
+        sentAt: new Date().toISOString(),
+        payload: {
+          ok: true,
+          runId: startPayload.runId,
+          conversationId: startPayload.conversationId,
+          acceptedAt: new Date().toISOString(),
+        },
+      });
+    } catch (error) {
+      sendRawMessage(socket, {
+        requestId: message.requestId,
+        command: WS_COMMANDS.DAEMON_AGENT_START_RESULT,
+        sentAt: new Date().toISOString(),
+        payload: {
+          ok: false,
+          runId: startPayload.runId,
+          conversationId: startPayload.conversationId,
+          error: error instanceof Error ? error.message : "Daemon Agent start failed.",
+        },
+      });
+    }
+    return true;
+  }
+
+  function broadcastDaemonAgentEvent(
+    sessionId: string,
+    event: DaemonAgentEventPayload,
+  ): void {
+    const message: McpToPluginMessage = {
+      requestId: createMessageId(),
+      command: WS_COMMANDS.DAEMON_AGENT_EVENT,
+      sentAt: new Date().toISOString(),
+      payload: event,
+    };
+    const serialized = JSON.stringify(message);
+    for (const socket of clients) {
+      if (
+        clientRoles.get(socket) === "ui" &&
+        clientSessionIds.get(socket) === sessionId &&
+        socket.readyState === socket.OPEN
+      ) {
+        socket.send(serialized);
+      }
+    }
+  }
+
+  function broadcastSessionSnapshot(
+    sessionId: string,
+    session: AgentSessionSnapshot,
+  ): void {
+    const message: McpToPluginMessage = {
+      requestId: createMessageId(),
+      command: WS_COMMANDS.AGENT_SESSION_SYNC,
+      sentAt: new Date().toISOString(),
+      payload: { session },
+    };
+    const serialized = JSON.stringify(message);
+    for (const socket of clients) {
+      if (
+        (clientRoles.get(socket) === "ui" ||
+          clientRoles.get(socket) === "observer") &&
+        clientSessionIds.get(socket) === sessionId &&
+        socket.readyState === socket.OPEN
+      ) {
+        socket.send(serialized);
+      }
+    }
+  }
+
+  async function executeDaemonAgentTool(
+    request: DaemonAgentToolRequest,
+    conversationId: string,
+  ): Promise<unknown> {
+    let result: McpToolResultPayload | undefined;
+    const syntheticSocket = {
+      OPEN: 1,
+      readyState: 1,
+      send: (raw: string) => {
+        const message = JSON.parse(raw) as McpToPluginMessage;
+        if (message.command === WS_COMMANDS.MCP_TOOL_RESULT) {
+          result = message.payload;
+        }
+      },
+    } as unknown as WebSocket;
+    const connectionId = `daemon-agent:${request.runId}`;
+    const requestId = `daemon-agent:${request.runId}:${request.toolCallId}`.slice(0, 200);
+    clientRoles.set(syntheticSocket, "ui");
+    clientSessionIds.set(syntheticSocket, request.sessionId);
+    clientConversationIds.set(syntheticSocket, conversationId);
+    connectionIds.set(syntheticSocket, connectionId);
+    try {
+      const taskContext: ToolTaskContext = {
+        taskId: request.executionBinding?.taskId ?? conversationId,
+        conversationId,
+        ...(request.executionBinding
+          ? {
+              target: {
+                tabId: request.executionBinding.target.tabId,
+                targetId: request.executionBinding.target.targetId,
+              },
+            }
+          : {}),
+        egressDestinations: request.egressDestinations,
+      };
+      await executeWithExternalCancellation({
+        signal: request.signal,
+        createPreCancelledError: () =>
+          new ExecutionBrokerError(
+            "REQUEST_CANCELLED",
+            "Daemon Agent tool request was cancelled before execution.",
+          ),
+        cancel: () => {
+          executionBroker.cancel(
+            connectionId,
+            requestId,
+            request.signal.reason instanceof Error
+              ? request.signal.reason.message
+              : "Daemon Agent tool request cancelled.",
+          );
+        },
+        start: () =>
+          isCollaborationToolName(request.toolName)
+            ? handleCollaborationTool(
+                syntheticSocket,
+                requestId,
+                request.toolName,
+                request.args,
+                request.sessionId,
+                (message) => {
+                  const serialized = JSON.stringify(message);
+                  for (const socket of clients) {
+                    if (
+                      clientRoles.get(socket) === "ui" &&
+                      clientSessionIds.get(socket) === request.sessionId &&
+                      socket.readyState === socket.OPEN
+                    ) {
+                      socket.send(serialized);
+                    }
+                  }
+                },
+                {
+                  actor: "extension_agent",
+                  clientId: connectionId,
+                  executionBroker,
+                  connectionId,
+                },
+              )
+            : handlePluginRequestedMcpTool(
+                syntheticSocket,
+                requestId,
+                request.toolName,
+                request.args,
+                (call, options) =>
+                  callBrowserTool(call, request.sessionId, options),
+                authorizeTool,
+                executionBroker,
+                connectionId,
+                request.sessionId,
+                undefined,
+                requestId,
+                artifactStore,
+                false,
+                options.stateStore,
+                "extension_agent",
+                taskContext,
+                additionalMcpBackend,
+              ),
+      });
+      if (!result) {
+        throw new Error(`Daemon Agent tool ${request.toolName} returned no protocol result.`);
+      }
+      if (!result.ok) {
+        throw new Error(result.error);
+      }
+      return result.data;
+    } finally {
+      clientRoles.delete(syntheticSocket);
+      clientSessionIds.delete(syntheticSocket);
+      clientConversationIds.delete(syntheticSocket);
+      connectionIds.delete(syntheticSocket);
+    }
+  }
 }
 
 function handleRawMessage(
@@ -1322,6 +1597,7 @@ function handleRawMessage(
   stateStore: DaemonStateStore | undefined,
   reportProtocolViolation: (requestId: string, error: string) => void,
   additionalMcpBackend?: AdditionalMcpToolBackend,
+  handleDaemonAgentCommand?: DaemonAgentCommandHandler,
 ): void {
   const parsedJson = safeJsonParse(raw);
   if (!parsedJson.ok) {
@@ -1497,6 +1773,7 @@ function handleRawMessage(
     stateStore,
     assignedHelloRole,
     additionalMcpBackend,
+    handleDaemonAgentCommand,
   ).catch((error) => {
     console.error(
       `[ai-devtools-daemon] protocol command failed: ${
@@ -1623,6 +1900,7 @@ async function handlePluginMessage(
   stateStore: DaemonStateStore | undefined,
   assignedHelloRole: WsClientRole | undefined,
   additionalMcpBackend?: AdditionalMcpToolBackend,
+  handleDaemonAgentCommand?: DaemonAgentCommandHandler,
 ): Promise<void> {
   if (message.command === WS_COMMANDS.CLIENT_HELLO) {
     handleClientHello(
@@ -1711,6 +1989,12 @@ async function handlePluginMessage(
     await handleObserverMessage(socket, message, additionalMcpBackend);
     return;
   } else if (currentRole === "ui") {
+    if (
+      handleDaemonAgentCommand &&
+      (await handleDaemonAgentCommand(socket, message))
+    ) {
+      return;
+    }
     await handleUiMessage(
       socket,
       message,
@@ -2023,6 +2307,22 @@ async function handleUiMessage(
         ok: false,
         error: "UI clients must invoke registered MCP tools, not raw browser tools.",
       });
+      break;
+    case WS_COMMANDS.LOCAL_UPDATE_CHECK:
+      await handleLocalUpdateCheck(socket, message.requestId);
+      break;
+    case WS_COMMANDS.LOCAL_UPDATE:
+      await handleLocalUpdateRun(socket, message.requestId);
+      break;
+    case WS_COMMANDS.LOCAL_SERVICE_STATUS:
+      await handleLocalServiceStatus(socket, message.requestId);
+      break;
+    case WS_COMMANDS.LOCAL_SERVICE_SET:
+      await handleLocalServiceSet(
+        socket,
+        message.requestId,
+        message.payload.enabled,
+      );
       break;
     default:
       break;
@@ -2536,8 +2836,10 @@ async function handlePluginRequestedMcpTool(
     const executionDeadlineAt = authorization.approvalRequired
       ? new Date(Date.now() + PROTOCOL_LIMITS.maxRequestDeadlineMs).toISOString()
       : deadlineAt;
-    const targetId =
-      browserStateHub.snapshot(sessionId).currentTab?.targetId ?? "active";
+    const targetId = authorization.target?.targetId ??
+      (authorization.target?.tabId !== undefined
+        ? String(authorization.target.tabId)
+        : "active");
     executionStartedAt = Date.now();
     const data = await executionBroker.execute({
       connectionId,
@@ -2555,53 +2857,60 @@ async function handlePluginRequestedMcpTool(
       },
       run: async (signal) => {
         if (normalizedToolName) {
-          return executeMcpToolData(
-            normalizedToolName,
-            validatedArgs,
-            {
-              close: async () => undefined,
-              ready: async () => ({ host: "127.0.0.1", port: 17321 }),
-              connectedClients: () => 1,
-              connectedPluginClients: () => 1,
-              callBrowserTool: (call, options) =>
-                callBrowserTool(call, {
-                  ...options,
-                  signal,
-                  deadlineAt: executionDeadlineAt,
-                  idempotencyKey,
-                  authorization,
-                }),
-            },
-            {
-              sessionId,
-              storeJsonArtifact: (value) =>
-                artifactStore.putBytes(
+          return browserStateHub.runWithTaskTarget(
+            sessionId,
+            authorization.target,
+            () =>
+              executeMcpToolData(
+                normalizedToolName,
+                validatedArgs,
+                {
+                  close: async () => undefined,
+                  ready: async () => ({ host: "127.0.0.1", port: 17321 }),
+                  connectedClients: () => 1,
+                  connectedPluginClients: () => 1,
+                  callBrowserTool: (call, options) =>
+                    callBrowserTool(call, {
+                      ...options,
+                      signal,
+                      deadlineAt: executionDeadlineAt,
+                      idempotencyKey,
+                      authorization,
+                    }),
+                },
+                {
                   sessionId,
-                  "payload",
-                  "application/json",
-                  Buffer.from(JSON.stringify(value), "utf8"),
-                ),
-              readJsonArtifact: async (artifactId) => {
-                const artifact = await artifactStore.read(
-                  artifactId,
-                  sessionId,
-                );
-                if (!artifact) {
-                  throw new Error(
-                    "RECIPE_NOT_FOUND: artifact was not found, expired, or belongs to another browser session.",
-                  );
-                }
-                if (artifact.metadata.mimeType !== "application/json") {
-                  throw new Error(
-                    "RECIPE_INVALID: artifact MIME type is not application/json.",
-                  );
-                }
-                return JSON.parse(Buffer.from(artifact.bytes).toString("utf8"));
-              },
-              ...(stateStore
-                ? { listAuditEvents: () => stateStore.listAuditEvents() }
-                : {}),
-            },
+                  storeJsonArtifact: (value) =>
+                    artifactStore.putBytes(
+                      sessionId,
+                      "payload",
+                      "application/json",
+                      Buffer.from(JSON.stringify(value), "utf8"),
+                    ),
+                  readJsonArtifact: async (artifactId) => {
+                    const artifact = await artifactStore.read(
+                      artifactId,
+                      sessionId,
+                    );
+                    if (!artifact) {
+                      throw new Error(
+                        "RECIPE_NOT_FOUND: artifact was not found, expired, or belongs to another browser session.",
+                      );
+                    }
+                    if (artifact.metadata.mimeType !== "application/json") {
+                      throw new Error(
+                        "RECIPE_INVALID: artifact MIME type is not application/json.",
+                      );
+                    }
+                    return JSON.parse(
+                      Buffer.from(artifact.bytes).toString("utf8"),
+                    );
+                  },
+                  ...(stateStore
+                    ? { listAuditEvents: () => stateStore.listAuditEvents() }
+                    : {}),
+                },
+              ),
           );
         }
         if (additionalMcpBackend) {
@@ -2828,6 +3137,224 @@ function sendBrowserToolResult(
   const message: McpToPluginMessage = {
     requestId,
     command: WS_COMMANDS.BROWSER_TOOL_RESULT,
+    sentAt: new Date().toISOString(),
+    payload,
+  };
+  socket.send(JSON.stringify(message));
+}
+
+let localUpdateInFlight = false;
+
+async function handleLocalUpdateCheck(
+  socket: WebSocket,
+  requestId: string,
+): Promise<void> {
+  try {
+    const result = await checkLocalUpdate(resolveProjectRootFromDaemon());
+    sendLocalUpdateCheckResult(socket, requestId, result);
+  } catch (error) {
+    sendLocalUpdateCheckResult(socket, requestId, {
+      ok: false,
+      error: error instanceof Error ? error.message : "LOCAL_UPDATE_CHECK failed.",
+    });
+  }
+}
+
+async function handleLocalUpdateRun(
+  socket: WebSocket,
+  requestId: string,
+): Promise<void> {
+  if (localUpdateInFlight) {
+    sendLocalUpdateResult(socket, requestId, {
+      ok: false,
+      error: "已有本地更新正在执行，请稍后再试。",
+      projectRoot: resolveProjectRootFromDaemon(),
+      restartScheduled: false,
+    });
+    return;
+  }
+  localUpdateInFlight = true;
+  try {
+    const result = await runLocalUpdate(resolveProjectRootFromDaemon(), {
+      noRestart: true,
+    });
+    sendLocalUpdateResult(socket, requestId, {
+      ...result,
+      needsExtensionReload: result.ok,
+      restartScheduled: result.ok,
+    });
+    if (result.ok) {
+      scheduleDaemonRestartAfterUpdate();
+    }
+  } catch (error) {
+    sendLocalUpdateResult(socket, requestId, {
+      ok: false,
+      error: error instanceof Error ? error.message : "LOCAL_UPDATE failed.",
+      projectRoot: resolveProjectRootFromDaemon(),
+      restartScheduled: false,
+    });
+  } finally {
+    localUpdateInFlight = false;
+  }
+}
+
+function scheduleDaemonRestartAfterUpdate(): void {
+  // Give the websocket response time to flush before LaunchAgent/process exit.
+  setTimeout(() => {
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (process.platform === "darwin" && uid !== undefined) {
+      const label = "com.ai-devtools-assistant.daemon";
+      const printed = spawnSync(
+        "/bin/launchctl",
+        ["print", `gui/${uid}/${label}`],
+        { encoding: "utf8" },
+      );
+      if (printed.status === 0) {
+        const restarted = spawnSync(
+          "/bin/launchctl",
+          ["kickstart", "-k", `gui/${uid}/${label}`],
+          { encoding: "utf8" },
+        );
+        if (restarted.status === 0) {
+          return;
+        }
+      }
+    }
+    const projectRoot = resolveProjectRootFromDaemon();
+    const helperCandidates = [
+      join(projectRoot, "runtime", "restart-daemon.mjs"),
+      join(projectRoot, "scripts", "restart-daemon.mjs"),
+    ];
+    const helperPath = helperCandidates.find((candidate) => existsSync(candidate));
+    const serverPath = process.argv[1] ? resolve(process.argv[1]) : "";
+    if (!helperPath || !serverPath.endsWith(".js")) {
+      console.error(
+        "[ai-devtools-daemon] update installed, but automatic restart helper is unavailable; restart the daemon manually.",
+      );
+      return;
+    }
+    const restartHelper = spawn(
+      process.execPath,
+      [
+        helperPath,
+        "--wait-pid",
+        String(process.pid),
+        "--server-path",
+        serverPath,
+        "--cwd",
+        projectRoot,
+        "--pid-path",
+        join(projectRoot, "daemon.pid"),
+      ],
+      {
+        cwd: projectRoot,
+        detached: true,
+        stdio: "ignore",
+        env: process.env,
+      },
+    );
+    restartHelper.unref();
+    setTimeout(() => process.exit(0), 250);
+  }, 1_500);
+}
+
+function sendLocalUpdateCheckResult(
+  socket: WebSocket,
+  requestId: string,
+  payload: import("../shared/wsProtocol").LocalUpdateCheckResultPayload,
+): void {
+  if (socket.readyState !== socket.OPEN) {
+    return;
+  }
+  const message: McpToPluginMessage = {
+    requestId,
+    command: WS_COMMANDS.LOCAL_UPDATE_CHECK_RESULT,
+    sentAt: new Date().toISOString(),
+    payload,
+  };
+  socket.send(JSON.stringify(message));
+}
+
+function sendLocalUpdateResult(
+  socket: WebSocket,
+  requestId: string,
+  payload: import("../shared/wsProtocol").LocalUpdateResultPayload,
+): void {
+  if (socket.readyState !== socket.OPEN) {
+    return;
+  }
+  const message: McpToPluginMessage = {
+    requestId,
+    command: WS_COMMANDS.LOCAL_UPDATE_RESULT,
+    sentAt: new Date().toISOString(),
+    payload,
+  };
+  socket.send(JSON.stringify(message));
+}
+
+async function handleLocalServiceStatus(
+  socket: WebSocket,
+  requestId: string,
+): Promise<void> {
+  try {
+    const result = await getLocalServiceStatus(resolveProjectRootFromDaemon());
+    sendLocalServiceStatusResult(socket, requestId, result);
+  } catch (error) {
+    sendLocalServiceStatusResult(socket, requestId, {
+      ok: false,
+      error:
+        error instanceof Error ? error.message : "LOCAL_SERVICE_STATUS failed.",
+    });
+  }
+}
+
+async function handleLocalServiceSet(
+  socket: WebSocket,
+  requestId: string,
+  enabled: boolean,
+): Promise<void> {
+  try {
+    const result = await setLocalServiceAutostart(
+      enabled,
+      resolveProjectRootFromDaemon(),
+    );
+    sendLocalServiceSetResult(socket, requestId, result);
+  } catch (error) {
+    sendLocalServiceSetResult(socket, requestId, {
+      ok: false,
+      error: error instanceof Error ? error.message : "LOCAL_SERVICE_SET failed.",
+    });
+  }
+}
+
+function sendLocalServiceStatusResult(
+  socket: WebSocket,
+  requestId: string,
+  payload: import("../shared/wsProtocol").LocalServiceStatusResultPayload,
+): void {
+  if (socket.readyState !== socket.OPEN) {
+    return;
+  }
+  const message: McpToPluginMessage = {
+    requestId,
+    command: WS_COMMANDS.LOCAL_SERVICE_STATUS_RESULT,
+    sentAt: new Date().toISOString(),
+    payload,
+  };
+  socket.send(JSON.stringify(message));
+}
+
+function sendLocalServiceSetResult(
+  socket: WebSocket,
+  requestId: string,
+  payload: import("../shared/wsProtocol").LocalServiceSetResultPayload,
+): void {
+  if (socket.readyState !== socket.OPEN) {
+    return;
+  }
+  const message: McpToPluginMessage = {
+    requestId,
+    command: WS_COMMANDS.LOCAL_SERVICE_SET_RESULT,
     sentAt: new Date().toISOString(),
     payload,
   };

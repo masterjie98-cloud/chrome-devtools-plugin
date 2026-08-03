@@ -32,11 +32,17 @@ import type {
   ToolCapability,
 } from "./toolPolicy";
 import type { BrowserActivityEventInput } from "./browserActivity";
+import type {
+  DaemonAgentCancelPayload,
+  DaemonAgentEventPayload,
+  DaemonAgentStartPayload,
+  DaemonAgentStartResultPayload,
+} from "./daemonAgent";
 
 export const MCP_WS_URL = "ws://127.0.0.1:17321";
 // Bump whenever an extension-visible tool/resource schema changes so a newly
 // loaded extension cannot silently keep using an older daemon process.
-export const WS_PROTOCOL_VERSION = 8;
+export const WS_PROTOCOL_VERSION = 11;
 export const WS_HEARTBEAT_INTERVAL_MS = 15_000;
 
 export const WS_COMMANDS = {
@@ -50,6 +56,10 @@ export const WS_COMMANDS = {
   SCREENSHOT_CAPTURED: "SCREENSHOT_CAPTURED",
   PAGE_CONTEXT_UPDATED: "PAGE_CONTEXT_UPDATED",
   AGENT_SESSION_SYNC: "AGENT_SESSION_SYNC",
+  DAEMON_AGENT_START: "DAEMON_AGENT_START",
+  DAEMON_AGENT_START_RESULT: "DAEMON_AGENT_START_RESULT",
+  DAEMON_AGENT_CANCEL: "DAEMON_AGENT_CANCEL",
+  DAEMON_AGENT_EVENT: "DAEMON_AGENT_EVENT",
   COLLABORATION_ITEM_UPSERT: "COLLABORATION_ITEM_UPSERT",
   COLLABORATION_WORKSPACE_UPDATED: "COLLABORATION_WORKSPACE_UPDATED",
   BROWSER_ACTIVITY_EVENT: "BROWSER_ACTIVITY_EVENT",
@@ -69,6 +79,14 @@ export const WS_COMMANDS = {
   REQUEST_CANCEL: "REQUEST_CANCEL",
   BROWSER_TOOL_CALL: "BROWSER_TOOL_CALL",
   BROWSER_TOOL_RESULT: "BROWSER_TOOL_RESULT",
+  LOCAL_UPDATE_CHECK: "LOCAL_UPDATE_CHECK",
+  LOCAL_UPDATE_CHECK_RESULT: "LOCAL_UPDATE_CHECK_RESULT",
+  LOCAL_UPDATE: "LOCAL_UPDATE",
+  LOCAL_UPDATE_RESULT: "LOCAL_UPDATE_RESULT",
+  LOCAL_SERVICE_STATUS: "LOCAL_SERVICE_STATUS",
+  LOCAL_SERVICE_STATUS_RESULT: "LOCAL_SERVICE_STATUS_RESULT",
+  LOCAL_SERVICE_SET: "LOCAL_SERVICE_SET",
+  LOCAL_SERVICE_SET_RESULT: "LOCAL_SERVICE_SET_RESULT",
 } as const;
 
 export type WsCommand = (typeof WS_COMMANDS)[keyof typeof WS_COMMANDS];
@@ -302,6 +320,10 @@ export interface ApprovalRequestPayload {
     clientName?: string;
     connectionId: string;
   };
+  taskContext?: {
+    taskId: string;
+    conversationId?: string;
+  };
   target?: ActiveTabSnapshot;
   preview: {
     summary: string;
@@ -444,6 +466,18 @@ export type PluginToMcpMessage =
     }
   | {
       requestId: string;
+      command: typeof WS_COMMANDS.DAEMON_AGENT_START;
+      sentAt: string;
+      payload: DaemonAgentStartPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.DAEMON_AGENT_CANCEL;
+      sentAt: string;
+      payload: DaemonAgentCancelPayload;
+    }
+  | {
+      requestId: string;
       command: typeof WS_COMMANDS.COLLABORATION_ITEM_UPSERT;
       sentAt: string;
       payload: CollaborationItemUpsertPayload;
@@ -517,7 +551,89 @@ export type PluginToMcpMessage =
       command: typeof WS_COMMANDS.BROWSER_TOOL_RESULT;
       sentAt: string;
       payload: BrowserToolResultPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.LOCAL_UPDATE_CHECK;
+      sentAt: string;
+      payload: Record<string, never>;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.LOCAL_UPDATE;
+      sentAt: string;
+      payload: Record<string, never>;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.LOCAL_SERVICE_STATUS;
+      sentAt: string;
+      payload: Record<string, never>;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.LOCAL_SERVICE_SET;
+      sentAt: string;
+      payload: { enabled: boolean };
     };
+
+export interface LocalUpdateCheckResultPayload {
+  ok: boolean;
+  updateAvailable?: boolean;
+  currentVersion?: string;
+  currentCommit?: string;
+  remoteCommit?: string | null;
+  latestReleaseTag?: string | null;
+  latestReleaseVersion?: string | null;
+  releaseUrl?: string | null;
+  releaseAssetName?: string | null;
+  projectRoot?: string;
+  branch?: string | null;
+  installMode?: "git" | "release-zip";
+  autoUpdateSupported?: boolean;
+  message?: string;
+  error?: string;
+}
+
+export interface LocalUpdateResultPayload {
+  ok: boolean;
+  currentVersion?: string;
+  newVersion?: string;
+  commit?: string;
+  buildId?: string;
+  logTail?: string;
+  projectRoot?: string;
+  installMode?: "git" | "release-zip";
+  releaseTag?: string;
+  releaseUrl?: string | null;
+  archiveName?: string;
+  archiveSha256?: string;
+  restartScheduled?: boolean;
+  error?: string;
+  needsExtensionReload?: boolean;
+}
+
+export interface LocalServiceStatusResultPayload {
+  ok: boolean;
+  platform?: string;
+  supported?: boolean;
+  registered?: boolean;
+  loaded?: boolean;
+  label?: string;
+  plistPath?: string | null;
+  serverPath?: string;
+  message?: string;
+  error?: string;
+}
+
+export interface LocalServiceSetResultPayload {
+  ok: boolean;
+  registered?: boolean;
+  supported?: boolean;
+  platform?: string;
+  message?: string;
+  error?: string;
+}
 
 export type McpToPluginMessage =
   | {
@@ -567,6 +683,18 @@ export type McpToPluginMessage =
       command: typeof WS_COMMANDS.AGENT_SESSION_SYNC;
       sentAt: string;
       payload: AgentSessionSyncPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.DAEMON_AGENT_START_RESULT;
+      sentAt: string;
+      payload: DaemonAgentStartResultPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.DAEMON_AGENT_EVENT;
+      sentAt: string;
+      payload: DaemonAgentEventPayload;
     }
   | {
       requestId: string;
@@ -635,6 +763,30 @@ export type McpToPluginMessage =
       command: typeof WS_COMMANDS.BROWSER_TOOL_RESULT;
       sentAt: string;
       payload: BrowserToolResultPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.LOCAL_UPDATE_CHECK_RESULT;
+      sentAt: string;
+      payload: LocalUpdateCheckResultPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.LOCAL_UPDATE_RESULT;
+      sentAt: string;
+      payload: LocalUpdateResultPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.LOCAL_SERVICE_STATUS_RESULT;
+      sentAt: string;
+      payload: LocalServiceStatusResultPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.LOCAL_SERVICE_SET_RESULT;
+      sentAt: string;
+      payload: LocalServiceSetResultPayload;
     };
 
 export type McpWsAck =

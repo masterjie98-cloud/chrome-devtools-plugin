@@ -27,7 +27,15 @@ test("task binding synchronization waits for target convergence", async () => {
     },
   ];
   const started: string[] = [];
-  const callOptions: Array<{ skipTaskContext?: boolean }> = [];
+  const callOptions: Array<{
+    skipTaskContext?: boolean;
+    taskContext?: {
+      taskId: string;
+      conversationId?: string;
+      target?: { tabId: number; targetId?: string };
+      egressDestinations: string[];
+    };
+  }> = [];
 
   await synchronizeMcpTaskBinding(
     {
@@ -48,8 +56,25 @@ test("task binding synchronization waits for target convergence", async () => {
 
   assert.deepEqual(started, ["conversation-1"]);
   assert.deepEqual(
+    callOptions.map((options) => options.taskContext),
+    [
+    {
+      taskId: "task-1",
+      conversationId: "conversation-1",
+      target: { tabId: 42, targetId: "42" },
+      egressDestinations: [],
+    },
+    {
+      taskId: "task-1",
+      conversationId: "conversation-1",
+      target: { tabId: 42, targetId: "42" },
+      egressDestinations: [],
+    },
+    ],
+  );
+  assert.deepEqual(
     callOptions.map((options) => options.skipTaskContext),
-    [true, true],
+    [undefined, undefined],
   );
 });
 
