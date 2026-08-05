@@ -36,7 +36,11 @@ import {
   sanitizePageSnapshotForMcp,
   sanitizeScreenshotForMcp,
 } from "../shared/wsProtocol";
-import { sanitizeText, sanitizeUrl } from "../shared/sanitize";
+import {
+  sanitizeMultilineText,
+  sanitizeText,
+  sanitizeUrl,
+} from "../shared/sanitize";
 import { createMessageId } from "../shared/messaging";
 import { createResourceTargetKey } from "./resourceRouting";
 import {
@@ -385,7 +389,7 @@ export class BrowserStateHub {
     const sanitized: PluginChatMessageSnapshot = {
       ...message,
       conversationId,
-      content: sanitizeText(message.content, 6000),
+      content: sanitizeMultilineText(message.content, 6000),
     };
     if (conversationId !== session.currentConversationId) {
       session.currentConversationId = conversationId;
@@ -567,7 +571,7 @@ export class BrowserStateHub {
       session.lastAgentConclusion = {
         sessionId: sanitized.id,
         status: sanitized.status,
-        content: sanitizeText(sanitized.finalContent, 12000),
+        content: sanitizeMultilineText(sanitized.finalContent, 12000),
         completedAt: sanitized.completedAt ?? sanitized.updatedAt,
       };
     }
@@ -695,7 +699,7 @@ export class BrowserStateHub {
         lastAgentConclusion: persisted.lastAgentConclusion
           ? {
               ...persisted.lastAgentConclusion,
-              content: sanitizeText(
+              content: sanitizeMultilineText(
                 persisted.lastAgentConclusion.content,
                 12000,
               ),
@@ -1412,7 +1416,7 @@ function sanitizePluginMessage(
       ? sanitizeText(message.conversationId, 200)
       : undefined,
     role: message.role,
-    content: sanitizeText(message.content, 6000),
+    content: sanitizeMultilineText(message.content, 6000),
     createdAt: message.createdAt,
   };
 }
@@ -1538,12 +1542,12 @@ function sanitizeAgentSession(
     assistantMessageId: session.assistantMessageId
       ? sanitizeText(session.assistantMessageId, 200)
       : undefined,
-    input: sanitizeText(session.input, 4000),
+    input: sanitizeMultilineText(session.input, 4000),
     finalContent: session.finalContent
-      ? sanitizeText(session.finalContent, 12000)
+      ? sanitizeMultilineText(session.finalContent, 12000)
       : undefined,
     visibleContent: session.visibleContent
-      ? sanitizeText(session.visibleContent, 12000)
+      ? sanitizeMultilineText(session.visibleContent, 12000)
       : undefined,
     executionBinding: session.executionBinding
       ? {

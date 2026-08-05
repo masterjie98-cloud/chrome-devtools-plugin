@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  compactToolResultForModel,
   MAX_TOOL_RESULT_DISPLAY_CHARS,
   presentToolResult,
+  toolResultModelCharLimit,
 } from "../src/sidepanel/toolResultPresentation";
 
 test("small tool results are retained in full with exact character metadata", () => {
@@ -53,4 +55,21 @@ test("unserializable tool results fail visibly without throwing", () => {
   assert.equal(result.meta.truncated, false);
   assert.match(result.content, /could not be serialized/);
   assert.match(result.content, /circular/i);
+});
+
+test("model tool-result budget scales with context and is shared by a batch", () => {
+  assert.equal(toolResultModelCharLimit(128_000, 1), 25_600);
+  assert.equal(toolResultModelCharLimit(128_000, 4), 6_400);
+  assert.equal(toolResultModelCharLimit(1_000_000, 1), 64_000);
+});
+
+test("model compaction preserves both ends without shrinking the UI result", () => {
+  const displayed = `HEAD-${"x".repeat(20_000)}-TAIL`;
+  const compacted = compactToolResultForModel(displayed, 2_000);
+
+  assert.equal(compacted.length, 2_000);
+  assert.match(compacted, /^HEAD-/);
+  assert.match(compacted, /-TAIL$/);
+  assert.match(compacted, /tool result compacted for model context/);
+  assert.equal(displayed.length > compacted.length, true);
 });

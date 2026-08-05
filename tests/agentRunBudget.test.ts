@@ -2362,6 +2362,641 @@ test("marker-only completion after tools is blocked with a visible fallback", as
   }
 });
 
+test("Agent rewrites a missing report body after tools without executing another tool", async () => {
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-k8s-status",
+                type: "function",
+                function: {
+                  name: "browser_status",
+                  arguments: "{}",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "Kubernetes 服务状态报告已完整生成，节点、Pod 和异常 Deployment 均已验证。报告如上所示。",
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "## Kubernetes 状态报告\n\n| 维度 | 状态 |\n| --- | --- |\n| 节点 | 8 个 Ready |\n| Pod | 26 个 Failed |\n\n覆盖范围：Prometheus test。",
+          },
+        },
+      ],
+    },
+  ];
+  let requestCount = 0;
+  let toolExecutionCount = 0;
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => {
+      requestCount += 1;
+    },
+  );
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 3 },
+      messages: [],
+      input:
+        "生成 Kubernetes 服务状态报告，包含节点、Pod 和异常 Deployment。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-report-rewrite",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_status",
+            description: "Read browser status.",
+            parameters: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        toolExecutionCount += calls.length;
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            source: "prometheus-infra-0",
+            environment: "test",
+            readyNodes: 8,
+            failedPods: 26,
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.equal(requestCount, 3);
+    assert.equal(toolExecutionCount, 1);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /## Kubernetes 状态报告/);
+    assert.match(result.finalContent, /26 个 Failed/);
+    assert.doesNotMatch(result.finalContent, /报告如上所示/);
+  } finally {
+    restore();
+  }
+});
+
+test("external MCP results do not trigger current-page browser verification", async () => {
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-prometheus-status",
+                type: "function",
+                function: {
+                  name: externalToolName,
+                  arguments: '{"query":"up"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "## Prometheus 状态\n\n数据源返回 8 个目标均为 up。\n\n你希望继续查看哪一项？",
+          },
+        },
+      ],
+    },
+  ];
+  let requestCount = 0;
+  const requestBodies: Record<string, unknown>[] = [];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => {
+      requestCount += 1;
+    },
+    (body) => requestBodies.push(body),
+  );
+  const executedTools: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 4 },
+      messages: [],
+      input: "查询 Prometheus 当前健康状态。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-external-mcp-report",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: externalToolName,
+            description: "Query Prometheus.",
+            parameters: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedTools.push(...calls.map((call) => call.name));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({ source: "prometheus-infra-0", up: 8 }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.equal(requestCount, 2);
+    assert.deepEqual(executedTools, [externalToolName]);
+    assert.equal(result.status, "completed");
+    assert.equal(result.session.taskState.verification.required, false);
+    assert.match(
+      JSON.stringify(requestBodies[0]),
+      /Never call browser_verify to validate an external MCP query/,
+    );
+    assert.doesNotMatch(
+      result.session.events.map((event) => event.summary).join("\n"),
+      /修改后的页面尚未验证|browser_verify/,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("external MCP volatile observation metadata cannot hide an identical-result loop", async () => {
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
+  const responses = [
+    ...Array.from({ length: 3 }, (_, index) => ({
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: `call-external-repeat-${index + 1}`,
+                type: "function",
+                function: {
+                  name: externalToolName,
+                  arguments: '{"query":"up"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    })),
+    {
+      choices: [
+        {
+          message: {
+            content: "已根据两次相同的 MCP 证据停止重复查询。",
+          },
+        },
+      ],
+    },
+  ];
+  let requestCount = 0;
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => {
+      requestCount += 1;
+    },
+  );
+  const executedCallIds: string[] = [];
+  let executionCount = 0;
+  let budgetExtensionRequests = 0;
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 1,
+        autoContinueAfterToolRoundLimit: true,
+      },
+      messages: [],
+      input: "查询 Prometheus 健康状态。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-external-repeat",
+      tools: [
+        {
+          ...externalReadOnlyToolDefinition(externalToolName),
+          clientMetadata: {
+            source: "external_mcp",
+            displayName: "prometheus_query",
+            externalMcpServerId: "mcp_prometheus_inf",
+            externalMcpServerName: "Prometheus Infra MCP",
+            externalMcpToolName: "prometheus_query",
+          },
+        },
+      ],
+      runBudgetLimits: {
+        maxToolCalls: 2,
+        maxEffectfulToolCalls: 2,
+        maxSensitiveToolCalls: 2,
+      },
+      requestBudgetExtension: async () => {
+        budgetExtensionRequests += 1;
+        return "continue";
+      },
+      executeToolCalls: async (calls) => {
+        executionCount += 1;
+        executedCallIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            content: [],
+            structuredContent: {
+              source: {
+                source_id: "prometheus-infra-0",
+                environment: "test",
+              },
+              observed_at: `2026-08-05T03:00:0${executionCount}Z`,
+              evidence_ref: `prometheus://prometheus-infra-0/query/${executionCount}`,
+              quality_status: "ok",
+              result_type: "vector",
+              series_count: 1,
+              data: [
+                {
+                  metric: {},
+                  value: [1_785_983_450 + executionCount, "12"],
+                },
+              ],
+            },
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedCallIds, [
+      "call-external-repeat-1",
+      "call-external-repeat-2",
+    ]);
+    assert.equal(budgetExtensionRequests, 0);
+    assert.equal(requestCount, 4);
+    assert.equal(result.status, "blocked");
+    assert.match(result.finalContent, /无进展循环/);
+    assert.match(result.finalContent, /停止重复查询/);
+  } finally {
+    restore();
+  }
+});
+
+test("external MCP observation loop protection preserves changed Prometheus values", async () => {
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
+  const responses = [
+    ...Array.from({ length: 3 }, (_, index) => ({
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: `call-external-progress-${index + 1}`,
+                type: "function",
+                function: {
+                  name: externalToolName,
+                  arguments: '{"query":"up"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    })),
+    {
+      choices: [
+        {
+          message: {
+            content: "Prometheus 指标连续变化，已完成三次采样。",
+          },
+        },
+      ],
+    },
+  ];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+  );
+  const executedCallIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 1,
+        autoContinueAfterToolRoundLimit: true,
+      },
+      messages: [],
+      input: "连续采样 Prometheus 指标，直到值发生变化。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-external-progress",
+      tools: [externalReadOnlyToolDefinition(externalToolName)],
+      executeToolCalls: async (calls) => {
+        const sampleNumber = executedCallIds.length + 1;
+        executedCallIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            structuredContent: {
+              observed_at: `2026-08-05T03:01:0${sampleNumber}Z`,
+              evidence_ref: `prometheus://prometheus-infra-0/query/${sampleNumber}`,
+              result_type: "vector",
+              data: [
+                {
+                  metric: { instance: "prometheus-infra-0" },
+                  value: [1_785_983_500 + sampleNumber, String(sampleNumber)],
+                },
+              ],
+            },
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedCallIds, [
+      "call-external-progress-1",
+      "call-external-progress-2",
+      "call-external-progress-3",
+    ]);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /连续变化/);
+  } finally {
+    restore();
+  }
+});
+
+test("external MCP distinct evidence calls are not stopped by an arbitrary per-tool limit", async () => {
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
+  const callCount = 15;
+  const responses = [
+    ...Array.from({ length: callCount }, (_, index) => ({
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: `call-external-distinct-${index + 1}`,
+                type: "function",
+                function: {
+                  name: externalToolName,
+                  arguments: JSON.stringify({ query: `metric_${index + 1}` }),
+                },
+              },
+            ],
+          },
+        },
+      ],
+    })),
+    {
+      choices: [
+        {
+          message: {
+            content: "15 项不同证据均已按用户要求完成采集。",
+          },
+        },
+      ],
+    },
+  ];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+  );
+  const executedCallIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 20 },
+      messages: [],
+      input: "依次采集这 15 项明确且不同的指标。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-external-distinct",
+      tools: [externalReadOnlyToolDefinition(externalToolName)],
+      runBudgetLimits: {
+        maxToolCalls: 20,
+        maxEffectfulToolCalls: 1,
+        maxSensitiveToolCalls: 1,
+      },
+      executeToolCalls: async (calls) => {
+        executedCallIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            query: call.arguments.query,
+            value: executedCallIds.length,
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.equal(executedCallIds.length, callCount);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /15 项不同证据/);
+  } finally {
+    restore();
+  }
+});
+
+function externalReadOnlyToolDefinition(name: string) {
+  return {
+    type: "function" as const,
+    function: {
+      name,
+      description: "Query Prometheus.",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    },
+    clientMetadata: {
+      source: "external_mcp" as const,
+      displayName: "prometheus_query",
+      externalMcpServerId: "mcp_prometheus_inf",
+      externalMcpServerName: "Prometheus Infra MCP",
+      externalMcpToolName: "prometheus_query",
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+  };
+}
+
+test("automatic MCP mode blocks browser_verify after an external-only query", async () => {
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-prometheus-status-auto",
+                type: "function",
+                function: {
+                  name: externalToolName,
+                  arguments: '{"query":"up"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-unrelated-browser-verify",
+                type: "function",
+                function: {
+                  name: "browser_verify",
+                  arguments: '{"checks":[]}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "## Prometheus 状态\n\n数据源返回 8 个目标均为 up。\n\n你希望继续查看哪一项？",
+          },
+        },
+      ],
+    },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+    (body) => requestBodies.push(body),
+  );
+  const executedTools: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 4 },
+      messages: [],
+      input: "自动选择合适的 MCP，查询 Prometheus 当前健康状态。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-auto-external-mcp-report",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: externalToolName,
+            description: "Query Prometheus.",
+            parameters: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+              additionalProperties: false,
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "browser_verify",
+            description: "Verify a current-page mutation.",
+            parameters: {
+              type: "object",
+              properties: { checks: { type: "array" } },
+              required: ["checks"],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedTools.push(...calls.map((call) => call.name));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({ source: "prometheus-infra-0", up: 8 }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.deepEqual(executedTools, [externalToolName]);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /8 个目标均为 up/);
+    assert.match(
+      JSON.stringify(requestBodies.at(-1)),
+      /UNRELATED_BROWSER_VERIFICATION/,
+    );
+  } finally {
+    restore();
+  }
+});
+
 test("Agent requires a read-only observation after a browser mutation", async () => {
   const responses = [
     {

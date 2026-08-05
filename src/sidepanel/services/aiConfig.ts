@@ -41,7 +41,7 @@ export interface AiCapabilityDetection {
 
 export interface AiProfile {
   id: string;
-  /** 用户自定义方案名，例如 "GPT-4o" / "DeepSeek R1" */
+  /** Legacy display name retained for storage compatibility; new UI uses config.model. */
   name: string;
   config: AiConfig;
 }
@@ -49,6 +49,14 @@ export interface AiProfile {
 export interface AiProfilesState {
   profiles: AiProfile[];
   activeProfileId: string;
+}
+
+export interface AiModelCapabilityResult {
+  supportsVision: boolean;
+  supportsWebSearch: boolean;
+  checkedAt: string;
+  visionError?: string;
+  webSearchError?: string;
 }
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
@@ -84,7 +92,7 @@ function generateProfileId(): string {
 function createDefaultProfile(): AiProfile {
   return {
     id: generateProfileId(),
-    name: "默认配置",
+    name: DEFAULT_AI_CONFIG.model,
     config: { ...DEFAULT_AI_CONFIG },
   };
 }
@@ -154,7 +162,7 @@ function loadProfilesStateWithLegacySecrets(): AiProfilesState {
       );
       const profile: AiProfile = {
         id: generateProfileId(),
-        name: "默认配置",
+        name: legacyConfig.model,
         config: legacyConfig,
       };
       return { profiles: [profile], activeProfileId: profile.id };
@@ -217,6 +225,103 @@ export function getActiveConfig(state: AiProfilesState): AiConfig {
   return active?.config ?? DEFAULT_AI_CONFIG;
 }
 
+export function activateAiProfile(
+  state: AiProfilesState,
+  profileId: string,
+): AiProfilesState {
+  if (
+    state.activeProfileId === profileId ||
+    !state.profiles.some((profile) => profile.id === profileId)
+  ) {
+    return state;
+  }
+  return { ...state, activeProfileId: profileId };
+}
+
+export function addAiModelsToState(
+  state: AiProfilesState,
+  modelIds: readonly string[],
+  baseConfig: AiConfig = getActiveConfig(state),
+): { state: AiProfilesState; addedProfileIds: string[] } {
+  const apiUrl = baseConfig.apiUrl.trim();
+  const existing = new Set(
+    state.profiles.map(
+      (profile) =>
+        `${profile.config.apiUrl.trim()}\u0000${profile.config.model.trim()}`,
+    ),
+  );
+  const addedProfiles: AiProfile[] = [];
+
+  for (const rawModelId of modelIds) {
+    const model = rawModelId.trim();
+    const key = `${apiUrl}\u0000${model}`;
+    if (!model || existing.has(key)) {
+      continue;
+    }
+    existing.add(key);
+    addedProfiles.push({
+      id: generateProfileId(),
+      name: model,
+      config: {
+        ...baseConfig,
+        apiUrl,
+        model,
+        supportsVision: false,
+        supportsWebSearch: false,
+        includeImageHistory: false,
+        enableWebSearch: false,
+        capabilityDetection: {},
+      },
+    });
+  }
+
+  if (addedProfiles.length === 0) {
+    return { state, addedProfileIds: [] };
+  }
+  return {
+    state: {
+      ...state,
+      profiles: [...state.profiles, ...addedProfiles],
+    },
+    addedProfileIds: addedProfiles.map((profile) => profile.id),
+  };
+}
+
+export function applyAiModelCapabilities(
+  state: AiProfilesState,
+  profileId: string,
+  result: AiModelCapabilityResult,
+): AiProfilesState {
+  if (!state.profiles.some((profile) => profile.id === profileId)) {
+    return state;
+  }
+
+  return {
+    ...state,
+    profiles: state.profiles.map((profile) =>
+      profile.id === profileId
+        ? {
+            ...profile,
+            config: {
+              ...profile.config,
+              supportsVision: result.supportsVision,
+              supportsWebSearch: result.supportsWebSearch,
+              includeImageHistory: result.supportsVision
+                ? profile.config.includeImageHistory
+                : false,
+              enableWebSearch: result.supportsWebSearch,
+              capabilityDetection: {
+                checkedAt: result.checkedAt,
+                visionError: result.visionError,
+                webSearchError: result.webSearchError,
+              },
+            },
+          }
+        : profile,
+    ),
+  };
+}
+
 function normalizeProfile(raw: unknown): AiProfile {
   const obj = raw as Partial<AiProfile>;
   return {
@@ -225,7 +330,7 @@ function normalizeProfile(raw: unknown): AiProfile {
     name:
       typeof obj.name === "string" && obj.name.trim()
         ? obj.name.trim()
-        : "未命名方案",
+        : "未命名模型",
     config: normalizeAiConfig((obj.config as Partial<AiConfig>) ?? {}),
   };
 }

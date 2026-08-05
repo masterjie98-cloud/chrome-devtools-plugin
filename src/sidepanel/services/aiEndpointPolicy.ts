@@ -32,6 +32,43 @@ export function assertSafeAiProviderUrl(value: string): URL {
   return new URL(value.trim());
 }
 
+export function resolveAiChatCompletionsUrl(value: string): string {
+  const url = assertSafeAiProviderUrl(value);
+  url.search = "";
+  url.hash = "";
+  const path = url.pathname.replace(/\/+$/, "");
+  if (path.endsWith("/chat/completions")) {
+    return url.toString();
+  }
+  if (!path || path.endsWith("/v1")) {
+    url.pathname = `${path || "/v1"}/chat/completions`;
+  }
+  return url.toString();
+}
+
+export function resolveAiModelsUrl(value: string): string {
+  const url = assertSafeAiProviderUrl(value);
+  url.search = "";
+  url.hash = "";
+  const path = url.pathname.replace(/\/+$/, "");
+  if (path.endsWith("/models")) {
+    throw new Error(
+      "API URL 不能填写模型列表地址；请填写 Provider 根地址、/v1 或 /chat/completions，聊天与模型列表会分别推导。",
+    );
+  }
+  if (path.endsWith("/chat/completions")) {
+    url.pathname = `${path.slice(0, -"/chat/completions".length)}/models`;
+    return url.toString();
+  }
+  if (!path || path.endsWith("/v1")) {
+    url.pathname = `${path || "/v1"}/models`;
+    return url.toString();
+  }
+  throw new Error(
+    "无法从自定义请求路径推导模型列表地址；请填写 Provider 根地址、/v1 或 /chat/completions。",
+  );
+}
+
 export function getAiProviderOrigin(value: string): string | undefined {
   try {
     return assertSafeAiProviderUrl(value).origin;

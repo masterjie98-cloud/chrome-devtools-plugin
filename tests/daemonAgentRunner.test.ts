@@ -138,6 +138,376 @@ test("daemon Agent persists a terminal failure before notifying the UI", async (
   );
 });
 
+test("daemon Agent waits for an explicit budget decision instead of auto-summarizing", async () => {
+  const runner = new DaemonAgentRunner(async (params) => {
+    const decision = await params.requestBudgetExtension?.({
+      kind: "sensitive_tool_calls",
+      label: "敏感读取工具调用",
+      used: 32,
+      requested: 1,
+      limit: 32,
+      increment: 32,
+      nextLimit: 64,
+      unit: "count",
+    });
+    assert.equal(decision, "continue");
+    const session = finalizeAgentSession(
+      createAgentSessionSnapshot("internal", params.input),
+      "completed",
+      "continued",
+    );
+    return { finalContent: "continued", session, status: "completed" };
+  });
+  const events: DaemonAgentEventPayload[] = [];
+  runner.start("profile-a", payload("run-budget", "conversation-budget"), {
+    executeTool: async () => ({}),
+    emit: (event) => events.push(event),
+    persistSession: () => undefined,
+  });
+
+  await waitFor(() => events.some((event) => event.kind === "budget_request"));
+  assert.equal(events.some((event) => event.kind === "completed"), false);
+  const request = events.find(
+    (event): event is Extract<DaemonAgentEventPayload, { kind: "budget_request" }> =>
+      event.kind === "budget_request",
+  );
+  assert.ok(request);
+  assert.equal(
+    runner.resolveBudgetDecision("profile-a", {
+      runId: request.runId,
+      conversationId: request.conversationId,
+      budgetRequestId: "stale-request",
+      decision: "continue",
+    }),
+    false,
+  );
+  assert.equal(
+    runner.resolveBudgetDecision("profile-a", {
+      runId: request.runId,
+      conversationId: request.conversationId,
+      budgetRequestId: request.budgetRequestId,
+      decision: "continue",
+    }),
+    true,
+  );
+  await waitFor(() => events.some((event) => event.kind === "completed"));
+});
+
+test("cancelling a pending budget decision releases the conversation for the next run", async () => {
+  let invocation = 0;
+  const runner = new DaemonAgentRunner(async (params) => {
+    invocation += 1;
+    if (invocation === 1) {
+      await params.requestBudgetExtension?.({
+        kind: "tool_calls",
+        label: "工具调用",
+        used: 128,
+        requested: 1,
+        limit: 128,
+        increment: 128,
+        nextLimit: 256,
+        unit: "count",
+      });
+    }
+    const session = finalizeAgentSession(
+      createAgentSessionSnapshot("internal", params.input),
+      "completed",
+      "done",
+    );
+    return { finalContent: "done", session, status: "completed" };
+  });
+  const events: DaemonAgentEventPayload[] = [];
+  const callbacks = {
+    executeTool: async () => ({}),
+    emit: (event: DaemonAgentEventPayload) => events.push(event),
+    persistSession: () => undefined,
+  };
+
+  runner.start("profile-a", payload("run-budget-cancel", "conversation-a"), callbacks);
+  await waitFor(() => events.some((event) => event.kind === "budget_request"));
+  assert.equal(
+    runner.cancel(
+      "profile-a",
+      "conversation-a",
+      "run-budget-cancel",
+      "interrupt with next message",
+    ),
+    true,
+  );
+  await waitFor(() => events.some((event) => event.kind === "failed"));
+
+  assert.doesNotThrow(() =>
+    runner.start("profile-a", payload("run-after-cancel", "conversation-a"), callbacks),
+  );
+  await waitFor(() =>
+    events.some(
+      (event) => event.kind === "completed" && event.runId === "run-after-cancel",
+    ),
+  );
+});
+
+test("daemon Agent stops a volatile external MCP duplicate loop after two executions", async () => {
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
+  const responses = [
+    ...Array.from({ length: 3 }, (_, index) => ({
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: `daemon-repeat-${index + 1}`,
+                type: "function",
+                function: {
+                  name: externalToolName,
+                  arguments: '{"query":"up"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    })),
+    {
+      choices: [
+        {
+          message: {
+            content: "相同 Prometheus 证据已足够，停止重复查询并完成总结。",
+          },
+        },
+      ],
+    },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  const restoreFetch = installDaemonAgentFetchFixture(
+    (index) => responses[index] ?? responses.at(-1)!,
+    requestBodies,
+  );
+  const events: DaemonAgentEventPayload[] = [];
+  const startPayload = payload(
+    "run-external-repeat",
+    "conversation-external-repeat",
+  );
+  startPayload.config.enableTools = true;
+  startPayload.config.maxToolRounds = 1;
+  startPayload.config.autoContinueAfterToolRoundLimit = true;
+  startPayload.runBudgetLimits = {
+    maxToolCalls: 2,
+    maxEffectfulToolCalls: 2,
+    maxSensitiveToolCalls: 2,
+  };
+  startPayload.tools = [
+    {
+      type: "function",
+      function: {
+        name: externalToolName,
+        description: "Query Prometheus.",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+          additionalProperties: false,
+        },
+      },
+      clientMetadata: {
+        source: "external_mcp",
+        displayName: "prometheus_query",
+        externalMcpServerId: "mcp_prometheus_inf",
+        externalMcpServerName: "Prometheus Infra MCP",
+        externalMcpToolName: "prometheus_query",
+      },
+    },
+  ];
+  let executionCount = 0;
+
+  try {
+    const runner = new DaemonAgentRunner();
+    runner.start("profile-a", startPayload, {
+      executeTool: async () => {
+        executionCount += 1;
+        return {
+          content: [],
+          structuredContent: {
+            observed_at: `2026-08-05T03:10:0${executionCount}Z`,
+            evidence_ref: `prometheus://prometheus-infra-0/query/${executionCount}`,
+            result_type: "vector",
+            data: [
+              {
+                metric: {},
+                value: [1_785_984_000 + executionCount, "12"],
+              },
+            ],
+          },
+        };
+      },
+      emit: (event) => events.push(event),
+      persistSession: () => undefined,
+    });
+
+    await waitFor(() =>
+      events.some(
+        (event) =>
+          event.kind === "completed" &&
+          event.runId === "run-external-repeat",
+      ),
+    );
+
+    const toolMessages = events.filter(
+      (event) =>
+        event.kind === "tool_message" &&
+        event.runId === "run-external-repeat",
+    );
+    const completed = events.find(
+      (event) =>
+        event.kind === "completed" &&
+        event.runId === "run-external-repeat",
+    );
+    assert.equal(executionCount, 2);
+    assert.equal(toolMessages.length, 2);
+    assert.equal(completed?.kind, "completed");
+    if (completed?.kind === "completed") {
+      assert.equal(completed.result.status, "blocked");
+      assert.match(completed.result.finalContent, /无进展循环/);
+    }
+    assert.equal(requestBodies.length, 4);
+    assert.equal(
+      Object.hasOwn(requestBodies.at(-1) ?? {}, "tools"),
+      false,
+    );
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("large MCP results stay detailed in the UI but are compacted before model reuse", async () => {
+  let modelResult = "";
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__resources_list_fixture";
+  const runner = new DaemonAgentRunner(async (params) => {
+    const results = await params.executeToolCalls(
+      [
+        {
+          id: "large-result-call",
+          name: externalToolName,
+          arguments: {},
+          rawArguments: "{}",
+        },
+      ],
+      params.assistantMessageId,
+    );
+    modelResult = results[0]?.content ?? "";
+    const session = finalizeAgentSession(
+      createAgentSessionSnapshot("internal", params.input),
+      "completed",
+      "done",
+    );
+    return { finalContent: "done", session, status: "completed" };
+  });
+  const events: DaemonAgentEventPayload[] = [];
+  const startPayload = payload("run-large-result", "conversation-large-result");
+  startPayload.tools = [
+    {
+      type: "function",
+      function: {
+        name: externalToolName,
+        parameters: { type: "object" },
+      },
+      clientMetadata: {
+        source: "external_mcp",
+        externalMcpToolName: "resources_list",
+      },
+    },
+  ];
+
+  runner.start("profile-a", startPayload, {
+    executeTool: async () => ({ text: `HEAD-${"x".repeat(180_000)}-TAIL` }),
+    emit: (event) => events.push(event),
+    persistSession: () => undefined,
+  });
+
+  await waitFor(() => events.some((event) => event.kind === "completed"));
+  const toolEvent = events.find(
+    (event): event is Extract<DaemonAgentEventPayload, { kind: "tool_message" }> =>
+      event.kind === "tool_message",
+  );
+  assert.ok(toolEvent);
+  assert.ok(toolEvent.message.content.length > 180_000);
+  assert.ok(modelResult.length <= 25_600);
+  assert.match(modelResult, /tool result compacted for model context/);
+  assert.match(modelResult, /-TAIL/);
+});
+
+test("daemon tool messages include redacted request arguments and MCP origin metadata", async () => {
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
+  const runner = new DaemonAgentRunner(async (params) => {
+    await params.executeToolCalls(
+      [
+        {
+          id: "call-prometheus-audit",
+          name: externalToolName,
+          arguments: { query: "up", password: "do-not-store" },
+          rawArguments: '{"query":"up","password":"do-not-store"}',
+        },
+      ],
+      params.assistantMessageId,
+    );
+    const session = finalizeAgentSession(
+      createAgentSessionSnapshot("internal", params.input),
+      "completed",
+      "done",
+    );
+    return { finalContent: "done", session, status: "completed" };
+  });
+  const events: DaemonAgentEventPayload[] = [];
+  const startPayload = payload("run-audit", "conversation-audit");
+  startPayload.tools = [
+    {
+      type: "function",
+      function: {
+        name: externalToolName,
+        description: "Query Prometheus",
+        parameters: { type: "object" },
+      },
+      clientMetadata: {
+        source: "external_mcp",
+        displayName: "prometheus_query",
+        externalMcpServerId: "mcp_prometheus_inf",
+        externalMcpServerName: "Prometheus Infra MCP",
+        externalMcpToolName: "prometheus_query",
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+    },
+  ];
+
+  runner.start("profile-a", startPayload, {
+    executeTool: async () => ({ status: "ok", targets: 8 }),
+    emit: (event) => events.push(event),
+    persistSession: () => undefined,
+  });
+
+  await waitFor(() => events.some((event) => event.kind === "completed"));
+  const toolEvent = events.find(
+    (event): event is Extract<DaemonAgentEventPayload, { kind: "tool_message" }> =>
+      event.kind === "tool_message",
+  );
+  assert.ok(toolEvent);
+  assert.equal(toolEvent.message.toolSource, "external_mcp");
+  assert.equal(toolEvent.message.toolDisplayName, "prometheus_query");
+  assert.equal(toolEvent.message.toolServerName, "Prometheus Infra MCP");
+  assert.match(toolEvent.message.requestArguments ?? "", /"query": "up"/);
+  assert.doesNotMatch(toolEvent.message.requestArguments ?? "", /do-not-store/);
+  assert.match(toolEvent.message.requestArguments ?? "", /\[redacted\]/);
+  assert.equal(toolEvent.message.resultMeta?.truncated, false);
+  assert.match(toolEvent.message.content, /"targets": 8/);
+});
+
 function payload(runId: string, conversationId: string): DaemonAgentStartPayload {
   return {
     runId,
@@ -188,4 +558,37 @@ async function waitFor(predicate: () => boolean): Promise<void> {
     }
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+function installDaemonAgentFetchFixture(
+  responsePayload: (requestIndex: number) => Record<string, unknown>,
+  requestBodies: Record<string, unknown>[],
+): () => void {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: globalThis,
+  });
+  let requestIndex = 0;
+  globalThis.fetch = (async (_input, init) => {
+    if (typeof init?.body === "string") {
+      requestBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+    }
+    const response = responsePayload(requestIndex);
+    requestIndex += 1;
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  return () => {
+    globalThis.fetch = originalFetch;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  };
 }

@@ -6,6 +6,7 @@ import { BrowserStateHub } from "../src/mcp/browserStateHub";
 import {
   appendAgentSessionEvent,
   createAgentSessionSnapshot,
+  finalizeAgentSession,
 } from "../src/shared/agentSession";
 import { createTestDataDirectory } from "./helpers/tempDataDir";
 
@@ -192,6 +193,78 @@ test("DaemonStateStore preserves a sanitized Agent snapshot and blocks an interr
       /原执行环境已经结束/,
     );
     assert.equal(snapshot.agentSessions[0]?.events.at(-1)?.type, "blocked");
+  } finally {
+    await dataDir.cleanup();
+  }
+});
+
+test("DaemonStateStore preserves Markdown line breaks in completed Agent messages", async () => {
+  const dataDir = await createTestDataDirectory("ai-devtools-state-markdown-");
+  const store = new DaemonStateStore({ statePath: dataDir.statePath });
+  const hub = new BrowserStateHub();
+  const finalContent = [
+    "## Kubernetes 状态报告",
+    "",
+    "- 节点：8 个 Ready",
+    "- Pod：26 个 Failed",
+    "",
+    "```text",
+    "namespace   deployment",
+    "default     ingress-controller",
+    "```",
+    "",
+    "Authorization: Bearer secret-token-value",
+  ].join("\r\n");
+
+  try {
+    await store.load();
+    const running = createAgentSessionSnapshot(
+      "agent-markdown",
+      "生成多行报告\n并保留 Markdown",
+      "2026-08-04T00:00:00.000Z",
+      {
+        taskId: "task-markdown",
+        conversationId: "conversation-markdown",
+        target: { tabId: 42 },
+      },
+      "assistant-markdown",
+    );
+    hub.setAgentSession(
+      finalizeAgentSession(
+        running,
+        "completed",
+        finalContent,
+        "2026-08-04T00:01:00.000Z",
+      ),
+      "profile-markdown",
+    );
+
+    store.scheduleBrowserState(hub.toPersistentState());
+    await store.flush();
+
+    const restoredState = await new DaemonStateStore({
+      statePath: dataDir.statePath,
+    }).load();
+    const restartedHub = new BrowserStateHub();
+    restartedHub.restorePersistentState(restoredState);
+    const restored = restartedHub.snapshot("profile-markdown").agentSessions[0];
+
+    assert.equal(restored?.input, "生成多行报告\n并保留 Markdown");
+    assert.equal(
+      restored?.finalContent,
+      finalContent
+        .replace(/\r\n/g, "\n")
+        .replace(
+          "Authorization: Bearer secret-token-value",
+          "Authorization=[REDACTED]",
+        ),
+    );
+    assert.match(restored?.finalContent ?? "", /\n\n- 节点/);
+    assert.match(restored?.finalContent ?? "", /```text\nnamespace {3}deployment/);
+    assert.equal(
+      restartedHub.snapshot("profile-markdown").lastAgentConclusion?.content,
+      restored?.finalContent,
+    );
   } finally {
     await dataDir.cleanup();
   }

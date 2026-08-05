@@ -224,15 +224,6 @@ async function writeLauncherScripts(answers) {
       pauseOnWin: true,
     }),
   ]);
-  files.push([
-    `拉取更新.${ext}`,
-    wrapperScript({
-      title: "拉取更新 (git pull + build)",
-      npmArgs: ["run", "update:local"],
-      pauseOnWin: true,
-    }),
-  ]);
-
   if (answers.mcpDebugScript) {
     files.push([
       `启动 MCP 调试.${ext}`,

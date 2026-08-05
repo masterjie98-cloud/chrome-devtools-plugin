@@ -3,11 +3,19 @@ import type { AgentSessionSnapshot } from "../shared/agentSession";
 import { finalizeAgentSession } from "../shared/agentSession";
 import { toAgentPageSnapshot } from "../shared/agentPageContext";
 import type {
+  DaemonAgentBudgetDecisionPayload,
   DaemonAgentEventPayload,
   DaemonAgentStartPayload,
 } from "../shared/daemonAgent";
+import type {
+  AgentRunBudgetExtensionDecision,
+  AgentRunBudgetExtensionRequest,
+} from "../shared/agentRunBudget";
 import type { ScreenshotCaptureResult } from "../shared/dom";
 import { MCP_TOOL_NAMES } from "../shared/mcpTools";
+import { isExternalMcpToolName } from "../shared/externalMcp";
+import { redactApprovalArguments } from "../shared/sensitiveData";
+import { sanitizeMultilineText } from "../shared/sanitize";
 import { assertSafeAiProviderUrl } from "../sidepanel/services/aiEndpointPolicy";
 import { executeAgentToolBatch } from "../sidepanel/services/agentToolBatch";
 import { isSuccessfulAgentToolResultContent } from "../sidepanel/services/agentToolResult";
@@ -16,7 +24,12 @@ import type {
   AiToolResultMessage,
 } from "../sidepanel/services/aiClient";
 import { runAutonomousAgentSession } from "../sidepanel/services/autonomousAgent";
-import { presentToolResult } from "../sidepanel/toolResultPresentation";
+import {
+  compactToolResultForModel,
+  presentToolResult,
+  toolResultModelCharLimit,
+} from "../sidepanel/toolResultPresentation";
+import type { ToolResultPresentationMeta } from "../sidepanel/toolResultPresentation";
 import type { ChatImageAttachment } from "../sidepanel/types";
 
 export interface DaemonAgentToolRequest {
@@ -36,10 +49,30 @@ export interface DaemonAgentRunnerCallbacks {
   persistSession: (session: DaemonAgentEventPayload & { kind: "session" }) => void;
 }
 
+const MAX_TOOL_REQUEST_DISPLAY_CHARS = 16_000;
+
+function formatToolRequestArguments(args: Record<string, unknown>): string {
+  try {
+    return sanitizeMultilineText(
+      JSON.stringify(redactApprovalArguments(args), null, 2),
+      MAX_TOOL_REQUEST_DISPLAY_CHARS,
+    );
+  } catch {
+    return "{\n  \"error\": \"请求参数无法序列化。\"\n}";
+  }
+}
+
 interface ActiveDaemonAgentRun {
   runId: string;
   conversationId: string;
   controller: AbortController;
+  pendingBudget?: {
+    id: string;
+    request: AgentRunBudgetExtensionRequest;
+    resolve: (decision: AgentRunBudgetExtensionDecision) => void;
+    reject: (error: unknown) => void;
+    cleanup: () => void;
+  };
 }
 
 export class DaemonAgentRunner {
@@ -66,7 +99,7 @@ export class DaemonAgentRunner {
     }
 
     const controller = new AbortController();
-    const active = {
+    const active: ActiveDaemonAgentRun = {
       runId: payload.runId,
       conversationId: payload.conversationId,
       controller,
@@ -97,6 +130,28 @@ export class DaemonAgentRunner {
     return true;
   }
 
+  resolveBudgetDecision(
+    sessionId: string,
+    payload: DaemonAgentBudgetDecisionPayload,
+  ): boolean {
+    const active = this.activeByConversation.get(
+      this.key(sessionId, payload.conversationId),
+    );
+    const pending = active?.pendingBudget;
+    if (
+      !active ||
+      active.runId !== payload.runId ||
+      !pending ||
+      pending.id !== payload.budgetRequestId
+    ) {
+      return false;
+    }
+    active.pendingBudget = undefined;
+    pending.cleanup();
+    pending.resolve(payload.decision);
+    return true;
+  }
+
   close(): void {
     for (const active of this.activeByConversation.values()) {
       active.controller.abort(
@@ -104,6 +159,28 @@ export class DaemonAgentRunner {
       );
     }
     this.activeByConversation.clear();
+  }
+
+  listPendingBudgetRequests(
+    sessionId: string,
+  ): Array<Extract<DaemonAgentEventPayload, { kind: "budget_request" }>> {
+    const prefix = `${sessionId}:`;
+    return Array.from(this.activeByConversation.entries()).flatMap(
+      ([key, active]) => {
+        if (!key.startsWith(prefix) || !active.pendingBudget) {
+          return [];
+        }
+        return [
+          {
+            runId: active.runId,
+            conversationId: active.conversationId,
+            kind: "budget_request" as const,
+            budgetRequestId: active.pendingBudget.id,
+            request: active.pendingBudget.request,
+          },
+        ];
+      },
+    );
   }
 
   private async run(
@@ -126,7 +203,8 @@ export class DaemonAgentRunner {
         executionBinding: payload.executionBinding,
         abortSignal: controller.signal,
         runBudgetLimits: payload.runBudgetLimits,
-        requestBudgetExtension: async () => "summarize",
+        requestBudgetExtension: (request) =>
+          this.requestBudgetDecision(sessionId, payload, callbacks, request),
         prepareContext: async (context) => {
           if (!payload.config.includePageContext) {
             return context;
@@ -244,6 +322,14 @@ export class DaemonAgentRunner {
             status,
           });
         },
+        onContextUsage: (report) => {
+          callbacks.emit({
+            runId: payload.runId,
+            conversationId: payload.conversationId,
+            kind: "context_usage",
+            report,
+          });
+        },
         onSessionUpdate: (session) => {
           const durableSession = {
             ...session,
@@ -340,6 +426,10 @@ export class DaemonAgentRunner {
     callbacks: DaemonAgentRunnerCallbacks,
   ): Promise<AiToolResultMessage[]> {
     type Prepared = { result: AiToolResultMessage; success: boolean };
+    const modelResultCharLimit = toolResultModelCharLimit(
+      payload.config.contextWindowTokens,
+      calls.length,
+    );
     const prepared = await executeAgentToolBatch<Prepared>(
       calls,
       async (call) => {
@@ -347,7 +437,17 @@ export class DaemonAgentRunner {
           throw signal.reason;
         }
         let content: string;
+        let displayContent: string;
         let attachments: ChatImageAttachment[] | undefined;
+        let resultMeta: ToolResultPresentationMeta;
+        const toolDefinition = payload.tools?.find(
+          (tool) => tool.function.name === call.name,
+        );
+        const clientMetadata = toolDefinition?.clientMetadata;
+        const toolSource =
+          clientMetadata?.source ??
+          (isExternalMcpToolName(call.name) ? "external_mcp" : "builtin");
+        const requestArguments = formatToolRequestArguments(call.arguments);
         try {
           if (call.name === "web_search" || call.name === "$web_search") {
             throw new Error(
@@ -366,20 +466,39 @@ export class DaemonAgentRunner {
           });
           if (isScreenshot(data)) {
             const redacted = { ...data, dataUrl: `[image:${data.mimeType};base64 omitted]` };
-            content = presentToolResult(redacted).content;
+            const presentation = presentToolResult(redacted);
+            displayContent = presentation.content;
+            content = compactToolResultForModel(
+              displayContent,
+              modelResultCharLimit,
+            );
+            resultMeta = presentation.meta;
             attachments = [screenshotAttachment(data, false)];
           } else {
-            content = presentToolResult(data).content;
+            const presentation = presentToolResult(data);
+            displayContent = presentation.content;
+            content = compactToolResultForModel(
+              displayContent,
+              modelResultCharLimit,
+            );
+            resultMeta = presentation.meta;
           }
         } catch (error) {
           if (signal.aborted) {
             throw error;
           }
-          content = JSON.stringify(
-            { error: error instanceof Error ? error.message : "MCP tool execution failed." },
-            null,
-            2,
+          const presentation = presentToolResult({
+            error:
+              error instanceof Error
+                ? error.message
+                : "MCP tool execution failed.",
+          });
+          displayContent = presentation.content;
+          content = compactToolResultForModel(
+            displayContent,
+            modelResultCharLimit,
           );
+          resultMeta = presentation.meta;
         }
         callbacks.emit({
           runId: payload.runId,
@@ -390,7 +509,15 @@ export class DaemonAgentRunner {
             assistantMessageId,
             toolCallId: call.id,
             toolName: call.name,
-            content,
+            toolSource,
+            toolDisplayName:
+              clientMetadata?.externalMcpToolName ??
+              clientMetadata?.displayName ??
+              call.name,
+            toolServerName: clientMetadata?.externalMcpServerName,
+            requestArguments,
+            content: displayContent,
+            resultMeta,
             createdAt: new Date().toISOString(),
             attachments,
           },
@@ -425,6 +552,59 @@ export class DaemonAgentRunner {
       },
     );
     return prepared.map((entry) => entry.result);
+  }
+
+  private requestBudgetDecision(
+    sessionId: string,
+    payload: DaemonAgentStartPayload,
+    callbacks: DaemonAgentRunnerCallbacks,
+    request: AgentRunBudgetExtensionRequest,
+  ): Promise<AgentRunBudgetExtensionDecision> {
+    const active = this.activeByConversation.get(
+      this.key(sessionId, payload.conversationId),
+    );
+    if (!active || active.runId !== payload.runId) {
+      throw new Error("AGENT_RUN_NOT_ACTIVE: budget decision target is no longer active.");
+    }
+    if (active.pendingBudget) {
+      throw new Error("AGENT_BUDGET_DECISION_PENDING: resolve the current request first.");
+    }
+    const budgetRequestId = createMessageId();
+    return new Promise<AgentRunBudgetExtensionDecision>((resolve, reject) => {
+      const signal = active.controller.signal;
+      const cleanup = () => signal.removeEventListener("abort", handleAbort);
+      const handleAbort = () => {
+        cleanup();
+        if (active.pendingBudget?.id === budgetRequestId) {
+          active.pendingBudget = undefined;
+        }
+        reject(
+          signal.reason ??
+            new DOMException("Agent run cancelled while awaiting budget approval.", "AbortError"),
+        );
+      };
+      signal.addEventListener("abort", handleAbort, { once: true });
+      active.pendingBudget = {
+        id: budgetRequestId,
+        request,
+        resolve,
+        reject,
+        cleanup,
+      };
+      try {
+        callbacks.emit({
+          runId: payload.runId,
+          conversationId: payload.conversationId,
+          kind: "budget_request",
+          budgetRequestId,
+          request,
+        });
+      } catch (error) {
+        active.pendingBudget = undefined;
+        cleanup();
+        reject(error);
+      }
+    });
   }
 
   private key(sessionId: string, conversationId: string): string {

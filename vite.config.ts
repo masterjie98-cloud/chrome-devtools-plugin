@@ -6,6 +6,11 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "dist",
+    // Chrome extension pages treat Vite's cross-origin modulepreload hints as
+    // cross-world resource mismatches. The entry module still loads its shared
+    // chunks normally, so omit preload hints instead of surfacing extension
+    // errors on every reload.
+    modulePreload: false,
     // The same dist/ directory also contains the packaged daemon and MCP
     // adapter. Extension-only rebuilds must not delete those Node entrypoints.
     emptyOutDir: false,

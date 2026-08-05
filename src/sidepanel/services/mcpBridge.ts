@@ -1,12 +1,21 @@
 import type { PageSnapshot } from "../../shared/dom";
 import type { AgentSessionSnapshot } from "../../shared/agentSession";
+import type { AiContextUsageSnapshot } from "../../shared/aiContextUsage";
 import type {
+  DaemonAgentBudgetDecisionPayload,
   DaemonAgentCompletionResult,
   DaemonAgentEventPayload,
   DaemonAgentStartPayload,
   DaemonAgentToolMessage,
 } from "../../shared/daemonAgent";
-import { daemonAgentResultFromSession } from "../../shared/daemonAgent";
+import type {
+  AgentRunBudgetExtensionDecision,
+  AgentRunBudgetExtensionRequest,
+} from "../../shared/agentRunBudget";
+import {
+  daemonAgentResultFromSession,
+  toDaemonAgentMessages,
+} from "../../shared/daemonAgent";
 import {
   sanitizeCollaborationItemInput,
   type CollaborationItemInput,
@@ -41,15 +50,21 @@ import {
   type LocalUpdateResultPayload,
   type LocalServiceStatusResultPayload,
   type LocalServiceSetResultPayload,
+  type ExternalMcpResultPayload,
   type McpToPluginMessage,
   type PluginChatMessageSnapshot,
   type PluginToMcpMessage,
   type ScreenshotSnapshot,
 } from "../../shared/wsProtocol";
+import type {
+  ExternalMcpServerConfig,
+  ExternalMcpServerSummary,
+} from "../../shared/externalMcp";
 import { WS_CLIENT_IDENTITIES } from "../../shared/wsClientIdentity";
 import {
   RUNTIME_BUILD_ID,
   RUNTIME_SCHEMA_HASH,
+  parseFailedProtocolAck,
   parseRuntimeHandshakeFailure,
   runtimeIdentityMismatch,
 } from "../../shared/runtimeIdentity";
@@ -65,6 +80,8 @@ type ApprovalCancellationHandler = (
 ) => void;
 
 const MCP_CONNECT_WAIT_MS = 6_000;
+const DAEMON_AGENT_START_TIMEOUT_MS = 15_000;
+const DAEMON_AGENT_CANCEL_RETRY_MS = 4_000;
 
 interface McpCallOptions {
   signal?: AbortSignal;
@@ -80,9 +97,37 @@ interface DaemonAgentHandlers {
   onStatusUpdate?: (status?: string) => void;
   onSessionUpdate?: (session: AgentSessionSnapshot) => void;
   onToolMessage?: (message: DaemonAgentToolMessage) => void;
+  onContextUsage?: (report: AiContextUsageSnapshot) => void;
+  onBudgetExtensionRequest?: (
+    request: AgentRunBudgetExtensionRequest & {
+      budgetRequestId: string;
+      runId: string;
+      conversationId: string;
+    },
+  ) => Promise<AgentRunBudgetExtensionDecision>;
+  onBudgetExtensionCancelled?: (budgetRequestId: string) => void;
 }
 
-class McpBridge {
+interface ActiveDaemonAgentRun {
+  conversationId: string;
+  handlers: DaemonAgentHandlers;
+  resolve: (value: DaemonAgentCompletionResult) => void;
+  reject: (error: Error) => void;
+  cleanup?: () => void;
+  signal?: AbortSignal;
+  pendingBudgetRequestId?: string;
+  cancelRequestId?: string;
+  cancelReason?: string;
+  cancelRetryTimer?: number;
+  terminalError?: Error;
+}
+
+interface McpBridgeOptions {
+  daemonAgentStartTimeoutMs?: number;
+  daemonAgentCancelRetryMs?: number;
+}
+
+export class McpBridge {
   private socket: WebSocket | null = null;
   private authenticatedSocket: WebSocket | null = null;
   private connectionId: string | null = null;
@@ -145,6 +190,14 @@ class McpBridge {
       timeout: number;
     }
   >();
+  private pendingExternalMcpRequests = new Map<
+    string,
+    {
+      resolve: (value: ExternalMcpResultPayload) => void;
+      reject: (error: Error) => void;
+      timeout: number;
+    }
+  >();
   private pendingDaemonAgentStarts = new Map<
     string,
     {
@@ -153,18 +206,22 @@ class McpBridge {
       timeout: number;
     }
   >();
-  private activeDaemonAgentRuns = new Map<
+  private pendingDaemonAgentCancels = new Map<
     string,
     {
-      conversationId: string;
-      handlers: DaemonAgentHandlers;
-      resolve: (value: DaemonAgentCompletionResult) => void;
-      reject: (error: Error) => void;
-      cleanup?: () => void;
+      runId: string;
+      timeout: number;
     }
   >();
+  private activeDaemonAgentRuns = new Map<string, ActiveDaemonAgentRun>();
+  private readonly daemonAgentStartTimeoutMs: number;
+  private readonly daemonAgentCancelRetryMs: number;
 
-  constructor() {
+  constructor(options: McpBridgeOptions = {}) {
+    this.daemonAgentStartTimeoutMs =
+      options.daemonAgentStartTimeoutMs ?? DAEMON_AGENT_START_TIMEOUT_MS;
+    this.daemonAgentCancelRetryMs =
+      options.daemonAgentCancelRetryMs ?? DAEMON_AGENT_CANCEL_RETRY_MS;
     subscribeBridgeTokenChanges(() => {
       const previousSocket = this.socket;
       this.rejectPendingMcpToolCalls((toolName) =>
@@ -177,6 +234,7 @@ class McpBridge {
       this.authenticatedSocket = null;
       this.connectionId = null;
       this.stopHeartbeat();
+      this.resetDaemonAgentCancelRequestsForReconnect();
       previousSocket?.close();
       this.connect();
     });
@@ -223,6 +281,8 @@ class McpBridge {
       this.rejectPendingMcpToolListRequests(
         "MCP tool list connection closed before a result was returned.",
       );
+      this.rejectPendingExternalMcpRequests("外部 MCP 连接已中断，请重试。");
+      this.resetDaemonAgentCancelRequestsForReconnect();
       this.scheduleReconnect();
     });
     socket.addEventListener("error", () => {
@@ -370,6 +430,123 @@ class McpBridge {
     });
   }
 
+  async listExternalMcpServers(): Promise<ExternalMcpServerSummary[]> {
+    return this.requestExternalMcp({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.EXTERNAL_MCP_LIST,
+      sentAt: new Date().toISOString(),
+      payload: {},
+    });
+  }
+
+  async upsertExternalMcpServer(
+    server: ExternalMcpServerConfig,
+  ): Promise<ExternalMcpServerSummary[]> {
+    return this.requestExternalMcp({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.EXTERNAL_MCP_UPSERT,
+      sentAt: new Date().toISOString(),
+      payload: { server },
+    });
+  }
+
+  async removeExternalMcpServer(
+    serverId: string,
+  ): Promise<ExternalMcpServerSummary[]> {
+    return this.requestExternalMcp({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.EXTERNAL_MCP_REMOVE,
+      sentAt: new Date().toISOString(),
+      payload: { serverId },
+    });
+  }
+
+  async setExternalMcpServerEnabled(
+    serverId: string,
+    enabled: boolean,
+  ): Promise<ExternalMcpServerSummary[]> {
+    return this.requestExternalMcp({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.EXTERNAL_MCP_SET_ENABLED,
+      sentAt: new Date().toISOString(),
+      payload: { serverId, enabled },
+    });
+  }
+
+  async setExternalMcpServerReadOnlyTrust(
+    serverId: string,
+    trusted: boolean,
+  ): Promise<ExternalMcpServerSummary[]> {
+    return this.requestExternalMcp({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST,
+      sentAt: new Date().toISOString(),
+      payload: { serverId, trusted },
+    });
+  }
+
+  async setExternalMcpServerAutoApprove(
+    serverId: string,
+    enabled: boolean,
+  ): Promise<ExternalMcpServerSummary[]> {
+    return this.requestExternalMcp({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE,
+      sentAt: new Date().toISOString(),
+      payload: { serverId, enabled },
+    });
+  }
+
+  async testExternalMcpServer(
+    serverId: string,
+  ): Promise<ExternalMcpServerSummary[]> {
+    return this.requestExternalMcp({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.EXTERNAL_MCP_TEST,
+      sentAt: new Date().toISOString(),
+      payload: { serverId },
+    });
+  }
+
+  private async requestExternalMcp(
+    message: Extract<
+      PluginToMcpMessage,
+      {
+        command:
+          | typeof WS_COMMANDS.EXTERNAL_MCP_LIST
+          | typeof WS_COMMANDS.EXTERNAL_MCP_UPSERT
+          | typeof WS_COMMANDS.EXTERNAL_MCP_REMOVE
+          | typeof WS_COMMANDS.EXTERNAL_MCP_SET_ENABLED
+          | typeof WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST
+          | typeof WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE
+          | typeof WS_COMMANDS.EXTERNAL_MCP_TEST;
+      }
+    >,
+  ): Promise<ExternalMcpServerSummary[]> {
+    await this.waitUntilOpen();
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Daemon 未连接，无法管理外部 MCP。");
+    }
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        this.pendingExternalMcpRequests.delete(message.requestId);
+        reject(new Error("外部 MCP 操作超时。"));
+      }, 65_000);
+      this.pendingExternalMcpRequests.set(message.requestId, {
+        resolve: (payload) => {
+          if (payload.ok) {
+            resolve(payload.servers);
+          } else {
+            reject(new Error(payload.error));
+          }
+        },
+        reject,
+        timeout,
+      });
+      this.socket?.send(JSON.stringify(message));
+    });
+  }
+
   setTaskContext(
     taskId: string,
     egressDestinations: string[],
@@ -510,6 +687,9 @@ class McpBridge {
       throw browserAbortError(signal);
     }
     await this.waitUntilOpen();
+    if (signal?.aborted) {
+      throw browserAbortError(signal);
+    }
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error("Daemon 未连接，无法启动后台 Agent。");
     }
@@ -517,25 +697,24 @@ class McpBridge {
       throw new Error(`AGENT_RUN_DUPLICATE: ${payload.runId}`);
     }
     const requestId = createMessageId();
+    const wirePayload: DaemonAgentStartPayload = {
+      ...payload,
+      messages: toDaemonAgentMessages(payload.messages),
+    };
     const message: PluginToMcpMessage = {
       requestId,
       command: WS_COMMANDS.DAEMON_AGENT_START,
       sentAt: new Date().toISOString(),
-      payload,
+      payload: wirePayload,
     };
 
     return new Promise((resolve, reject) => {
       const abort = () => {
-        this.send({
-          requestId: createMessageId(),
-          command: WS_COMMANDS.DAEMON_AGENT_CANCEL,
-          sentAt: new Date().toISOString(),
-          payload: {
-            runId: payload.runId,
-            conversationId: payload.conversationId,
-            reason: "Sidepanel requested cancellation.",
-          },
-        });
+        this.markDaemonAgentStartAccepted(payload.runId);
+        this.requestDaemonAgentCancellation(
+          payload.runId,
+          "Sidepanel requested cancellation.",
+        );
       };
       signal?.addEventListener("abort", abort, { once: true });
       const cleanup = signal
@@ -547,14 +726,22 @@ class McpBridge {
         resolve,
         reject,
         cleanup,
+        signal,
       });
       const timeout = window.setTimeout(() => {
         this.pendingDaemonAgentStarts.delete(requestId);
         const active = this.activeDaemonAgentRuns.get(payload.runId);
-        active?.cleanup?.();
-        this.activeDaemonAgentRuns.delete(payload.runId);
-        reject(new Error("启动 daemon Agent 超时。"));
-      }, 15_000);
+        if (!active) {
+          return;
+        }
+        active.terminalError = new Error(
+          "启动 daemon Agent 超时；已请求 daemon 取消并核对旧任务状态。",
+        );
+        this.requestDaemonAgentCancellation(
+          payload.runId,
+          "Daemon Agent start acknowledgement timed out.",
+        );
+      }, this.daemonAgentStartTimeoutMs);
       this.pendingDaemonAgentStarts.set(requestId, {
         runId: payload.runId,
         reject,
@@ -569,12 +756,130 @@ class McpBridge {
     conversationId: string,
     reason = "Sidepanel requested cancellation.",
   ): void {
+    const active = this.activeDaemonAgentRuns.get(runId);
+    if (active?.conversationId === conversationId) {
+      this.markDaemonAgentStartAccepted(runId);
+      this.requestDaemonAgentCancellation(runId, reason);
+      return;
+    }
     this.send({
       requestId: createMessageId(),
       command: WS_COMMANDS.DAEMON_AGENT_CANCEL,
       sentAt: new Date().toISOString(),
       payload: { runId, conversationId, reason },
     });
+  }
+
+  private requestDaemonAgentCancellation(runId: string, reason: string): void {
+    const active = this.activeDaemonAgentRuns.get(runId);
+    if (!active || active.cancelRequestId) {
+      return;
+    }
+    active.cancelReason = reason;
+    if (active.cancelRetryTimer !== undefined) {
+      window.clearTimeout(active.cancelRetryTimer);
+      active.cancelRetryTimer = undefined;
+    }
+    const requestId = createMessageId();
+    active.cancelRequestId = requestId;
+    const timeout = window.setTimeout(() => {
+      this.pendingDaemonAgentCancels.delete(requestId);
+      const current = this.activeDaemonAgentRuns.get(runId);
+      if (!current || current.cancelRequestId !== requestId) {
+        return;
+      }
+      current.cancelRequestId = undefined;
+      if (this.isConnected()) {
+        this.requestDaemonAgentCancellation(
+          runId,
+          current.cancelReason ?? reason,
+        );
+      }
+    }, this.daemonAgentCancelRetryMs);
+    this.pendingDaemonAgentCancels.set(requestId, { runId, timeout });
+    this.send({
+      requestId,
+      command: WS_COMMANDS.DAEMON_AGENT_CANCEL,
+      sentAt: new Date().toISOString(),
+      payload: {
+        runId,
+        conversationId: active.conversationId,
+        reason,
+      },
+    });
+  }
+
+  private resetDaemonAgentCancelRequestsForReconnect(): void {
+    const staleRequestIds = new Set(this.pendingDaemonAgentCancels.keys());
+    for (const pending of this.pendingDaemonAgentCancels.values()) {
+      window.clearTimeout(pending.timeout);
+      const active = this.activeDaemonAgentRuns.get(pending.runId);
+      if (active) {
+        active.cancelRequestId = undefined;
+      }
+    }
+    this.pendingDaemonAgentCancels.clear();
+    for (const active of this.activeDaemonAgentRuns.values()) {
+      if (active.cancelRetryTimer !== undefined) {
+        window.clearTimeout(active.cancelRetryTimer);
+        active.cancelRetryTimer = undefined;
+      }
+    }
+    this.queue = this.queue.filter(
+      (message) =>
+        message.command !== WS_COMMANDS.DAEMON_AGENT_CANCEL ||
+        !staleRequestIds.has(message.requestId),
+    );
+  }
+
+  private reconcileDaemonAgentCancellations(): void {
+    for (const [runId, active] of this.activeDaemonAgentRuns) {
+      if (!active.cancelReason || active.cancelRequestId) {
+        continue;
+      }
+      this.requestDaemonAgentCancellation(runId, active.cancelReason);
+    }
+  }
+
+  private settleDaemonAgentRun(
+    runId: string,
+    result?: DaemonAgentCompletionResult,
+    error?: Error,
+  ): void {
+    const active = this.activeDaemonAgentRuns.get(runId);
+    if (!active) {
+      return;
+    }
+    this.markDaemonAgentStartAccepted(runId);
+    for (const [requestId, pending] of this.pendingDaemonAgentCancels) {
+      if (pending.runId !== runId) {
+        continue;
+      }
+      window.clearTimeout(pending.timeout);
+      this.pendingDaemonAgentCancels.delete(requestId);
+    }
+    if (active.cancelRetryTimer !== undefined) {
+      window.clearTimeout(active.cancelRetryTimer);
+    }
+    if (active.pendingBudgetRequestId) {
+      active.handlers.onBudgetExtensionCancelled?.(
+        active.pendingBudgetRequestId,
+      );
+    }
+    active.cleanup?.();
+    this.activeDaemonAgentRuns.delete(runId);
+    const terminalError = active.terminalError ?? error;
+    if (terminalError) {
+      active.reject(terminalError);
+      return;
+    }
+    if (result) {
+      active.resolve(result);
+      return;
+    }
+    active.reject(
+      browserAbortError(active.signal),
+    );
   }
 
   private sendRequestCancel(targetRequestId: string, reason: string): void {
@@ -586,7 +891,11 @@ class McpBridge {
     });
   }
 
-  async listMcpTools(): Promise<McpAvailableTool[]> {
+  async listMcpTools(options: {
+    includeLocal?: boolean;
+    includeExternal?: boolean;
+    externalServerIds?: string[];
+  } = {}): Promise<McpAvailableTool[]> {
     await this.waitUntilOpen();
 
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
@@ -599,7 +908,11 @@ class McpBridge {
       command: WS_COMMANDS.MCP_LIST_TOOLS,
       sentAt: new Date().toISOString(),
       payload: {
-        includeExternal: true,
+        includeLocal: options.includeLocal ?? true,
+        includeExternal: options.includeExternal ?? true,
+        ...(options.externalServerIds?.length
+          ? { externalServerIds: options.externalServerIds }
+          : {}),
       },
     };
 
@@ -748,6 +1061,25 @@ class McpBridge {
     raw: unknown,
     socket: WebSocket,
   ): Promise<void> {
+    const failedAck = parseFailedProtocolAck(raw);
+    if (failedAck) {
+      const pendingStart = this.pendingDaemonAgentStarts.get(
+        failedAck.requestId,
+      );
+      if (pendingStart) {
+        window.clearTimeout(pendingStart.timeout);
+        this.pendingDaemonAgentStarts.delete(failedAck.requestId);
+        const error = new Error(
+          `Daemon Agent 启动请求被拒绝：${failedAck.error}`,
+        );
+        if (this.activeDaemonAgentRuns.has(pendingStart.runId)) {
+          this.settleDaemonAgentRun(pendingStart.runId, undefined, error);
+        } else {
+          pendingStart.reject(error);
+        }
+        return;
+      }
+    }
     const handshakeFailure = parseRuntimeHandshakeFailure(raw);
     if (handshakeFailure) {
       this.lastConnectionFailure = handshakeFailure;
@@ -775,6 +1107,7 @@ class McpBridge {
       this.connectionId = message.payload.connectionId;
       this.startHeartbeat(socket, message.payload.sessionId);
       this.flushQueue();
+      this.reconcileDaemonAgentCancellations();
       return;
     }
 
@@ -789,12 +1122,22 @@ class McpBridge {
         window.clearTimeout(pending.timeout);
         this.pendingDaemonAgentStarts.delete(message.requestId);
         if (!message.payload.ok) {
-          const active = this.activeDaemonAgentRuns.get(pending.runId);
-          active?.cleanup?.();
-          this.activeDaemonAgentRuns.delete(pending.runId);
-          pending.reject(new Error(message.payload.error));
+          const error = new Error(message.payload.error);
+          if (this.activeDaemonAgentRuns.has(pending.runId)) {
+            this.settleDaemonAgentRun(pending.runId, undefined, error);
+          } else {
+            pending.reject(error);
+          }
         }
       }
+      return;
+    }
+
+    if (message.command === WS_COMMANDS.DAEMON_AGENT_CANCEL_RESULT) {
+      this.handleDaemonAgentCancelResult(
+        message.requestId,
+        message.payload,
+      );
       return;
     }
 
@@ -810,6 +1153,16 @@ class McpBridge {
 
     if (message.command === WS_COMMANDS.MCP_LIST_TOOLS_RESULT) {
       this.resolveMcpToolListRequest(message.requestId, message.payload);
+      return;
+    }
+
+    if (message.command === WS_COMMANDS.EXTERNAL_MCP_RESULT) {
+      const pending = this.pendingExternalMcpRequests.get(message.requestId);
+      if (pending) {
+        window.clearTimeout(pending.timeout);
+        this.pendingExternalMcpRequests.delete(message.requestId);
+        pending.resolve(message.payload);
+      }
       return;
     }
 
@@ -893,17 +1246,113 @@ class McpBridge {
       case "tool_message":
         active.handlers.onToolMessage?.(event.message);
         return;
+      case "context_usage":
+        active.handlers.onContextUsage?.(event.report);
+        return;
+      case "budget_request":
+        void this.resolveDaemonAgentBudgetRequest(event);
+        return;
       case "completed":
-        active.cleanup?.();
-        this.activeDaemonAgentRuns.delete(event.runId);
-        active.resolve(event.result);
+        this.settleDaemonAgentRun(event.runId, event.result);
         return;
       case "failed":
-        active.cleanup?.();
-        this.activeDaemonAgentRuns.delete(event.runId);
-        active.reject(new Error(event.error));
+        this.settleDaemonAgentRun(
+          event.runId,
+          undefined,
+          new Error(event.error),
+        );
         return;
     }
+  }
+
+  private handleDaemonAgentCancelResult(
+    requestId: string,
+    payload: Extract<
+      McpToPluginMessage,
+      { command: typeof WS_COMMANDS.DAEMON_AGENT_CANCEL_RESULT }
+    >["payload"],
+  ): void {
+    const pending = this.pendingDaemonAgentCancels.get(requestId);
+    if (!pending || pending.runId !== payload.runId) {
+      return;
+    }
+    window.clearTimeout(pending.timeout);
+    this.pendingDaemonAgentCancels.delete(requestId);
+    const active = this.activeDaemonAgentRuns.get(payload.runId);
+    if (!active || active.conversationId !== payload.conversationId) {
+      return;
+    }
+    if (active.cancelRequestId === requestId) {
+      active.cancelRequestId = undefined;
+    }
+    this.markDaemonAgentStartAccepted(payload.runId);
+    if (payload.session) {
+      this.handleDaemonAgentSessionSync(payload.session);
+    }
+    const current = this.activeDaemonAgentRuns.get(payload.runId);
+    if (!current) {
+      return;
+    }
+    if (!payload.accepted) {
+      this.settleDaemonAgentRun(payload.runId);
+      return;
+    }
+    current.cancelRetryTimer = window.setTimeout(() => {
+      const latest = this.activeDaemonAgentRuns.get(payload.runId);
+      if (!latest) {
+        return;
+      }
+      latest.cancelRetryTimer = undefined;
+      this.requestDaemonAgentCancellation(
+        payload.runId,
+        latest.cancelReason ?? "Sidepanel requested cancellation.",
+      );
+    }, this.daemonAgentCancelRetryMs);
+  }
+
+  private async resolveDaemonAgentBudgetRequest(
+    event: Extract<DaemonAgentEventPayload, { kind: "budget_request" }>,
+  ): Promise<void> {
+    const active = this.activeDaemonAgentRuns.get(event.runId);
+    if (!active || active.conversationId !== event.conversationId) {
+      return;
+    }
+    const handler = active.handlers.onBudgetExtensionRequest;
+    if (!handler) {
+      this.cancelDaemonAgentRun(
+        event.runId,
+        event.conversationId,
+        "Agent reached a safety budget but no confirmation UI is available.",
+      );
+      return;
+    }
+    active.pendingBudgetRequestId = event.budgetRequestId;
+    const decision = await handler({
+      ...event.request,
+      budgetRequestId: event.budgetRequestId,
+      runId: event.runId,
+      conversationId: event.conversationId,
+    });
+    const current = this.activeDaemonAgentRuns.get(event.runId);
+    if (!current || current !== active) {
+      return;
+    }
+    if (current.pendingBudgetRequestId !== event.budgetRequestId) {
+      return;
+    }
+    current.pendingBudgetRequestId = undefined;
+    const payload: DaemonAgentBudgetDecisionPayload = {
+      runId: event.runId,
+      conversationId: event.conversationId,
+      budgetRequestId: event.budgetRequestId,
+      decision,
+    };
+    this.send({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.DAEMON_AGENT_BUDGET_DECISION,
+      sentAt: new Date().toISOString(),
+      payload,
+    });
   }
 
   private handleDaemonAgentSessionSync(session: AgentSessionSnapshot): void {
@@ -920,9 +1369,7 @@ class McpBridge {
     if (!result) {
       return;
     }
-    active.cleanup?.();
-    this.activeDaemonAgentRuns.delete(session.id);
-    active.resolve(result);
+    this.settleDaemonAgentRun(session.id, result);
   }
 
   private markDaemonAgentStartAccepted(runId: string): void {
@@ -1149,6 +1596,14 @@ class McpBridge {
       this.pendingMcpToolListRequests.delete(requestId);
     }
   }
+
+  private rejectPendingExternalMcpRequests(message: string): void {
+    for (const [requestId, pending] of this.pendingExternalMcpRequests) {
+      window.clearTimeout(pending.timeout);
+      pending.reject(new Error(message));
+      this.pendingExternalMcpRequests.delete(requestId);
+    }
+  }
 }
 
 function parseServerMessage(raw: unknown): McpToPluginMessage | null {
@@ -1161,12 +1616,14 @@ function parseServerMessage(raw: unknown): McpToPluginMessage | null {
       (parsed.command === WS_COMMANDS.MCP_LIST_TOOLS_RESULT ||
         parsed.command === WS_COMMANDS.SERVER_WELCOME ||
         parsed.command === WS_COMMANDS.MCP_TOOL_RESULT ||
+        parsed.command === WS_COMMANDS.EXTERNAL_MCP_RESULT ||
         parsed.command === WS_COMMANDS.LOCAL_UPDATE_CHECK_RESULT ||
         parsed.command === WS_COMMANDS.LOCAL_UPDATE_RESULT ||
         parsed.command === WS_COMMANDS.LOCAL_SERVICE_STATUS_RESULT ||
         parsed.command === WS_COMMANDS.LOCAL_SERVICE_SET_RESULT ||
         parsed.command === WS_COMMANDS.AGENT_SESSION_SYNC ||
         parsed.command === WS_COMMANDS.DAEMON_AGENT_START_RESULT ||
+        parsed.command === WS_COMMANDS.DAEMON_AGENT_CANCEL_RESULT ||
         parsed.command === WS_COMMANDS.DAEMON_AGENT_EVENT ||
         parsed.command === WS_COMMANDS.APPROVAL_REQUEST ||
         parsed.command === WS_COMMANDS.APPROVAL_CANCELLED ||

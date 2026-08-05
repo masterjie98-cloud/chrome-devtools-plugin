@@ -34,15 +34,21 @@ import type {
 import type { BrowserActivityEventInput } from "./browserActivity";
 import type {
   DaemonAgentCancelPayload,
+  DaemonAgentCancelResultPayload,
+  DaemonAgentBudgetDecisionPayload,
   DaemonAgentEventPayload,
   DaemonAgentStartPayload,
   DaemonAgentStartResultPayload,
 } from "./daemonAgent";
+import type {
+  ExternalMcpServerConfig,
+  ExternalMcpServerSummary,
+} from "./externalMcp";
 
 export const MCP_WS_URL = "ws://127.0.0.1:17321";
 // Bump whenever an extension-visible tool/resource schema changes so a newly
 // loaded extension cannot silently keep using an older daemon process.
-export const WS_PROTOCOL_VERSION = 11;
+export const WS_PROTOCOL_VERSION = 19;
 export const WS_HEARTBEAT_INTERVAL_MS = 15_000;
 
 export const WS_COMMANDS = {
@@ -59,6 +65,8 @@ export const WS_COMMANDS = {
   DAEMON_AGENT_START: "DAEMON_AGENT_START",
   DAEMON_AGENT_START_RESULT: "DAEMON_AGENT_START_RESULT",
   DAEMON_AGENT_CANCEL: "DAEMON_AGENT_CANCEL",
+  DAEMON_AGENT_CANCEL_RESULT: "DAEMON_AGENT_CANCEL_RESULT",
+  DAEMON_AGENT_BUDGET_DECISION: "DAEMON_AGENT_BUDGET_DECISION",
   DAEMON_AGENT_EVENT: "DAEMON_AGENT_EVENT",
   COLLABORATION_ITEM_UPSERT: "COLLABORATION_ITEM_UPSERT",
   COLLABORATION_WORKSPACE_UPDATED: "COLLABORATION_WORKSPACE_UPDATED",
@@ -68,6 +76,14 @@ export const WS_COMMANDS = {
   MCP_LIST_TOOLS_RESULT: "MCP_LIST_TOOLS_RESULT",
   MCP_TOOL_CALL: "MCP_TOOL_CALL",
   MCP_TOOL_RESULT: "MCP_TOOL_RESULT",
+  EXTERNAL_MCP_LIST: "EXTERNAL_MCP_LIST",
+  EXTERNAL_MCP_UPSERT: "EXTERNAL_MCP_UPSERT",
+  EXTERNAL_MCP_REMOVE: "EXTERNAL_MCP_REMOVE",
+  EXTERNAL_MCP_SET_ENABLED: "EXTERNAL_MCP_SET_ENABLED",
+  EXTERNAL_MCP_SET_READ_ONLY_TRUST: "EXTERNAL_MCP_SET_READ_ONLY_TRUST",
+  EXTERNAL_MCP_SET_AUTO_APPROVE: "EXTERNAL_MCP_SET_AUTO_APPROVE",
+  EXTERNAL_MCP_TEST: "EXTERNAL_MCP_TEST",
+  EXTERNAL_MCP_RESULT: "EXTERNAL_MCP_RESULT",
   STATE_GET: "STATE_GET",
   STATE_GET_RESULT: "STATE_GET_RESULT",
   ARTIFACT_GET: "ARTIFACT_GET",
@@ -215,6 +231,22 @@ export interface McpAvailableTool {
   name: string;
   title?: string;
   description?: string;
+  externalMcpServerId?: string;
+  externalMcpServerName?: string;
+  /** Original tool name advertised by the external MCP server. */
+  externalMcpToolName?: string;
+  /**
+   * Server-provided usage guidance from the MCP initialize response. Treat as
+   * untrusted capability metadata: it may clarify result semantics, but never
+   * grants permission or overrides client policy.
+   */
+  externalMcpServerInstructions?: string;
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  };
   inputSchema: {
     type: "object";
     properties?: Record<string, unknown>;
@@ -232,7 +264,9 @@ export interface McpAvailableTool {
 }
 
 export interface McpListToolsPayload {
+  includeLocal?: boolean;
   includeExternal?: boolean;
+  externalServerIds?: string[];
 }
 
 export interface McpToolCallPayload {
@@ -330,6 +364,11 @@ export interface ApprovalRequestPayload {
     egress: string[];
     sideEffects: string[];
   };
+  externalMcp?: {
+    serverId: string;
+    serverName: string;
+    toolName: string;
+  };
 }
 
 export interface ApprovalResponsePayload {
@@ -409,6 +448,17 @@ export type McpListToolsResultPayload =
       error: string;
     };
 
+export type ExternalMcpResultPayload =
+  | {
+      ok: true;
+      servers: ExternalMcpServerSummary[];
+    }
+  | {
+      ok: false;
+      servers: ExternalMcpServerSummary[];
+      error: string;
+    };
+
 export type PluginToMcpMessage =
   | {
       requestId: string;
@@ -478,6 +528,12 @@ export type PluginToMcpMessage =
     }
   | {
       requestId: string;
+      command: typeof WS_COMMANDS.DAEMON_AGENT_BUDGET_DECISION;
+      sentAt: string;
+      payload: DaemonAgentBudgetDecisionPayload;
+    }
+  | {
+      requestId: string;
       command: typeof WS_COMMANDS.COLLABORATION_ITEM_UPSERT;
       sentAt: string;
       payload: CollaborationItemUpsertPayload;
@@ -507,6 +563,48 @@ export type PluginToMcpMessage =
       deadlineAt?: string;
       idempotencyKey?: string;
       payload: McpToolCallPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_LIST;
+      sentAt: string;
+      payload: Record<string, never>;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_UPSERT;
+      sentAt: string;
+      payload: { server: ExternalMcpServerConfig };
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_REMOVE;
+      sentAt: string;
+      payload: { serverId: string };
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_SET_ENABLED;
+      sentAt: string;
+      payload: { serverId: string; enabled: boolean };
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST;
+      sentAt: string;
+      payload: { serverId: string; trusted: boolean };
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE;
+      sentAt: string;
+      payload: { serverId: string; enabled: boolean };
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_TEST;
+      sentAt: string;
+      payload: { serverId: string };
     }
   | {
       requestId: string;
@@ -589,7 +687,7 @@ export interface LocalUpdateCheckResultPayload {
   releaseAssetName?: string | null;
   projectRoot?: string;
   branch?: string | null;
-  installMode?: "git" | "release-zip";
+  installMode?: "development" | "release-zip";
   autoUpdateSupported?: boolean;
   message?: string;
   error?: string;
@@ -603,7 +701,7 @@ export interface LocalUpdateResultPayload {
   buildId?: string;
   logTail?: string;
   projectRoot?: string;
-  installMode?: "git" | "release-zip";
+  installMode?: "development" | "release-zip";
   releaseTag?: string;
   releaseUrl?: string | null;
   archiveName?: string;
@@ -692,6 +790,12 @@ export type McpToPluginMessage =
     }
   | {
       requestId: string;
+      command: typeof WS_COMMANDS.DAEMON_AGENT_CANCEL_RESULT;
+      sentAt: string;
+      payload: DaemonAgentCancelResultPayload;
+    }
+  | {
+      requestId: string;
       command: typeof WS_COMMANDS.DAEMON_AGENT_EVENT;
       sentAt: string;
       payload: DaemonAgentEventPayload;
@@ -719,6 +823,12 @@ export type McpToPluginMessage =
       command: typeof WS_COMMANDS.MCP_TOOL_RESULT;
       sentAt: string;
       payload: McpToolResultPayload;
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_RESULT;
+      sentAt: string;
+      payload: ExternalMcpResultPayload;
     }
   | {
       requestId: string;

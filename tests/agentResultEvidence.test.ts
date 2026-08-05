@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   arbitrateAgentFinalResult,
   createAgentResultEvidenceState,
+  needsSelfContainedReportRepair,
   recordAgentResultEvidence,
 } from "../src/sidepanel/services/agentResultEvidence";
 
@@ -65,6 +66,37 @@ test("result arbiter requires an independent read after a successful mutation", 
   assert.deepEqual(decision, { accepted: true });
 });
 
+test("external MCP calls are not browser mutation or verification evidence", () => {
+  let state = createAgentResultEvidenceState("点击保存按钮并确认页面更新");
+  state = recordAgentResultEvidence(
+    state,
+    [
+      {
+        id: "external-query",
+        name: "extmcp__prometheus__query_deadbee",
+        arguments: { query: "up" },
+        rawArguments: '{"query":"up"}',
+      },
+    ],
+    [
+      {
+        toolCallId: "external-query",
+        name: "extmcp__prometheus__query_deadbee",
+        content: '{"status":"success"}',
+      },
+    ],
+  );
+
+  assert.equal(state.mutationAttemptCount, 0);
+  assert.equal(state.successfulMutationCount, 0);
+  assert.equal(state.independentlyVerified, false);
+  const decision = arbitrateAgentFinalResult(state, "已经点击并保存成功。");
+  assert.equal(decision.accepted, false);
+  if (!decision.accepted) {
+    assert.equal(decision.code, "UNSUPPORTED_BROWSER_EFFECT_CLAIM");
+  }
+});
+
 test("result arbiter does not turn ordinary factual answers into browser tasks", () => {
   const state = createAgentResultEvidenceState("解释浏览器是怎么工作的");
   assert.deepEqual(
@@ -84,5 +116,32 @@ test("result arbiter treats a saved-cursor activity summary as read-only evidenc
       "页面停留在登录页，期间已刷新 5 次，共观察到 25 条 Network 请求。",
     ),
     { accepted: true },
+  );
+});
+
+test("report arbiter rejects a short final answer that points to a missing report above", () => {
+  assert.equal(
+    needsSelfContainedReportRepair(
+      "生成 Kubernetes 服务状态报告，包含节点、Pod 和异常 Deployment。",
+      "Kubernetes 服务状态报告已完整生成，所有关键维度均已验证。报告如上所示。",
+      6,
+    ),
+    true,
+  );
+  assert.equal(
+    needsSelfContainedReportRepair(
+      "生成 Kubernetes 服务状态报告。",
+      "## 集群状态\n\n| 状态 | 数量 |\n| --- | ---: |\n| Running | 643 |",
+      2,
+    ),
+    false,
+  );
+  assert.equal(
+    needsSelfContainedReportRepair(
+      "解释 CSS 盒模型。",
+      "示意图如上所示。",
+      1,
+    ),
+    false,
   );
 });

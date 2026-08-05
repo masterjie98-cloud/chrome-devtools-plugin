@@ -16,7 +16,6 @@
     "daemon:service-plan": "node scripts/manage-local-service.mjs print --dry-run",
     "client:config": "node scripts/print-client-config.mjs",
     "setup:local": "node scripts/setup-local-scaffold.mjs",
-    "update:local": "node scripts/update-local.mjs",
     "release": "release-it",
     "release:dry": "release-it --dry-run",
     "version:sync-manifest": "node scripts/sync-manifest-version.mjs",

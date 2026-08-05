@@ -570,6 +570,74 @@ export function hasExplicitToolPolicy(toolName: string): boolean {
   return Boolean(normalizedName && POLICY_CLASS_BY_TOOL.has(normalizedName));
 }
 
+export function createTrustedExternalReadOnlyPolicy(
+  toolName: string,
+  annotations: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  },
+): ToolPolicy | undefined {
+  if (
+    annotations.readOnlyHint !== true ||
+    annotations.destructiveHint === true
+  ) {
+    return undefined;
+  }
+  return {
+    toolName,
+    policyClass: "sensitive_read",
+    known: true,
+    requiresApproval: false,
+    sensitive: true,
+    mutatesBrowser: false,
+    destructive: false,
+    idempotent: true,
+    openWorld: annotations.openWorldHint !== false,
+    effect: "read",
+    dataSensitivity: "unknown",
+    approvalMode: "none",
+    reason:
+      "The user explicitly trusts this MCP server's read-only annotations; this declared read-only tool may run without repeated approval.",
+  };
+}
+
+export function createTrustedExternalAutoRunPolicy(
+  toolName: string,
+  annotations: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  } = {},
+): ToolPolicy {
+  const readOnly =
+    annotations.readOnlyHint === true && annotations.destructiveHint !== true;
+  const destructive = annotations.destructiveHint === true;
+  return {
+    toolName,
+    policyClass: destructive
+      ? "destructive_write"
+      : readOnly
+        ? "sensitive_read"
+        : "open_world",
+    known: true,
+    requiresApproval: false,
+    sensitive: true,
+    mutatesBrowser: false,
+    destructive,
+    idempotent: readOnly || annotations.idempotentHint === true,
+    openWorld: annotations.openWorldHint !== false,
+    effect: readOnly ? "read" : "unknown",
+    dataSensitivity: "unknown",
+    approvalMode: "none",
+    capability: "external.open_world",
+    reason:
+      "The user explicitly enabled automatic execution for every tool from this external MCP server.",
+  };
+}
+
 function buildPolicyIndex(): Map<McpToolName, ToolPolicyClass> {
   const result = new Map<McpToolName, ToolPolicyClass>();
 

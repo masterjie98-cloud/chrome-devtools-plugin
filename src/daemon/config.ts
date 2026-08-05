@@ -9,11 +9,16 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import {
+  normalizeExternalMcpServers,
+  type ExternalMcpServerConfig,
+} from "../shared/externalMcp";
 
 export interface DaemonConfig {
   bridgeToken: string;
   configPath: string;
   allowedExtensionIds: string[];
+  externalMcpServers: ExternalMcpServerConfig[];
 }
 
 export interface DaemonDataPaths {
@@ -31,6 +36,7 @@ export interface LoadDaemonConfigOptions {
 interface StoredDaemonConfig {
   bridgeToken: string;
   allowedExtensionIds?: string[];
+  externalMcpServers?: ExternalMcpServerConfig[];
 }
 
 const MAX_ALLOWED_EXTENSION_IDS = 32;
@@ -88,6 +94,7 @@ export async function loadDaemonConfig(
       configPath,
       allowedExtensionIds:
         environmentExtensionIds ?? existing?.allowedExtensionIds ?? [],
+      externalMcpServers: existing?.externalMcpServers ?? [],
     };
   }
 
@@ -105,6 +112,7 @@ export async function loadDaemonConfig(
       configPath,
       allowedExtensionIds:
         environmentExtensionIds ?? existing.allowedExtensionIds ?? [],
+      externalMcpServers: existing.externalMcpServers ?? [],
     };
   }
 
@@ -116,6 +124,7 @@ export async function loadDaemonConfig(
         {
           bridgeToken,
           allowedExtensionIds: environmentExtensionIds ?? [],
+          externalMcpServers: [],
         } satisfies StoredDaemonConfig,
         null,
         2,
@@ -135,6 +144,7 @@ export async function loadDaemonConfig(
       configPath,
       allowedExtensionIds:
         environmentExtensionIds ?? raced.allowedExtensionIds ?? [],
+      externalMcpServers: raced.externalMcpServers ?? [],
     };
   }
   await chmod(configPath, 0o600);
@@ -142,6 +152,7 @@ export async function loadDaemonConfig(
     bridgeToken,
     configPath,
     allowedExtensionIds: environmentExtensionIds ?? [],
+    externalMcpServers: [],
   };
 }
 
@@ -166,6 +177,7 @@ export async function addAllowedExtensionId(
   const next: StoredDaemonConfig = {
     bridgeToken: stored?.bridgeToken ?? loaded.bridgeToken,
     allowedExtensionIds,
+    externalMcpServers: stored?.externalMcpServers ?? loaded.externalMcpServers,
   };
   await ensureConfigDirectory(
     dirname(paths.configPath),
@@ -176,6 +188,39 @@ export async function addAllowedExtensionId(
     bridgeToken: next.bridgeToken,
     configPath: paths.configPath,
     allowedExtensionIds,
+    externalMcpServers: next.externalMcpServers ?? [],
+  };
+}
+
+export async function saveExternalMcpServers(
+  servers: ExternalMcpServerConfig[],
+  options: LoadDaemonConfigOptions = {},
+): Promise<DaemonConfig> {
+  const environment = options.environment ?? process.env;
+  const paths = options.paths ?? resolveDaemonDataPaths(environment);
+  const normalizedServers = normalizeExternalMcpServers(servers);
+  const loaded = await loadDaemonConfig({ environment, paths });
+  const stored = await readStoredConfig(paths.configPath);
+  if (!stored && environment.AI_DEVTOOLS_BRIDGE_TOKEN?.trim()) {
+    throw new Error(
+      "Cannot persist external MCP servers while the bridge token exists only in AI_DEVTOOLS_BRIDGE_TOKEN.",
+    );
+  }
+  const next: StoredDaemonConfig = {
+    bridgeToken: stored?.bridgeToken ?? loaded.bridgeToken,
+    allowedExtensionIds: stored?.allowedExtensionIds ?? loaded.allowedExtensionIds,
+    externalMcpServers: normalizedServers,
+  };
+  await ensureConfigDirectory(
+    dirname(paths.configPath),
+    paths.dataDir === dirname(paths.configPath),
+  );
+  await writeStoredConfigAtomic(paths.configPath, next);
+  return {
+    bridgeToken: next.bridgeToken,
+    configPath: paths.configPath,
+    allowedExtensionIds: next.allowedExtensionIds ?? [],
+    externalMcpServers: normalizedServers,
   };
 }
 
@@ -229,8 +274,11 @@ async function readStoredConfig(
     (parsed as StoredDaemonConfig).allowedExtensionIds ?? [],
     "daemon config allowedExtensionIds",
   );
+  const externalMcpServers = normalizeExternalMcpServers(
+    (parsed as StoredDaemonConfig).externalMcpServers ?? [],
+  );
   await chmod(configPath, 0o600);
-  return { bridgeToken, allowedExtensionIds };
+  return { bridgeToken, allowedExtensionIds, externalMcpServers };
 }
 
 function parseAllowedExtensionIds(

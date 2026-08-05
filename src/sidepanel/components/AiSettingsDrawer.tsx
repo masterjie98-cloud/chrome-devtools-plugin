@@ -1,5 +1,6 @@
 import Alert from "antd/es/alert";
 import AntApp from "antd/es/app";
+import AutoComplete from "antd/es/auto-complete";
 import Button from "antd/es/button";
 import Divider from "antd/es/divider";
 import Drawer from "antd/es/drawer";
@@ -11,19 +12,19 @@ import Select from "antd/es/select";
 import Space from "antd/es/space";
 import Switch from "antd/es/switch";
 import Tag from "antd/es/tag";
+import Tabs from "antd/es/tabs";
 import Tooltip from "antd/es/tooltip";
 import Typography from "antd/es/typography";
 import { useEffect, useState } from "react";
 import type { AiConfig, AiProfile, AiProfilesState } from "../services/aiConfig";
 import {
+  addAiModelsToState,
+  applyAiModelCapabilities,
   DEFAULT_AI_CONFIG,
   MAX_TOOL_ROUNDS,
   getActiveConfig,
 } from "../services/aiConfig";
-import {
-  detectAiCapabilities,
-  type AiCapabilityProbeResult,
-} from "../services/aiClient";
+import { detectAiCapabilities } from "../services/aiClient";
 import {
   getBridgeToken,
   saveBridgeToken,
@@ -45,32 +46,44 @@ import {
   hasAiProviderOriginChanged,
   validateAiProviderUrl,
 } from "../services/aiEndpointPolicy";
+import {
+  fetchAiModelCatalog,
+  type AiModelCatalogResult,
+} from "../services/aiModelCatalog";
 import { mcpBridge } from "../services/mcpBridge";
+import type { ExternalMcpServerSummary } from "../../shared/externalMcp";
+import { McpSettingsSection } from "./McpSettingsSection";
 
 interface AiSettingsDrawerProps {
   open: boolean;
+  initialTab: AiSettingsTab;
   profilesState: AiProfilesState;
   bridgeConnected: boolean;
   activeTargetLabel?: string;
   pageContextSynced: boolean;
   onClose: () => void;
   onSave: (state: AiProfilesState) => Promise<void>;
+  onMcpServersChange?: (servers: ExternalMcpServerSummary[]) => void;
 }
+
+export type AiSettingsTab = "model" | "mcp" | "page" | "local";
 
 function generateId(): string {
   return `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 }
 
-type ConfigFormValues = AiConfig & { profileName: string };
+type ConfigFormValues = AiConfig;
 
 export function AiSettingsDrawer({
   open,
+  initialTab,
   profilesState,
   bridgeConnected,
   activeTargetLabel,
   pageContextSynced,
   onClose,
   onSave,
+  onMcpServersChange,
 }: AiSettingsDrawerProps) {
   const [form] = Form.useForm<ConfigFormValues>();
   const { modal, message } = AntApp.useApp();
@@ -92,6 +105,12 @@ export function AiSettingsDrawer({
   // Local copy of profiles so edits don't commit until Save
   const [localState, setLocalState] = useState<AiProfilesState>(profilesState);
   const [detecting, setDetecting] = useState(false);
+  const [modelCatalogLoading, setModelCatalogLoading] = useState(false);
+  const [modelCatalog, setModelCatalog] =
+    useState<AiModelCatalogResult | null>(null);
+  const [selectedCatalogModels, setSelectedCatalogModels] = useState<string[]>(
+    [],
+  );
   const [bridgeToken, setBridgeToken] = useState("");
   const [installationId, setInstallationId] = useState("");
   const [savingBridge, setSavingBridge] = useState(false);
@@ -106,7 +125,10 @@ export function AiSettingsDrawer({
     useState<LocalServiceStatusResultPayload | null>(null);
   const [localServiceLoading, setLocalServiceLoading] = useState(false);
   const [localServiceSaving, setLocalServiceSaving] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<AiSettingsTab>(initialTab);
   const runningVersion = getRunningExtensionVersion();
+  const latestVersion =
+    updateCheck?.latestReleaseVersion || updateNotice?.version || runningVersion;
   const daemonConnected = bridgeConnected || mcpBridge.isConnected();
 
   const refreshLocalServiceStatus = async () => {
@@ -212,12 +234,47 @@ export function AiSettingsDrawer({
   // When active profile changes, sync form
   useEffect(() => {
     if (activeProfile) {
-      form.setFieldsValue({
-        ...activeProfile.config,
-        profileName: activeProfile.name,
-      });
+      form.setFieldsValue(activeProfile.config);
     }
   }, [activeProfile, form]);
+
+  useEffect(() => {
+    setModelCatalog(null);
+    setSelectedCatalogModels([]);
+  }, [apiUrl, localState.activeProfileId]);
+
+  const loadModelCatalog = async () => {
+    setSubmitError(undefined);
+    setModelCatalogLoading(true);
+    try {
+      await form.validateFields(["apiUrl"]);
+      const values = form.getFieldsValue(["apiUrl", "apiKey"]);
+      const nextApiUrl = String(values.apiUrl ?? "").trim();
+      const apiKey = String(values.apiKey ?? "").trim();
+      if (
+        apiKey &&
+        activeProfile &&
+        hasAiProviderOriginChanged(activeProfile.config.apiUrl, nextApiUrl) &&
+        !(await confirmModelCatalogRequest(
+          modal,
+          activeProfile.config.apiUrl,
+          nextApiUrl,
+        ))
+      ) {
+        return;
+      }
+      const result = await fetchAiModelCatalog({ apiUrl: nextApiUrl, apiKey });
+      setModelCatalog(result);
+      message.success(`已获取 ${result.models.length} 个模型。`);
+    } catch (error) {
+      setModelCatalog(null);
+      setSubmitError(
+        error instanceof Error ? error.message : "获取模型列表失败。",
+      );
+    } finally {
+      setModelCatalogLoading(false);
+    }
+  };
 
   const switchProfile = (id: string) => {
     // Persist current form edits before switching
@@ -226,21 +283,47 @@ export function AiSettingsDrawer({
     setLocalState({ ...updated, activeProfileId: id });
   };
 
-  const addProfile = () => {
-    const newProfile: AiProfile = {
-      id: generateId(),
-      name: `方案 ${localState.profiles.length + 1}`,
-      config: { ...getActiveConfig(localState), apiKey: "" },
-    };
+  const addModel = () => {
     const values = form.getFieldsValue(true);
     const updated = syncFormToState(localState, values);
+    const sourceConfig = getActiveConfig(updated);
+    const newProfile: AiProfile = {
+      id: generateId(),
+      name: "新模型",
+      config: {
+        ...sourceConfig,
+        model: "",
+        supportsVision: false,
+        supportsWebSearch: false,
+        includeImageHistory: false,
+        enableWebSearch: false,
+        capabilityDetection: {},
+      },
+    };
     setLocalState({
       profiles: [...updated.profiles, newProfile],
       activeProfileId: newProfile.id,
     });
   };
 
-  const deleteProfile = () => {
+  const addSelectedCatalogModels = () => {
+    const values = form.getFieldsValue(true);
+    const updated = syncFormToState(localState, values);
+    const result = addAiModelsToState(
+      updated,
+      selectedCatalogModels,
+      getActiveConfig(updated),
+    );
+    if (result.addedProfileIds.length === 0) {
+      message.info("所选模型已全部添加。");
+      return;
+    }
+    setLocalState(result.state);
+    setSelectedCatalogModels([]);
+    message.success(`已添加 ${result.addedProfileIds.length} 个模型。`);
+  };
+
+  const deleteModel = () => {
     if (localState.profiles.length <= 1) return;
     const remaining = localState.profiles.filter(
       (p) => p.id !== localState.activeProfileId,
@@ -292,7 +375,11 @@ export function AiSettingsDrawer({
       fastAgentEgressConfirmed =
         providerOriginChanged && activeConfig.fastAgentMode;
       const result = await detectAiCapabilities(activeConfig);
-      const finalState = applyCapabilityProbeResult(syncedState, result);
+      const finalState = applyAiModelCapabilities(
+        syncedState,
+        syncedState.activeProfileId,
+        result,
+      );
       const nextConfig = getActiveConfig(finalState);
       if (
         nextConfig.fastAgentMode &&
@@ -306,7 +393,7 @@ export function AiSettingsDrawer({
       await onSave(finalState);
     } catch (error) {
       setSubmitError(
-        error instanceof Error ? error.message : "AI 配置保存失败，请重试。",
+        error instanceof Error ? error.message : "模型保存失败，请重试。",
       );
     } finally {
       setDetecting(false);
@@ -329,55 +416,37 @@ export function AiSettingsDrawer({
 
   return (
     <Drawer
-      title="AI 配置"
-      width={480}
+      className="ai-settings-drawer"
+      title="设置"
+      width={600}
       open={open}
       onClose={onClose}
       destroyOnClose
     >
       <Form form={form} layout="vertical" initialValues={activeProfile?.config}>
-        {/* ── 配置方案 ─────────────────────────────────── */}
-        <Typography.Text className="settings-section-title">
-          配置方案
-        </Typography.Text>
-
-        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-          <Select
-            style={{ flex: 1 }}
-            value={localState.activeProfileId}
-            onChange={switchProfile}
-            options={localState.profiles.map((p) => ({
-              value: p.id,
-              label: p.name,
-            }))}
-          />
-          <Tooltip title="新建方案（复制当前配置）">
-            <Button onClick={addProfile}>+ 新建</Button>
-          </Tooltip>
-          <Popconfirm
-            title="删除此配置方案？"
-            okText="删除"
-            cancelText="取消"
-            disabled={localState.profiles.length <= 1}
-            onConfirm={deleteProfile}
-          >
-            <Button danger disabled={localState.profiles.length <= 1}>
-              删除
-            </Button>
-          </Popconfirm>
-        </div>
-
-        <Form.Item
-          label="方案名称"
-          name="profileName"
-          rules={[{ required: true, message: "请输入方案名称" }]}
-        >
-          <Input placeholder="例如：GPT-4o / DeepSeek R1 / Claude" />
-        </Form.Item>
-
-        <Divider />
+        <Tabs
+          className="settings-tabs"
+          activeKey={settingsTab}
+          onChange={(tab) => {
+            if (
+              tab === "model" ||
+              tab === "mcp" ||
+              tab === "page" ||
+              tab === "local"
+            ) {
+              setSettingsTab(tab);
+            }
+          }}
+          items={[
+            { key: "model", label: "模型管理" },
+            { key: "mcp", label: "MCP" },
+            { key: "page", label: "页面与工具" },
+            { key: "local", label: "本机与更新" },
+          ]}
+        />
 
         {/* ── 连接 ─────────────────────────────────────── */}
+        <section hidden={settingsTab !== "local"} className="settings-tab-panel">
         <Typography.Text className="settings-section-title">
           连接
         </Typography.Text>
@@ -387,7 +456,7 @@ export function AiSettingsDrawer({
             <div>
               <Typography.Text strong>本地版本与更新</Typography.Text>
               <Typography.Paragraph type="secondary">
-                已连接的 daemon 会按安装模式更新：开发目录使用 git，Release ZIP 安装会下载、校验、覆盖并重启。
+                自动更新只接受正式 Release ZIP 与对应 SHA-256；源码开发目录不会执行 git、安装依赖或构建。
               </Typography.Paragraph>
             </div>
             <Tag color={daemonConnected ? "green" : "default"}>
@@ -395,12 +464,19 @@ export function AiSettingsDrawer({
             </Tag>
           </div>
           <div className="settings-connection-status__grid">
-            <span>扩展版本</span>
-            <Typography.Text code>v{runningVersion}</Typography.Text>
-            <span>磁盘版本</span>
-            <Typography.Text code>
-              {updateNotice?.version ? `v${updateNotice.version}` : "—"}
-            </Typography.Text>
+            {latestVersion === runningVersion ? (
+              <>
+                <span>当前版本</span>
+                <Typography.Text code>v{runningVersion}</Typography.Text>
+              </>
+            ) : (
+              <>
+                <span>当前版本</span>
+                <Typography.Text code>v{runningVersion}</Typography.Text>
+                <span>最新版本</span>
+                <Typography.Text code>v{latestVersion}</Typography.Text>
+              </>
+            )}
           </div>
           {!daemonConnected ? (
             <Alert
@@ -409,17 +485,7 @@ export function AiSettingsDrawer({
               style={{ marginTop: 12 }}
               message="仅扩展模式不能自动更新"
               description={
-                <Space direction="vertical" size={4}>
-                  <Typography.Text>
-                    已安装用户请先启动 daemon；尚未安装的用户请手动下载最新 Release ZIP。
-                  </Typography.Text>
-                  <Typography.Text code copyable={{ text: "npm run update:local" }}>
-                    npm run update:local
-                  </Typography.Text>
-                  <Typography.Text type="secondary">
-                    上述命令仅用于 git clone 的开发目录。ZIP 安装不需要 git 或重新构建。
-                  </Typography.Text>
-                </Space>
+                "已安装用户请先启动 daemon；尚未安装的用户请手动下载最新 Release ZIP。源码目录由维护者自行更新，不提供应用内 git 更新。"
               }
             />
           ) : null}
@@ -441,25 +507,22 @@ export function AiSettingsDrawer({
               description={`磁盘 ${updateNotice.version} 已就绪。点「重载扩展」或到 chrome://extensions 重新加载。`}
             />
           ) : null}
-          <Space direction="vertical" style={{ width: "100%", marginTop: 12 }} size={8}>
-            <Button block loading={checkingUpdate} onClick={() => void checkForUpdates()}>
+          <div className="settings-update-actions">
+            <Button loading={checkingUpdate} onClick={() => void checkForUpdates()}>
               {daemonConnected ? "检查更新" : "查看更新说明 / 检查重载"}
             </Button>
             <Button
-              block
               type="primary"
               disabled={
                 !daemonConnected ||
-                (updateCheck?.updateAvailable === true &&
-                  updateCheck.autoUpdateSupported === false)
+                updateCheck?.autoUpdateSupported === false
               }
               loading={runningUpdate}
               onClick={() => void runDaemonUpdate()}
             >
-              由 Daemon 执行更新
+              下载并安装 Release ZIP
             </Button>
             <Button
-              block
               disabled={!promptReload || !updateNotice}
               onClick={() => {
                 if (!updateNotice) {
@@ -473,7 +536,7 @@ export function AiSettingsDrawer({
             >
               重载扩展
             </Button>
-          </Space>
+          </div>
           {daemonConnected && localService?.ok && localService.supported ? (
             <div style={{ marginTop: 16 }}>
               <div
@@ -590,6 +653,46 @@ export function AiSettingsDrawer({
             {installationId || "加载中…"}
           </Typography.Text>
         </Form.Item>
+        </section>
+
+        <section hidden={settingsTab !== "model"} className="settings-tab-panel">
+        <div className="settings-model-manager">
+          <div className="settings-section-heading">
+            <div>
+              <Typography.Text strong>模型管理</Typography.Text>
+              <Typography.Paragraph type="secondary">
+                每个模型独立保存连接信息和能力；聊天输入框可直接切换。
+              </Typography.Paragraph>
+            </div>
+            <Button onClick={addModel}>手动添加</Button>
+          </div>
+          <div className="settings-model-toolbar">
+            <Select
+              className="settings-model-select"
+              value={localState.activeProfileId}
+              onChange={switchProfile}
+              options={localState.profiles.map((profile) => ({
+                value: profile.id,
+                label: profile.config.model || "未填写模型 ID",
+              }))}
+              aria-label="选择要编辑的模型"
+            />
+            <Popconfirm
+              title="删除这个模型？"
+              description="仅删除本地保存的模型信息，不会影响 Provider。"
+              okText="删除"
+              cancelText="取消"
+              disabled={localState.profiles.length <= 1}
+              onConfirm={deleteModel}
+            >
+              <Button danger disabled={localState.profiles.length <= 1}>
+                删除
+              </Button>
+            </Popconfirm>
+          </div>
+        </div>
+
+        <Divider />
 
         <Form.Item
           label="API URL"
@@ -618,12 +721,80 @@ export function AiSettingsDrawer({
         </Form.Item>
 
         <Form.Item
-          label="Model"
-          name="model"
-          rules={[{ required: true, message: "请输入模型名" }]}
+          label="模型 ID"
+          extra={
+            modelCatalog
+              ? `已从 ${modelCatalog.requestUrl} 获取 ${modelCatalog.models.length} 个模型。`
+              : "可手动输入，也可从当前 Provider 获取模型列表后批量添加。"
+          }
         >
-          <Input placeholder="gpt-4.1-mini / deepseek-chat / claude-3-5-sonnet" />
+          <Space.Compact block>
+            <Form.Item
+              name="model"
+              noStyle
+              rules={[{ required: true, message: "请输入模型名" }]}
+            >
+              <AutoComplete
+                style={{ flex: 1 }}
+                options={(modelCatalog?.models ?? []).map((model) => ({
+                  value: model,
+                  label: model,
+                }))}
+                filterOption={(input, option) =>
+                  String(option?.value ?? "")
+                    .toLocaleLowerCase()
+                    .includes(input.toLocaleLowerCase())
+                }
+                placeholder="gpt-4.1-mini / deepseek-chat / Kimi-K2.7-Code"
+              />
+            </Form.Item>
+            <Button
+              loading={modelCatalogLoading}
+              onClick={() => void loadModelCatalog()}
+            >
+              获取列表
+            </Button>
+          </Space.Compact>
         </Form.Item>
+
+        {modelCatalog ? (
+          <div className="settings-model-catalog">
+            <div>
+              <Typography.Text strong>从列表添加模型</Typography.Text>
+              <Typography.Paragraph type="secondary">
+                选择一个或多个模型；已添加到当前 API URL 的模型会自动忽略。
+              </Typography.Paragraph>
+            </div>
+            <div className="settings-model-catalog-actions">
+              <Select
+                mode="multiple"
+                allowClear
+                showSearch
+                maxTagCount="responsive"
+                value={selectedCatalogModels}
+                onChange={setSelectedCatalogModels}
+                options={modelCatalog.models.map((model) => ({
+                  value: model,
+                  label: model,
+                  disabled: localState.profiles.some(
+                    (profile) =>
+                      profile.config.apiUrl.trim() === apiUrl.trim() &&
+                      profile.config.model.trim() === model,
+                  ),
+                }))}
+                placeholder="选择要添加的模型"
+                aria-label="选择要添加的模型"
+              />
+              <Button
+                type="primary"
+                disabled={selectedCatalogModels.length === 0}
+                onClick={addSelectedCatalogModels}
+              >
+                添加选中模型
+              </Button>
+            </div>
+          </div>
+        ) : null}
 
         <Divider />
 
@@ -740,8 +911,10 @@ export function AiSettingsDrawer({
         </div>
 
         <Divider />
+        </section>
 
         {/* ── 页面上下文 ────────────────────────────────── */}
+        <section hidden={settingsTab !== "page"} className="settings-tab-panel">
         <Typography.Text className="settings-section-title">
           页面上下文
         </Typography.Text>
@@ -804,27 +977,45 @@ export function AiSettingsDrawer({
             <InputNumber min={0} max={16000} step={500} />
           </Form.Item>
         </Space>
+        </section>
 
-        <Alert
-          type="info"
-          showIcon
-          message="API Key 可选；留空时不会发送 Authorization 请求头。有值时仅保存在当前 Chrome Profile 的扩展存储中，不写入 localStorage。"
-          style={{ marginBottom: 16 }}
-        />
+        <section hidden={settingsTab !== "mcp"} className="settings-tab-panel">
+          <McpSettingsSection
+            daemonConnected={daemonConnected}
+            onServersChange={onMcpServersChange}
+          />
+        </section>
 
-        {submitError ? (
+        {settingsTab === "model" ? (
           <Alert
-            type="error"
+            type="info"
             showIcon
-            message="保存失败"
-            description={submitError}
+            message="API Key 可选；留空时不会发送 Authorization 请求头。有值时仅保存在当前 Chrome Profile 的扩展存储中，不写入 localStorage。"
             style={{ marginBottom: 16 }}
           />
         ) : null}
 
-        <Button type="primary" block onClick={submit} loading={detecting}>
-          {detecting ? "检测模型能力..." : "检测并保存配置"}
-        </Button>
+        {settingsTab === "model" || settingsTab === "page" ? (
+          <>
+            {submitError ? (
+              <Alert
+                type="error"
+                showIcon
+                message="保存失败"
+                description={submitError}
+                style={{ marginBottom: 16 }}
+              />
+            ) : null}
+
+            <Button type="primary" block onClick={submit} loading={detecting}>
+              {detecting
+                ? "检测模型能力..."
+                : settingsTab === "model"
+                  ? "保存模型"
+                  : "保存页面与工具设置"}
+            </Button>
+          </>
+        ) : null}
       </Form>
     </Drawer>
   );
@@ -872,6 +1063,38 @@ function confirmProviderOriginChange(
   });
 }
 
+function confirmModelCatalogRequest(
+  modal: ReturnType<typeof AntApp.useApp>["modal"],
+  previousUrl: string,
+  nextUrl: string,
+): Promise<boolean> {
+  const previousOrigin = getAiProviderOrigin(previousUrl) ?? previousUrl;
+  const nextOrigin = getAiProviderOrigin(nextUrl) ?? nextUrl;
+  return new Promise((resolve) => {
+    modal.confirm({
+      title: "确认向新 Provider 查询模型？",
+      content: (
+        <Space direction="vertical" size={8}>
+          <Typography.Text>
+            点击继续后，会立即向新的目标发送 GET /v1/models，并携带当前模型的 API Key：
+          </Typography.Text>
+          <Typography.Text code>{previousOrigin}</Typography.Text>
+          <Typography.Text code>{nextOrigin}</Typography.Text>
+          <Typography.Text type="secondary">
+            仅在你信任该 Provider 时继续；响应只用于填充模型选择列表。
+          </Typography.Text>
+        </Space>
+      ),
+      okText: "确认并查询",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      centered: true,
+      onOk: () => resolve(true),
+      onCancel: () => resolve(false),
+    });
+  });
+}
+
 function confirmFastAgentModeEnable(
   modal: ReturnType<typeof AntApp.useApp>["modal"],
   providerUrl: string,
@@ -908,10 +1131,6 @@ function syncFormToState(
   values: Partial<ConfigFormValues>,
 ): AiProfilesState {
   const activeConfig = getActiveConfig(state);
-  const profileName =
-    typeof values.profileName === "string" && values.profileName.trim()
-      ? values.profileName.trim()
-      : "未命名方案";
 
   const config: AiConfig = {
     ...DEFAULT_AI_CONFIG,
@@ -947,40 +1166,10 @@ function syncFormToState(
   };
 
   const profiles = state.profiles.map((p) =>
-    p.id === state.activeProfileId ? { ...p, name: profileName, config } : p,
+    p.id === state.activeProfileId
+      ? { ...p, name: config.model || "未命名模型", config }
+      : p,
   );
-
-  return { ...state, profiles };
-}
-
-function applyCapabilityProbeResult(
-  state: AiProfilesState,
-  result: AiCapabilityProbeResult,
-): AiProfilesState {
-  const profiles = state.profiles.map((profile) => {
-    if (profile.id !== state.activeProfileId) {
-      return profile;
-    }
-
-    return {
-      ...profile,
-      config: {
-        ...profile.config,
-        supportsVision: result.supportsVision,
-        supportsWebSearch: result.supportsWebSearch,
-        includeImageHistory: result.supportsVision
-          ? profile.config.includeImageHistory
-          : false,
-        fastAgentMode: profile.config.fastAgentMode,
-        enableWebSearch: result.supportsWebSearch,
-        capabilityDetection: {
-          checkedAt: result.checkedAt,
-          visionError: result.visionError,
-          webSearchError: result.webSearchError,
-        },
-      },
-    };
-  });
 
   return { ...state, profiles };
 }

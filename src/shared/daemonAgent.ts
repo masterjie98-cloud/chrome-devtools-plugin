@@ -1,8 +1,13 @@
-import type { AgentRunBudgetLimits } from "./agentRunBudget";
+import type {
+  AgentRunBudgetExtensionDecision,
+  AgentRunBudgetExtensionRequest,
+  AgentRunBudgetLimits,
+} from "./agentRunBudget";
 import type { AgentSessionExecutionBinding, AgentSessionSnapshot } from "./agentSession";
 import type { BrowserActivityCursor } from "./browserActivity";
 import type { CollaborationWorkspaceSnapshot } from "./collaborationWorkspace";
 import type { DomElementInfo, PageSnapshot } from "./dom";
+import type { AiContextUsageSnapshot } from "./aiContextUsage";
 
 export interface DaemonAgentConfig {
   apiUrl: string;
@@ -59,6 +64,20 @@ export interface DaemonAgentAttachment {
   height?: number;
 }
 
+export interface AgentToolClientMetadata {
+  source: "builtin" | "external_mcp";
+  displayName?: string;
+  externalMcpServerId?: string;
+  externalMcpServerName?: string;
+  externalMcpToolName?: string;
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  };
+}
+
 export interface DaemonAgentToolDefinition {
   type: "function" | "builtin_function";
   function: {
@@ -66,6 +85,8 @@ export interface DaemonAgentToolDefinition {
     description?: string;
     parameters: unknown;
   };
+  /** Client-only execution metadata. Never forward this object to the LLM API. */
+  clientMetadata?: AgentToolClientMetadata;
 }
 
 export interface DaemonAgentContext {
@@ -74,6 +95,7 @@ export interface DaemonAgentContext {
   collaborationWorkspace?: CollaborationWorkspaceSnapshot;
   activityCursor?: BrowserActivityCursor;
   contextReadError?: string;
+  toolScope?: "browser" | "mixed" | "external_only";
 }
 
 export interface DaemonAgentStartPayload {
@@ -91,10 +113,71 @@ export interface DaemonAgentStartPayload {
   egressDestinations: string[];
 }
 
+/**
+ * Project UI messages to the minimal wire representation accepted by the
+ * daemon protocol. ChatMessage is structurally compatible with
+ * DaemonAgentMessage, so TypeScript does not reject UI-only fields such as
+ * toolResultMeta. Keeping this projection at the transport boundary prevents
+ * those fields from failing the daemon's strict schema after a tool round.
+ */
+export function toDaemonAgentMessages(
+  messages: readonly DaemonAgentMessage[],
+): DaemonAgentMessage[] {
+  return messages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    createdAt: message.createdAt,
+    ...(message.source ? { source: message.source } : {}),
+    ...(message.delegatedTaskId
+      ? { delegatedTaskId: message.delegatedTaskId }
+      : {}),
+    ...(message.toolName ? { toolName: message.toolName } : {}),
+    ...(message.status ? { status: message.status } : {}),
+    ...(message.attachments
+      ? {
+          attachments: message.attachments.map((attachment) => ({
+            id: attachment.id,
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            dataUrl: attachment.dataUrl,
+            createdAt: attachment.createdAt,
+            source: attachment.source,
+            ...(attachment.visualPurpose
+              ? { visualPurpose: attachment.visualPurpose }
+              : {}),
+            ...(attachment.savedAs ? { savedAs: attachment.savedAs } : {}),
+            ...(attachment.width !== undefined
+              ? { width: attachment.width }
+              : {}),
+            ...(attachment.height !== undefined
+              ? { height: attachment.height }
+              : {}),
+          })),
+        }
+      : {}),
+  }));
+}
+
 export interface DaemonAgentCancelPayload {
   runId: string;
   conversationId: string;
   reason?: string;
+}
+
+export interface DaemonAgentCancelResultPayload {
+  runId: string;
+  conversationId: string;
+  accepted: boolean;
+  state: "cancelling" | "not_active";
+  session?: AgentSessionSnapshot;
+}
+
+export interface DaemonAgentBudgetDecisionPayload {
+  runId: string;
+  conversationId: string;
+  budgetRequestId: string;
+  decision: AgentRunBudgetExtensionDecision;
 }
 
 export interface DaemonAgentCompletionResult {
@@ -149,7 +232,16 @@ export interface DaemonAgentToolMessage {
   assistantMessageId: string;
   toolCallId: string;
   toolName: string;
+  toolSource?: AgentToolClientMetadata["source"];
+  toolDisplayName?: string;
+  toolServerName?: string;
+  requestArguments?: string;
   content: string;
+  resultMeta?: {
+    originalCharCount: number;
+    displayedSourceCharCount: number;
+    truncated: boolean;
+  };
   createdAt: string;
   attachments?: DaemonAgentAttachment[];
 }
@@ -178,6 +270,19 @@ export type DaemonAgentEventPayload =
       conversationId: string;
       kind: "tool_message";
       message: DaemonAgentToolMessage;
+    }
+  | {
+      runId: string;
+      conversationId: string;
+      kind: "context_usage";
+      report: AiContextUsageSnapshot;
+    }
+  | {
+      runId: string;
+      conversationId: string;
+      kind: "budget_request";
+      budgetRequestId: string;
+      request: AgentRunBudgetExtensionRequest;
     }
   | {
       runId: string;

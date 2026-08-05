@@ -1,18 +1,28 @@
 import { startPluginWebSocketServer } from "../mcp/wsServer";
 import { browserStateHub } from "../mcp/browserStateHub";
-import { loadDaemonConfig, resolveDaemonDataPaths } from "./config";
+import {
+  loadDaemonConfig,
+  resolveDaemonDataPaths,
+  saveExternalMcpServers,
+} from "./config";
 import { ArtifactStore } from "./artifacts/store";
 import { DaemonStateStore } from "./store/stateStore";
+import { ExternalMcpRegistry } from "./externalMcpRegistry";
 
 const port = parsePort(process.env.AI_DEVTOOLS_DAEMON_PORT);
 const dataPaths = resolveDaemonDataPaths();
 const config = await loadDaemonConfig({ paths: dataPaths });
 const stateStore = new DaemonStateStore({ statePath: dataPaths.statePath });
+const externalMcpRegistry = new ExternalMcpRegistry(config.externalMcpServers, {
+  saveServers: async (servers) => {
+    await saveExternalMcpServers(servers, { paths: dataPaths });
+  },
+});
 const restoredState = await stateStore.load();
 if (restoredState) {
   browserStateHub.restorePersistentState(restoredState);
 }
-const daemon = startPluginWebSocketServer(port, undefined, {
+const daemon = startPluginWebSocketServer(port, externalMcpRegistry, {
   bridgeToken: config.bridgeToken,
   allowedExtensionIds: config.allowedExtensionIds,
   artifactStore: new ArtifactStore({ rootDir: dataPaths.artifactDir }),
@@ -33,6 +43,7 @@ async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   }
   shuttingDown = true;
   console.error(`[ai-devtools-daemon] shutting down after ${signal}.`);
+  await externalMcpRegistry.close();
   await daemon.close();
   process.exit(0);
 }

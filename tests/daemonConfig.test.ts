@@ -6,6 +6,7 @@ import {
   addAllowedExtensionId,
   loadDaemonConfig,
   resolveDaemonDataPaths,
+  saveExternalMcpServers,
 } from "../src/daemon/config";
 import { createTestDataDirectory } from "./helpers/tempDataDir";
 
@@ -63,6 +64,40 @@ test("extension ID allowlist is strict, deduplicated, persisted, and private", a
       addAllowedExtensionId("not-an-extension-id", { environment: {}, paths }),
       /32 lowercase letters/,
     );
+  } finally {
+    await dataDir.cleanup();
+  }
+});
+
+test("external MCP secrets stay only in the private daemon config", async () => {
+  const dataDir = await createTestDataDirectory("ai-devtools-external-mcp-");
+  try {
+    const paths = resolveDaemonDataPaths({ AI_DEVTOOLS_DATA_DIR: dataDir.rootDir });
+    const initial = await loadDaemonConfig({ environment: {}, paths });
+    const saved = await saveExternalMcpServers(
+      [
+        {
+          id: "mcp_private_fixture",
+          name: "Private fixture",
+          enabled: false,
+          autoApproveTools: true,
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.test/mcp",
+            headers: { Authorization: "Bearer not-a-real-secret" },
+          },
+        },
+      ],
+      { environment: {}, paths },
+    );
+    assert.equal(saved.bridgeToken, initial.bridgeToken);
+    assert.equal(saved.externalMcpServers.length, 1);
+    assert.equal(saved.externalMcpServers[0]?.autoApproveTools, true);
+    assert.equal((await stat(paths.configPath)).mode & 0o777, 0o600);
+    const raw = await readFile(paths.configPath, "utf8");
+    assert.match(raw, /not-a-real-secret/);
+    const loaded = await loadDaemonConfig({ environment: {}, paths });
+    assert.deepEqual(loaded.externalMcpServers, saved.externalMcpServers);
   } finally {
     await dataDir.cleanup();
   }

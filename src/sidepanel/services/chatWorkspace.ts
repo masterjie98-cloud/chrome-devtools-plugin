@@ -1,5 +1,12 @@
 import type { ChatMessage } from "../types";
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
+import {
+  normalizeExternalMcpSelection,
+  type ExternalMcpSelection,
+} from "../../shared/externalMcp";
+import { isGeneratedMcpCapabilityGreeting } from "./mcpCapabilityGreeting";
+import { redactSensitiveData } from "../../shared/sensitiveData";
+import { sanitizeMultilineText } from "../../shared/sanitize";
 
 export const CHAT_WORKSPACE_STORAGE_KEY = "aiDevtools.chatWorkspaceV1";
 export const MAX_STORED_CONVERSATIONS = 20;
@@ -8,15 +15,22 @@ export const MAX_STORED_MESSAGE_CHARS = 12_000;
 export const MAX_STORED_DRAFT_CHARS = 12_000;
 export const DEFAULT_CHAT_GREETING = "AI DevTools Assistant 已就绪。";
 const MAX_CONVERSATION_CHARS = 240_000;
+const MAX_STORED_TOOL_MESSAGES = 48;
 const FALLBACK_STORAGE_KEY = "ai-devtools-assistant.chat-workspace-v1";
 let workspaceSaveQueue: Promise<void> = Promise.resolve();
 
 export interface StoredChatMessage {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool";
   content: string;
   createdAt: string;
-  source?: "user" | "extension_ai" | "system";
+  source?: "user" | "extension_ai" | "mcp_ai" | "system";
+  toolName?: string;
+  toolSource?: "builtin" | "external_mcp";
+  toolDisplayName?: string;
+  toolServerName?: string;
+  toolRequestArguments?: string;
+  toolResultMeta?: ChatMessage["toolResultMeta"];
 }
 
 export interface StoredConversationTarget {
@@ -36,6 +50,7 @@ export interface StoredChatConversation {
   draft: string;
   target?: StoredConversationTarget;
   activityCursor?: BrowserActivityCursor;
+  externalMcpSelection?: ExternalMcpSelection;
   forkedFromConversationId?: string;
   forkedFromMessageId?: string;
 }
@@ -44,6 +59,21 @@ export interface ChatWorkspaceState {
   version: 1;
   activeConversationId?: string;
   conversations: StoredChatConversation[];
+}
+
+export function clearUnavailableConversationTarget(
+  conversation: StoredChatConversation,
+  expectedTabId: number,
+): StoredChatConversation {
+  if (conversation.target?.tabId !== expectedTabId) {
+    return conversation;
+  }
+  const {
+    target: _unavailableTarget,
+    activityCursor: _unavailableActivityCursor,
+    ...rest
+  } = conversation;
+  return rest;
 }
 
 export function conversationSearchText(
@@ -83,8 +113,17 @@ export function exportStoredConversation(
       : []),
     "",
     ...conversation.messages.flatMap((message) => [
-      `## ${message.role === "user" ? "用户" : "插件 AI"}`,
+      `## ${
+        message.role === "user"
+          ? "用户"
+          : message.role === "tool"
+            ? `${message.toolSource === "external_mcp" ? "MCP" : "内置工具"} · ${message.toolDisplayName ?? message.toolName ?? "调用"}`
+            : "插件 AI"
+      }`,
       "",
+      ...(message.role === "tool" && message.toolRequestArguments
+        ? ["### 请求参数", "", "```json", message.toolRequestArguments, "```", ""]
+        : []),
       message.content,
       "",
     ]),
@@ -107,12 +146,16 @@ export function createStoredConversation(params: {
   draft: string;
   target?: StoredConversationTarget;
   activityCursor?: BrowserActivityCursor;
+  externalMcpSelection?: ExternalMcpSelection;
   forkedFromConversationId?: string;
   forkedFromMessageId?: string;
 }): StoredChatConversation {
   const messages = sanitizeMessages(params.messages);
   const target = sanitizeConversationTarget(params.target);
   const activityCursor = sanitizeActivityCursor(params.activityCursor);
+  const externalMcpSelection = normalizeExternalMcpSelection(
+    params.externalMcpSelection,
+  );
   return {
     id: sanitizeIdentifier(params.id),
     title: deriveConversationTitle(messages),
@@ -122,6 +165,7 @@ export function createStoredConversation(params: {
     draft: sanitizeText(params.draft, MAX_STORED_DRAFT_CHARS),
     ...(target ? { target } : {}),
     ...(activityCursor !== undefined ? { activityCursor } : {}),
+    externalMcpSelection,
     ...(params.forkedFromConversationId
       ? {
           forkedFromConversationId: sanitizeIdentifier(
@@ -170,7 +214,11 @@ export function isEmptyStoredConversation(
   return (
     message?.role === "assistant" &&
     (message.source === undefined || message.source === "extension_ai") &&
-    message.content === DEFAULT_CHAT_GREETING
+    (message.content === DEFAULT_CHAT_GREETING ||
+      isGeneratedMcpCapabilityGreeting(
+        message.content,
+        DEFAULT_CHAT_GREETING,
+      ))
   );
 }
 
@@ -274,6 +322,9 @@ function normalizeStoredConversation(
   const updatedAt = sanitizeTimestamp(value.updatedAt, createdAt);
   const target = sanitizeConversationTarget(value.target);
   const activityCursor = sanitizeActivityCursor(value.activityCursor);
+  const externalMcpSelection = normalizeExternalMcpSelection(
+    value.externalMcpSelection,
+  );
   return {
     id,
     title: deriveConversationTitle(messages),
@@ -283,6 +334,7 @@ function normalizeStoredConversation(
     draft: sanitizeText(value.draft, MAX_STORED_DRAFT_CHARS),
     ...(target ? { target } : {}),
     ...(activityCursor !== undefined ? { activityCursor } : {}),
+    externalMcpSelection,
     ...(sanitizeOptionalIdentifier(value.forkedFromConversationId)
       ? {
           forkedFromConversationId: sanitizeIdentifier(
@@ -369,24 +421,54 @@ function sanitizeStoredTargetUrl(value: unknown): string | undefined {
 function sanitizeMessages(values: unknown[]): StoredChatMessage[] {
   const accepted: StoredChatMessage[] = [];
   let acceptedChars = 0;
-  const candidates = values
+  const indexed = values
+    .map((value, index) => ({ value, index }))
     .filter(
-      (value) =>
-        isRecord(value) &&
-        (value.role === "user" || value.role === "assistant"),
-    )
+      (entry): entry is { value: Record<string, unknown>; index: number } =>
+        isRecord(entry.value) &&
+        (entry.value.role === "user" ||
+          entry.value.role === "assistant" ||
+          entry.value.role === "tool"),
+    );
+  const primary = indexed
+    .filter((entry) => entry.value.role !== "tool")
     .slice(-MAX_STORED_MESSAGES);
+  const toolCapacity = Math.min(
+    MAX_STORED_TOOL_MESSAGES,
+    Math.max(0, MAX_STORED_MESSAGES - primary.length),
+  );
+  const tools =
+    toolCapacity > 0
+      ? indexed
+          .filter((entry) => entry.value.role === "tool")
+          .slice(-toolCapacity)
+      : [];
+  const candidates = [...primary, ...tools]
+    .sort((left, right) => left.index - right.index)
+    .map((entry) => entry.value);
 
   for (const value of candidates) {
-    if (!isRecord(value) || (value.role !== "user" && value.role !== "assistant")) {
+    if (
+      !isRecord(value) ||
+      (value.role !== "user" &&
+        value.role !== "assistant" &&
+        value.role !== "tool")
+    ) {
       continue;
     }
     const id = sanitizeOptionalIdentifier(value.id);
-    const content = sanitizeText(value.content, MAX_STORED_MESSAGE_CHARS);
-    if (!id || !content || acceptedChars + content.length > MAX_CONVERSATION_CHARS) {
+    const content =
+      value.role === "tool"
+        ? sanitizeStoredToolPayload(value.content)
+        : sanitizeText(value.content, MAX_STORED_MESSAGE_CHARS);
+    const toolRequestArguments = sanitizeStoredToolPayload(
+      value.toolRequestArguments,
+    );
+    const messageChars = content.length + toolRequestArguments.length;
+    if (!id || !content || acceptedChars + messageChars > MAX_CONVERSATION_CHARS) {
       continue;
     }
-    acceptedChars += content.length;
+    acceptedChars += messageChars;
     accepted.push({
       id,
       role: value.role,
@@ -394,13 +476,73 @@ function sanitizeMessages(values: unknown[]): StoredChatMessage[] {
       createdAt: sanitizeTimestamp(value.createdAt),
       ...(value.source === "user" ||
       value.source === "extension_ai" ||
+      value.source === "mcp_ai" ||
       value.source === "system"
         ? { source: value.source }
+        : {}),
+      ...(value.role === "tool" && sanitizeOptionalIdentifier(value.toolName)
+        ? { toolName: sanitizeIdentifier(value.toolName) }
+        : {}),
+      ...(value.role === "tool" &&
+      (value.toolSource === "builtin" || value.toolSource === "external_mcp")
+        ? { toolSource: value.toolSource }
+        : {}),
+      ...(value.role === "tool" && sanitizeText(value.toolDisplayName, 200).trim()
+        ? { toolDisplayName: sanitizeText(value.toolDisplayName, 200).trim() }
+        : {}),
+      ...(value.role === "tool" && sanitizeText(value.toolServerName, 200).trim()
+        ? { toolServerName: sanitizeText(value.toolServerName, 200).trim() }
+        : {}),
+      ...(value.role === "tool" && toolRequestArguments
+        ? { toolRequestArguments }
+        : {}),
+      ...(value.role === "tool" && sanitizeToolResultMeta(value.toolResultMeta)
+        ? { toolResultMeta: sanitizeToolResultMeta(value.toolResultMeta) }
         : {}),
     });
   }
 
   return accepted;
+}
+
+function sanitizeStoredToolPayload(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  try {
+    return sanitizeMultilineText(
+      JSON.stringify(redactSensitiveData(JSON.parse(value)), null, 2),
+      MAX_STORED_MESSAGE_CHARS,
+    );
+  } catch {
+    return sanitizeMultilineText(value, MAX_STORED_MESSAGE_CHARS);
+  }
+}
+
+function sanitizeToolResultMeta(
+  value: unknown,
+): ChatMessage["toolResultMeta"] | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const originalCharCount = value.originalCharCount;
+  const displayedSourceCharCount = value.displayedSourceCharCount;
+  if (
+    typeof originalCharCount !== "number" ||
+    !Number.isSafeInteger(originalCharCount) ||
+    originalCharCount < 0 ||
+    typeof displayedSourceCharCount !== "number" ||
+    !Number.isSafeInteger(displayedSourceCharCount) ||
+    displayedSourceCharCount < 0 ||
+    typeof value.truncated !== "boolean"
+  ) {
+    return undefined;
+  }
+  return {
+    originalCharCount,
+    displayedSourceCharCount,
+    truncated: value.truncated,
+  };
 }
 
 function deriveConversationTitle(messages: StoredChatMessage[]): string {

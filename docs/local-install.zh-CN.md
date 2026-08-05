@@ -64,18 +64,9 @@ macOS LaunchAgent 或 Windows 登录启动项，用户可用 `--no-autostart` �
 npm run setup:local -- --defaults
 ```
 
-### 更新代码（git 目录）
+### 开发目录不参与自动更新
 
-Chrome 扩展不能执行 git，按是否连上 daemon 分流：
-
-| Daemon | 做法 |
-|--------|------|
-| 未连接 | AI 设置里看版本与说明；在项目根运行 `npm run update:local`，再点「重载扩展」 |
-| 已连接 | AI 设置 →「检查更新」→「由 Daemon 执行更新」→ 提示后「重载扩展」 |
-
-```bash
-npm run update:local
-```
+源码开发目录由维护者显式切换版本并重新构建。daemon 不会执行 `git pull`、安装依赖或运行构建命令；设置页最多提示存在更高的正式 Release。给普通使用者升级时，请使用下文的正式 Release ZIP。
 
 维护者发版（规范化版本 / GitHub Release）：
 
@@ -143,6 +134,24 @@ npm run package:local
 
 不要把 Token 贴到聊天、日志或共享文档。每台机器用本机生成的 Token。
 
+### 导入第三方 MCP
+
+1. 确认 daemon 已连接，打开侧栏 `设置 → MCP`。
+2. 粘贴常见的 `{"mcpServers": {...}}` JSON，点击「导入并注册」。导入后默认停用，不会立即执行命令。
+3. 打开对应开关或点击「测试连接」后，daemon 才会启动 stdio `command + args` 或连接 Streamable HTTP。
+4. 新对话默认使用 `MCP 自动`，只调用 `tools/list` 探测并在欢迎消息展示能力；也可在聊天顶部选择 `MCP 关闭` 或指定一个已启用 MCP。此选择仅属于当前聊天。
+
+远程配置同时兼容 `type: "streamable-http" + url` 和常见的
+`type: "streamableHttp" + baseUrl`，并支持 `description`、
+`timeout`/`timeoutMs`、`disabledTools`。外部配置里的 `isActive: true` 只会标记
+“配置请求启用”，不会在导入时自动连接；仍需在设置页手动确认启用。
+
+远程 MCP 必须使用 HTTPS（`localhost` 可使用 HTTP），旧 SSE 不支持。第三方工具默认逐次请求审批；如用户在设置中明确“信任只读声明”，仅 server 声明 `readOnlyHint: true` 且没有 destructive 冲突的工具可免重复审批。审批条右侧下拉菜单还可选择“此后自动运行这个 MCP 的全部工具”：此授权按 server 隔离并由 daemon 持久化，会跳过该 server 后续读取、写入、删除和未知工具的逐次确认，直到在 `设置 → MCP` 中关闭；不会授权其他 MCP 或浏览器工具。传输类型或 HTTP GET 不能证明工具只读，server 声明也不会在未信任时自动生效。`env` 和 HTTP `headers` 仅保存在 daemon 的 0600 私有配置中，不进入 Chrome 扩展存储。导入 `npx`、`uvx` 等命令后，首次启用可能由该命令自身下载包，请只使用可信配置。
+
+### 获取 Provider 模型列表
+
+在 `设置 → 模型管理` 中可添加多个模型，并在聊天输入框直接切换。模型 ID 支持手动填写，也可点击「获取列表」，使用当前 API URL 和 API Key 请求 OpenAI-compatible 的 `GET /v1/models`，再选择一个或多个模型添加。填写 Provider 根地址时会分别推导 `/v1/models` 和 `/v1/chat/completions`；返回结果只用于模型选择，不会复制 API Key 到 MCP 或 localStorage。
+
 ### 查看状态 / 重新取 Token
 
 Windows（PowerShell）：
@@ -179,7 +188,7 @@ NODE_TARGET="$([ "$(uname -m)" = arm64 ] && echo darwin-arm64 || echo darwin-x64
 人工覆盖安装一次；之后即可使用上述流程。本机 Token 和 daemon 状态目录不会被
 Release ZIP 覆盖。
 
-开发目录（`git clone`）的更新见上文 A 节。
+开发目录（`git clone`）不会走应用内自动更新。
 
 ### 卸载
 

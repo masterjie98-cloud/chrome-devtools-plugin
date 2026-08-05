@@ -15,16 +15,24 @@ test("sync-manifest-version keeps public/manifest.json aligned", () => {
   assert.equal(result.status, 0, result.stderr || result.stdout);
 });
 
-test("localUpdate check returns structured fields on this git checkout", async () => {
-  const { checkLocalUpdate } = await import("../src/daemon/localUpdate.js");
+test("source checkout is development-only and never auto-updates with git", async () => {
+  const { checkLocalUpdate, runLocalUpdate } = await import(
+    "../src/daemon/localUpdate.js"
+  );
   const result = await checkLocalUpdate(projectRoot, {
-    skipGitFetch: true,
     fetchImpl: async () => new Response("not found", { status: 404 }),
   });
   assert.equal(result.ok, true);
-  assert.equal(result.installMode, "git");
+  assert.equal(result.installMode, "development");
+  assert.equal(result.autoUpdateSupported, false);
   assert.equal(typeof result.currentVersion, "string");
   assert.equal(typeof result.currentCommit, "string");
   assert.equal(typeof result.updateAvailable, "boolean");
   assert.equal(typeof result.message, "string");
+
+  const update = await runLocalUpdate(projectRoot, { noRestart: true });
+  assert.equal(update.ok, false);
+  assert.equal(update.installMode, "development");
+  assert.match(update.error ?? "", /Release ZIP/);
+  assert.equal(update.restartScheduled, false);
 });

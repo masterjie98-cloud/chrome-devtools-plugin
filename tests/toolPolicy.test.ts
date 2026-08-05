@@ -7,6 +7,8 @@ import {
 import {
   getToolPolicy,
   getToolPolicyAnnotations,
+  createTrustedExternalAutoRunPolicy,
+  createTrustedExternalReadOnlyPolicy,
   hasExplicitToolPolicy,
   requiresToolApproval,
 } from "../src/shared/toolPolicy";
@@ -17,6 +19,51 @@ test("every exposed MCP tool has explicit policy metadata", () => {
   );
 
   assert.deepEqual(missing, []);
+});
+
+test("external MCP auto-run policy is explicit and annotation-aware", () => {
+  const destructive = createTrustedExternalAutoRunPolicy(
+    "extmcp__delete_fixture",
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  );
+  assert.equal(destructive.requiresApproval, false);
+  assert.equal(destructive.approvalMode, "none");
+  assert.equal(destructive.policyClass, "destructive_write");
+  assert.equal(destructive.destructive, true);
+  assert.equal(destructive.capability, "external.open_world");
+
+  const undeclared = createTrustedExternalAutoRunPolicy("extmcp__unknown");
+  assert.equal(undeclared.requiresApproval, false);
+  assert.equal(undeclared.policyClass, "open_world");
+  assert.equal(undeclared.openWorld, true);
+});
+
+test("external read-only annotations require explicit trust and reject conflicts", () => {
+  const trusted = createTrustedExternalReadOnlyPolicy("extmcp__metrics", {
+    readOnlyHint: true,
+    destructiveHint: false,
+    openWorldHint: true,
+  });
+  assert.equal(trusted?.approvalMode, "none");
+  assert.equal(trusted?.mutatesBrowser, false);
+  assert.equal(trusted?.openWorld, true);
+
+  assert.equal(
+    createTrustedExternalReadOnlyPolicy("extmcp__unknown", {}),
+    undefined,
+  );
+  assert.equal(
+    createTrustedExternalReadOnlyPolicy("extmcp__conflict", {
+      readOnlyHint: true,
+      destructiveHint: true,
+    }),
+    undefined,
+  );
 });
 
 test("ordinary bounded page reads do not require confirmation", () => {

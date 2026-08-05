@@ -1,4 +1,5 @@
 import { getToolPolicy } from "../../shared/toolPolicy";
+import { isExternalMcpToolName } from "../../shared/externalMcp";
 import type { AiRequestedToolCall, AiToolResultMessage } from "./aiClient";
 import {
   isAgentToolResultDefinitelyNotExecuted,
@@ -14,6 +15,12 @@ const BROWSER_EFFECT_CONTEXT =
 
 const COMPLETION_CLAIM =
   /(?:已(?:经)?(?:完成|点击|填写|输入|选择|勾选|取消|拖拽|滚动|提交|保存|更新|删除|移除|关闭|打开|跳转|导航|返回|刷新|上传|修改|设置|启用|停用)|(?:操作|任务|处理|修改|设置|保存|提交)(?:已)?完成|(?:成功|已经生效)|(?:clicked|filled|selected|submitted|saved|updated|deleted|removed|opened|closed|navigated|completed|done|succeeded|successful))/i;
+
+const REPORTING_INTENT =
+  /(?:报告|报表|状态|健康|异常|分布|汇总|总结|分析|诊断|审计|查询|检查|report|status|health|distribution|summary|analysis|diagnos|audit|query|check)/i;
+
+const MISSING_REPORT_BODY_REFERENCE =
+  /(?:(?:报告|报表|结果|详情|内容|数据|分析)[\s\S]{0,30}(?:如上(?:所示)?|见上(?:文|方)?|已在上(?:面|方)(?:展示|显示|列出)|上(?:面|方)(?:已经)?(?:展示|显示|列出))|(?:report|results?|details?|content|data|analysis)[\s\S]{0,48}(?:(?:shown|provided|listed|available)[\s\S]{0,16}above|see above))/i;
 
 export interface AgentResultEvidenceState {
   requestedBrowserEffect: boolean;
@@ -57,6 +64,9 @@ export function recordAgentResultEvidence(
   let independentlyVerified = state.independentlyVerified;
 
   for (const call of calls) {
+    if (isExternalMcpToolName(call.name)) {
+      continue;
+    }
     const policy = getToolPolicy(call.name, call.arguments);
     const result = resultsById.get(call.id);
     if (policy.mutatesBrowser || policy.openWorld) {
@@ -118,4 +128,19 @@ export function arbitrateAgentFinalResult(
     };
   }
   return { accepted: true };
+}
+
+export function needsSelfContainedReportRepair(
+  input: string,
+  finalContent: string,
+  toolExchangeCount: number,
+): boolean {
+  const content = finalContent.trim();
+  return (
+    toolExchangeCount > 0 &&
+    content.length > 0 &&
+    content.length < 1_600 &&
+    REPORTING_INTENT.test(input) &&
+    MISSING_REPORT_BODY_REFERENCE.test(content)
+  );
 }

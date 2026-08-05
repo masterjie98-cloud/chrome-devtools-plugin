@@ -49,14 +49,30 @@ export function truncateText(value: string, maxLength: number): string {
 
 export function sanitizeText(value: string, maxLength: number): string {
   const compact = value.replace(/\s+/g, " ").trim();
-  const redacted = compact
+  return truncateText(redactSensitiveText(compact), maxLength);
+}
+
+/**
+ * Sanitizes user-visible prose without flattening Markdown paragraphs, lists,
+ * tables, or code blocks. Metadata should continue to use `sanitizeText` so it
+ * remains compact and single-line.
+ */
+export function sanitizeMultilineText(value: string, maxLength: number): string {
+  const normalized = value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .trim();
+
+  return truncateText(redactSensitiveText(normalized), maxLength);
+}
+
+function redactSensitiveText(value: string): string {
+  return value
     .replace(HEADER_SECRET_PATTERN, (_match, key: string) => `${key}: [REDACTED]`)
     .replace(EMAIL_PATTERN, "[REDACTED_EMAIL]")
     .replace(PHONE_PATTERN, "[REDACTED_PHONE]")
     .replace(BEARER_PATTERN, "Bearer [REDACTED]")
     .replace(KEY_VALUE_SECRET_PATTERN, (_match, key: string) => `${key}=[REDACTED]`);
-
-  return truncateText(redacted, maxLength);
 }
 
 export function sanitizeHtmlSnippet(value: string, maxLength: number): string {

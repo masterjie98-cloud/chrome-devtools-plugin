@@ -1,4 +1,5 @@
 import type { ApprovalRequestPayload } from "../shared/wsProtocol";
+import type { AgentRunBudgetExtensionRequest } from "../shared/agentRunBudget";
 import type { ToolResultPresentationMeta } from "./toolResultPresentation";
 
 export type ChatRole = "user" | "assistant" | "tool";
@@ -16,6 +17,10 @@ export interface ChatMessage {
   source?: ChatMessageSource;
   delegatedTaskId?: string;
   toolName?: string;
+  toolSource?: "builtin" | "external_mcp";
+  toolDisplayName?: string;
+  toolServerName?: string;
+  toolRequestArguments?: string;
   toolResultMeta?: ToolResultPresentationMeta;
   status?: string;
   attachments?: ChatImageAttachment[];
@@ -103,4 +108,12 @@ export interface PendingToolApproval {
   egressDestinations?: string[];
   conversationOrigin?: string;
   allowForConversationOriginAvailable: boolean;
+  externalMcp?: ApprovalRequestPayload["externalMcp"];
+}
+
+export interface PendingAgentBudgetRequest {
+  id: string;
+  runId: string;
+  conversationId: string;
+  request: AgentRunBudgetExtensionRequest;
 }

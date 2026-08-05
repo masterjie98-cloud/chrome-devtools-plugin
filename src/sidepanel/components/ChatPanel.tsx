@@ -14,11 +14,14 @@ import {
   EditOutlined,
   ExclamationCircleOutlined,
   FileSearchOutlined,
+  FileTextOutlined,
   GlobalOutlined,
   HistoryOutlined,
   InboxOutlined,
   LeftOutlined,
   PictureOutlined,
+  PieChartOutlined,
+  PlusOutlined,
   RedoOutlined,
   RightOutlined,
   SafetyCertificateOutlined,
@@ -34,6 +37,7 @@ import Dropdown from "antd/es/dropdown";
 import Empty from "antd/es/empty";
 import Image from "antd/es/image";
 import Input from "antd/es/input";
+import Popover from "antd/es/popover";
 import Popconfirm from "antd/es/popconfirm";
 import Switch from "antd/es/switch";
 import Tag from "antd/es/tag";
@@ -41,6 +45,7 @@ import Tooltip from "antd/es/tooltip";
 import Typography from "antd/es/typography";
 import type { ReactNode } from "react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { AiSettingsTab } from "./AiSettingsDrawer";
 import { createMessageId } from "../../shared/messaging";
 import type { ToolName } from "../../shared/tools";
 import type { BrowserTargetTab } from "../../shared/dom";
@@ -50,6 +55,24 @@ import {
 } from "../../shared/collaborationTasks";
 import type { ActiveTabSnapshot } from "../../shared/wsProtocol";
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
+import {
+  contextUsagePercent,
+  type AiContextUsageCategory,
+  type AiContextUsageSnapshot,
+} from "../../shared/aiContextUsage";
+import {
+  estimateTextTokens,
+  estimateTokensFromCharacterCount,
+  formatEstimatedTokenCount,
+} from "../../shared/tokenEstimate";
+import {
+  formatAgentRunBudgetAmount,
+  type AgentRunBudgetExtensionDecision,
+} from "../../shared/agentRunBudget";
+import type {
+  ExternalMcpSelection,
+  ExternalMcpServerSummary,
+} from "../../shared/externalMcp";
 import type {
   ExecutionApprovalMode,
   ToolApprovalDecision,
@@ -65,6 +88,7 @@ import type {
   ChatSendMode,
   ExecutionTaskBinding,
   PendingToolApproval,
+  PendingAgentBudgetRequest,
   QueuedChatSubmission,
 } from "../types";
 import { LocalUpdateAlert, useLocalUpdateStatus } from "./LocalUpdateBanner";
@@ -75,6 +99,8 @@ interface ChatPanelProps {
   busy: boolean;
   agentBusy: boolean;
   aiConfigured: boolean;
+  modelProfiles: Array<{ id: string; name: string; model: string }>;
+  activeModelProfileId: string;
   supportsVision: boolean;
   hubConnected: boolean;
   permissions: {
@@ -83,12 +109,17 @@ interface ChatPanelProps {
     enableTools: boolean;
     includePageContext: boolean;
   };
+  externalMcpSelection: ExternalMcpSelection;
+  externalMcpServers: ExternalMcpServerSummary[];
   contextLabel: string;
+  contextUsage?: AiContextUsageSnapshot;
   streamingMessageId?: string;
   pendingToolApprovals: PendingToolApproval[];
+  pendingAgentBudgetRequest?: PendingAgentBudgetRequest;
   executionApprovalMode: ExecutionApprovalMode;
   executionApprovalScopeLabel?: string;
   activeExecutionBinding?: ExecutionTaskBinding;
+  unavailableTargetTabIds: ReadonlySet<number>;
   backgroundConversationWork: BackgroundConversationWork[];
   selectedToolTarget?: ActiveTabSnapshot;
   foregroundTab?: BrowserTargetTab;
@@ -119,6 +150,7 @@ interface ChatPanelProps {
     mode: ChatSendMode,
   ) => boolean;
   onStop: () => void;
+  onChangeModelProfile: (profileId: string) => void;
   onRemoveQueuedMessage: (submissionId: string) => void;
   onClearQueuedMessages: () => void;
   onRunQueuedMessageNow: (submissionId: string) => void;
@@ -139,6 +171,10 @@ interface ChatPanelProps {
     approvalId: string,
     decision: ToolApprovalDecision,
   ) => void;
+  onResolveAgentBudgetRequest: (
+    requestId: string,
+    decision: AgentRunBudgetExtensionDecision,
+  ) => void;
   onChangeExecutionApprovalMode: (mode: ExecutionApprovalMode) => void;
   onFocusExecutionTarget: (tabId: number) => void;
   onRestartActivityMonitor: () => void;
@@ -153,8 +189,9 @@ interface ChatPanelProps {
     enableTools?: boolean;
     includePageContext?: boolean;
   }) => void;
+  onChangeExternalMcpSelection: (selection: ExternalMcpSelection) => void;
   onClearChat: () => void;
-  onOpenSettings: () => void;
+  onOpenSettings: (tab?: AiSettingsTab) => void;
 }
 
 export function ChatPanel({
@@ -162,15 +199,22 @@ export function ChatPanel({
   busy,
   agentBusy,
   aiConfigured,
+  modelProfiles,
+  activeModelProfileId,
   supportsVision,
   hubConnected,
   permissions,
+  externalMcpSelection,
+  externalMcpServers,
   contextLabel,
+  contextUsage,
   streamingMessageId,
   pendingToolApprovals,
+  pendingAgentBudgetRequest,
   executionApprovalMode,
   executionApprovalScopeLabel,
   activeExecutionBinding,
+  unavailableTargetTabIds,
   backgroundConversationWork,
   selectedToolTarget,
   foregroundTab,
@@ -187,6 +231,7 @@ export function ChatPanel({
   runningTool,
   onSend,
   onStop,
+  onChangeModelProfile,
   onRemoveQueuedMessage,
   onClearQueuedMessages,
   onRunQueuedMessageNow,
@@ -199,6 +244,7 @@ export function ChatPanel({
   onForkMessage,
   onDraftChange,
   onResolveToolApproval,
+  onResolveAgentBudgetRequest,
   onChangeExecutionApprovalMode,
   onFocusExecutionTarget,
   onRestartActivityMonitor,
@@ -209,6 +255,7 @@ export function ChatPanel({
   onCaptureScreenshot,
   onAttachmentRejected,
   onUpdatePermission,
+  onChangeExternalMcpSelection,
   onClearChat,
   onOpenSettings
 }: ChatPanelProps) {
@@ -229,11 +276,17 @@ export function ChatPanel({
   const [delegatedInboxOpen, setDelegatedInboxOpen] = useState(false);
   const [backgroundWorkOpen, setBackgroundWorkOpen] = useState(false);
   const localUpdateStatus = useLocalUpdateStatus();
-  const { runningVersion, daemonConnected, updateAvailable } = localUpdateStatus;
+  const {
+    runningVersion,
+    latestVersion,
+    daemonConnected,
+    updateAvailable,
+  } = localUpdateStatus;
   const [activeApprovalId, setActiveApprovalId] = useState<string>();
   const [editingMessageId, setEditingMessageId] = useState<string>();
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textFileInputRef = useRef<HTMLInputElement>(null);
   const copyResetTimerRef = useRef<number | undefined>(undefined);
   const draftBeforeEditRef = useRef("");
 
@@ -457,6 +510,30 @@ export function ChatPanel({
     }
   };
 
+  const addTextFiles = async (files: FileList | null) => {
+    if (!files?.length) {
+      return;
+    }
+
+    const selectedFiles = Array.from(files).slice(0, 4);
+    const textBlocks: string[] = [];
+    for (const file of selectedFiles) {
+      if (file.size > 256 * 1024) {
+        onAttachmentRejected(`文件 ${file.name} 超过 256 KiB，未加入上下文。`);
+        continue;
+      }
+      const content = await file.text();
+      textBlocks.push(formatImportedTextFile(file.name, content));
+    }
+    if (textBlocks.length > 0) {
+      const prefix = draftValue.trimEnd();
+      onDraftChange([prefix, ...textBlocks].filter(Boolean).join("\n\n"));
+    }
+    if (textFileInputRef.current) {
+      textFileInputRef.current.value = "";
+    }
+  };
+
   const addPastedImages = async (clipboardData: DataTransfer) => {
     const files = Array.from(clipboardData.items)
       .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
@@ -478,7 +555,7 @@ export function ChatPanel({
 
   const captureScreenshot = async () => {
     if (!supportsVision) {
-      onAttachmentRejected("当前检测结果不支持图片输入；保存 AI 配置会重新检测。");
+      onAttachmentRejected("当前检测结果不支持图片输入；可在模型管理中重新检测。");
       return;
     }
 
@@ -509,6 +586,7 @@ export function ChatPanel({
               message,
               message.id === streamingMessageId,
             ),
+            message.role === "assistant",
           )}
           {message.id === streamingMessageId ? <span className="streaming-caret" /> : null}
           {message.status ? (
@@ -519,6 +597,8 @@ export function ChatPanel({
     }
 
     const expanded = expandedToolMessages.has(message.id);
+    const toolDisplayName = getToolDisplayName(message);
+    const externalMcp = message.toolSource === "external_mcp";
 
     return (
       <div className="tool-message-body">
@@ -528,53 +608,80 @@ export function ChatPanel({
           onClick={() => toggleToolMessage(message.id)}
           aria-expanded={expanded}
         >
-          <RightOutlined
-            className={`disclosure-chevron${expanded ? " is-expanded" : ""}`}
-            aria-hidden="true"
-          />
-          <span>{expanded ? "收起工具结果" : getToolMessageSummary(message)}</span>
+          <span className="tool-message-identity">
+            {externalMcp ? <ApiOutlined /> : <ToolOutlined />}
+            <span
+              className={`tool-message-source is-${externalMcp ? "mcp" : "builtin"}`}
+            >
+              {externalMcp ? "MCP" : "内置"}
+            </span>
+            <span className="tool-message-name" title={toolDisplayName}>
+              {toolDisplayName}
+            </span>
+            {message.toolServerName ? (
+              <span
+                className="tool-message-server"
+                title={message.toolServerName}
+              >
+                {message.toolServerName}
+              </span>
+            ) : null}
+          </span>
+          <span className="tool-message-summary">
+            {getToolMessageSummary(message)}
+            <RightOutlined
+              className={`disclosure-chevron${expanded ? " is-expanded" : ""}`}
+              aria-hidden="true"
+            />
+          </span>
         </button>
         {expanded ? (
           <div className="tool-message-content">
-            <div className="tool-result-toolbar">
-              <span>{getExpandedToolResultLabel(message)}</span>
-              <Button
-                size="small"
-                type="text"
-                icon={
-                  copiedMessageId === message.id ? (
-                    <CheckOutlined />
-                  ) : (
-                    <CopyOutlined />
-                  )
-                }
-                onClick={() => void copyMessage(message)}
-                aria-label={`复制工具结果 ${message.toolName ?? ""}`.trim()}
-              >
-                {copiedMessageId === message.id ? "已复制" : "复制"}
-              </Button>
-            </div>
-            {message.toolResultMeta?.truncated ? (
-              <div className="tool-result-truncated-note" role="note">
-                当前只保留了 {formatCharCount(
-                  message.toolResultMeta.displayedSourceCharCount,
-                )}
-                ，原始结果为 {formatCharCount(
-                  message.toolResultMeta.originalCharCount,
-                )}
-                。请使用工具的分页或 cursor 参数继续读取。
-              </div>
+            {message.toolRequestArguments ? (
+              <section className="tool-detail-block" aria-label="工具请求参数">
+                <div className="tool-result-toolbar">
+                  <span>请求参数</span>
+                </div>
+                <ToolResultViewport content={message.toolRequestArguments} />
+              </section>
             ) : null}
-            {message.toolName === "browser_capture_issue_evidence" ? (
-              <IssueEvidenceWorkbench
-                content={message.content}
-                copiedId={copiedMessageId}
-                messageId={message.id}
-                onCopy={copyText}
-              />
-            ) : (
-              <ToolResultViewport content={message.content} />
-            )}
+            <section className="tool-detail-block" aria-label="工具返回结果">
+              <div className="tool-result-toolbar">
+                <span>{getExpandedToolResultLabel(message)}</span>
+                <Button
+                  size="small"
+                  type="text"
+                  icon={
+                    copiedMessageId === message.id ? (
+                      <CheckOutlined />
+                    ) : (
+                      <CopyOutlined />
+                    )
+                  }
+                  onClick={() => void copyMessage(message)}
+                  aria-label={`复制工具结果 ${toolDisplayName}`}
+                >
+                  {copiedMessageId === message.id ? "已复制" : "复制"}
+                </Button>
+              </div>
+              {message.toolResultMeta?.truncated ? (
+                <div className="tool-result-truncated-note" role="note">
+                  当前只保留了 {formatToolResultTokens(message, "displayed")}
+                  ，原始结果约为 {formatToolResultTokens(message, "original")}
+                  。请使用工具的分页或 cursor 参数继续读取。
+                </div>
+              ) : null}
+              {message.toolName === "browser_capture_issue_evidence" ? (
+                <IssueEvidenceWorkbench
+                  content={message.content}
+                  copiedId={copiedMessageId}
+                  messageId={message.id}
+                  onCopy={copyText}
+                />
+              ) : (
+                <ToolResultViewport content={message.content} />
+              )}
+            </section>
           </div>
         ) : null}
       </div>
@@ -585,102 +692,149 @@ export function ChatPanel({
     <div className="chat-panel">
       <div className="chat-top-stack">
         <div className="chat-status-row">
-        <Tag color={agentBusy ? "processing" : aiConfigured ? "green" : "orange"}>
-          {agentBusy
-            ? `AI 回复中${queuedMessages.length ? ` · 待发送 ${queuedMessages.length}` : ""}`
-            : aiConfigured
-              ? "AI 已就绪"
-              : "需要配置 AI"}
-        </Tag>
-        <Tag color={daemonConnected || hubConnected ? "green" : "default"}>
-          {daemonConnected || hubConnected ? "Daemon 已连接" : "Daemon 未连接"}
-        </Tag>
-        <Tag className="context-status-tag">{contextLabel}</Tag>
-        <Tag>v{runningVersion}</Tag>
-        {updateAvailable ? <Tag color="warning">有更新</Tag> : null}
-        <div className="chat-status-actions">
-          {backgroundConversationWork.length > 0 ? (
-            <Tooltip
-              title={
-                backgroundConversationWork.reduce(
-                  (total, work) => total + work.pendingApprovalCount,
-                  0,
-                )
-                  ? `其他对话有 ${backgroundConversationWork.reduce((total, work) => total + work.pendingApprovalCount, 0)} 条待审批`
-                  : `${backgroundConversationWork.length} 个其他对话正在后台执行`
+          <div className="chat-runtime-status">
+            <span
+              className={`chat-runtime-dot ${
+                agentBusy
+                  ? "is-busy"
+                  : aiConfigured
+                    ? "is-ready"
+                    : "is-warning"
+              }`}
+              aria-hidden="true"
+            />
+            <span>
+              {agentBusy
+                ? `AI 回复中${queuedMessages.length ? ` · 待发送 ${queuedMessages.length}` : ""}`
+                : aiConfigured
+                  ? "AI 已就绪"
+                  : "需要配置 AI"}
+            </span>
+          </div>
+          <Tooltip title={contextLabel}>
+            <div
+              className={`chat-runtime-status is-daemon${
+                daemonConnected || hubConnected ? " is-connected" : ""
+              }`}
+            >
+              <span className="chat-runtime-dot" aria-hidden="true" />
+              <span>
+                {daemonConnected || hubConnected
+                  ? "Daemon 已连接"
+                  : "Daemon 未连接"}
+              </span>
+              {updateAvailable ? (
+                <span className="chat-runtime-update-dot" aria-label="有更新" />
+              ) : null}
+            </div>
+          </Tooltip>
+          <Tooltip
+            title={
+              latestVersion !== runningVersion
+                ? `当前 v${runningVersion}，最新 v${latestVersion}；打开更新设置`
+                : `当前版本 v${runningVersion}；打开更新设置`
+            }
+          >
+            <button
+              type="button"
+              className={`chat-version-status${
+                latestVersion !== runningVersion ? " is-update-available" : ""
+              }`}
+              onClick={() => onOpenSettings("local")}
+              aria-label={
+                latestVersion !== runningVersion
+                  ? `当前版本 ${runningVersion}，最新版本 ${latestVersion}，打开更新设置`
+                  : `当前版本 ${runningVersion}，打开更新设置`
               }
             >
-              <Button
-                className={`background-work-trigger ${
-                  backgroundConversationWork.some(
-                    (work) => work.pendingApprovalCount > 0,
+              {latestVersion !== runningVersion
+                ? `v${runningVersion} → v${latestVersion}`
+                : `v${runningVersion}`}
+            </button>
+          </Tooltip>
+          <div className="chat-status-actions">
+            {backgroundConversationWork.length > 0 ? (
+              <Tooltip
+                title={
+                  backgroundConversationWork.reduce(
+                    (total, work) => total + work.pendingApprovalCount,
+                    0,
                   )
-                    ? "is-attention"
-                    : ""
-                }`}
-                size="small"
-                type="text"
-                icon={<ClockCircleOutlined />}
-                onClick={() => setBackgroundWorkOpen(true)}
-                aria-label={
-                  backgroundConversationWork.some(
-                    (work) => work.pendingApprovalCount > 0,
-                  )
-                    ? `打开后台任务，${backgroundConversationWork.reduce((total, work) => total + work.pendingApprovalCount, 0)} 条待审批`
-                    : "打开后台任务，1 个对话正在执行"
+                    ? `其他对话有 ${backgroundConversationWork.reduce((total, work) => total + work.pendingApprovalCount, 0)} 条待审批`
+                    : `${backgroundConversationWork.length} 个其他对话正在后台执行`
                 }
               >
-                {backgroundConversationWork.reduce(
-                  (total, work) => total + work.pendingApprovalCount,
-                  0,
-                ) || backgroundConversationWork.length}
-              </Button>
-            </Tooltip>
-          ) : null}
-          {delegatedInboxTasks.length ? (
-            <Tooltip
-              title={`Codex 收件箱 · ${delegatedInboxTasks.length} 条待处理`}
-            >
+                <Button
+                  className={`background-work-trigger ${
+                    backgroundConversationWork.some(
+                      (work) => work.pendingApprovalCount > 0,
+                    )
+                      ? "is-attention"
+                      : ""
+                  }`}
+                  size="small"
+                  type="text"
+                  icon={<ClockCircleOutlined />}
+                  onClick={() => setBackgroundWorkOpen(true)}
+                  aria-label={
+                    backgroundConversationWork.some(
+                      (work) => work.pendingApprovalCount > 0,
+                    )
+                      ? `打开后台任务，${backgroundConversationWork.reduce((total, work) => total + work.pendingApprovalCount, 0)} 条待审批`
+                      : "打开后台任务，1 个对话正在执行"
+                  }
+                >
+                  {backgroundConversationWork.reduce(
+                    (total, work) => total + work.pendingApprovalCount,
+                    0,
+                  ) || backgroundConversationWork.length}
+                </Button>
+              </Tooltip>
+            ) : null}
+            {delegatedInboxTasks.length ? (
+              <Tooltip
+                title={`Codex 收件箱 · ${delegatedInboxTasks.length} 条待处理`}
+              >
+                <Button
+                  className="delegated-inbox-trigger"
+                  size="small"
+                  type="text"
+                  icon={<InboxOutlined />}
+                  onClick={() => setDelegatedInboxOpen(true)}
+                  aria-label={`打开 Codex 收件箱，${delegatedInboxTasks.length} 条待处理`}
+                >
+                  {delegatedInboxTasks.length}
+                </Button>
+              </Tooltip>
+            ) : null}
+            <Tooltip title="本地对话历史">
               <Button
-                className="delegated-inbox-trigger"
                 size="small"
                 type="text"
-                icon={<InboxOutlined />}
-                onClick={() => setDelegatedInboxOpen(true)}
-                aria-label={`打开 Codex 收件箱，${delegatedInboxTasks.length} 条待处理`}
-              >
-                {delegatedInboxTasks.length}
-              </Button>
+                icon={<HistoryOutlined />}
+                onClick={() => setHistoryOpen(true)}
+                aria-label="打开本地对话历史"
+              />
             </Tooltip>
-          ) : null}
-          <Tooltip title="本地对话历史">
-            <Button
-              size="small"
-              type="text"
-              icon={<HistoryOutlined />}
-              onClick={() => setHistoryOpen(true)}
-              aria-label="打开本地对话历史"
-            />
-          </Tooltip>
-          <Tooltip title="AI 配置">
-            <Button
-              size="small"
-              type="text"
-              icon={<SettingOutlined />}
-              onClick={onOpenSettings}
-              aria-label="打开 AI 配置"
-            />
-          </Tooltip>
-          <Tooltip title="新建干净对话；当前任务会继续留在原对话和 Tab">
-            <Button
-              size="small"
-              type="text"
-              icon={<ClearOutlined />}
-              onClick={onClearChat}
-              aria-label="新对话"
-            />
-          </Tooltip>
-        </div>
+            <Tooltip title="设置">
+              <Button
+                size="small"
+                type="text"
+                icon={<SettingOutlined />}
+                onClick={() => onOpenSettings("model")}
+                aria-label="打开设置"
+              />
+            </Tooltip>
+            <Tooltip title="新建干净对话；当前任务会继续留在原对话和 Tab">
+              <Button
+                size="small"
+                type="text"
+                icon={<ClearOutlined />}
+                onClick={onClearChat}
+                aria-label="新对话"
+              />
+            </Tooltip>
+          </div>
         </div>
         <LocalUpdateAlert status={localUpdateStatus} />
         {activeExecutionBinding ? (
@@ -689,6 +843,9 @@ export function ChatPanel({
             mode="task"
             foregroundTab={foregroundTab}
             queuedCount={queuedMessages.length}
+            unavailable={unavailableTargetTabIds.has(
+              activeExecutionBinding.target.tabId,
+            )}
             onFocus={onFocusExecutionTarget}
           />
         ) : selectedToolTarget?.tabId !== undefined &&
@@ -704,38 +861,12 @@ export function ChatPanel({
             mode="tool"
             foregroundTab={foregroundTab}
             queuedCount={0}
+            unavailable={unavailableTargetTabIds.has(
+              selectedToolTarget.tabId,
+            )}
             onFocus={onFocusExecutionTarget}
           />
         ) : null}
-      </div>
-
-      <div className="chat-permission-row">
-        <PermissionSwitch
-          icon={<GlobalOutlined />}
-          label="联网"
-          checked={permissions.enableWebSearch}
-          disabled={!permissions.supportsWebSearch}
-          tooltip={
-            permissions.supportsWebSearch
-              ? "允许本轮对话使用联网搜索"
-              : "当前模型/接口未检测到联网搜索能力，保存 AI 配置会重新检测"
-          }
-          onChange={(checked) => onUpdatePermission({ enableWebSearch: checked })}
-        />
-        <PermissionSwitch
-          icon={<FileSearchOutlined />}
-          label="页面"
-          checked={permissions.includePageContext}
-          tooltip="发送前自动附带当前页面上下文"
-          onChange={(checked) => onUpdatePermission({ includePageContext: checked })}
-        />
-        <PermissionSwitch
-          icon={<ToolOutlined />}
-          label="工具"
-          checked={permissions.enableTools}
-          tooltip="允许 AI 调用页面、网络、截图等工具"
-          onChange={(checked) => onUpdatePermission({ enableTools: checked })}
-        />
       </div>
 
       <div className="chat-messages" ref={scrollRef} onScroll={handleScroll}>
@@ -778,18 +909,12 @@ export function ChatPanel({
                 />
               ) : (
                 <>
-                  {message.role === "tool" ||
-                  message.source === "extension_ai" ? (
+                  {message.source === "extension_ai" ? (
                     <div className="chat-meta">
                       <div className="chat-meta-labels">
                         <Typography.Text type="secondary">
-                          {message.role === "tool" ? "工具" : "插件 AI"}
+                          插件 AI
                         </Typography.Text>
-                        {message.role === "tool" && message.toolName ? (
-                          <Typography.Text type="secondary">
-                            {message.toolName}
-                          </Typography.Text>
-                        ) : null}
                       </div>
                     </div>
                   ) : null}
@@ -876,6 +1001,17 @@ export function ChatPanel({
       </div>
 
       <div className="chat-bottom-stack">
+        {pendingAgentBudgetRequest ? (
+          <AgentBudgetDecisionCard
+            pending={pendingAgentBudgetRequest}
+            onResolve={(decision) =>
+              onResolveAgentBudgetRequest(
+                pendingAgentBudgetRequest.id,
+                decision,
+              )
+            }
+          />
+        ) : null}
         {activeApproval ? (
           <div className="tool-approval-stack">
             {pendingToolApprovals.length > 1 ? (
@@ -928,11 +1064,6 @@ export function ChatPanel({
             />
           </div>
         ) : null}
-        <ExecutionApprovalModeBar
-          mode={executionApprovalMode}
-          scopeLabel={executionApprovalScopeLabel}
-          onChange={onChangeExecutionApprovalMode}
-        />
         <div className={`chat-composer ${composerFocused ? "chat-composer-focused" : ""}`}>
         {queuedMessages.length ? (
           <div className="chat-queue" aria-label="待发送消息队列">
@@ -1054,51 +1185,168 @@ export function ChatPanel({
               ? "继续输入；Enter 排队，⌘/Ctrl + Enter 强制发送"
               : composerBlocked
                 ? "页面工具执行中…"
-                : "询问当前页面、粘贴日志或附加图片…"
+                : "询问当前页面、粘贴日志或添加附件…"
           }
         />
         <div className="composer-footer">
           <div className="composer-actions">
-            <Tooltip title="读取页面">
+            <Dropdown
+              trigger={["click"]}
+              menu={{
+                items: [
+                  {
+                    key: "screenshot",
+                    icon: <CameraOutlined />,
+                    label: "附加当前页截图",
+                    disabled: !supportsVision || shortcutState.disabled,
+                  },
+                  {
+                    key: "upload-image",
+                    icon: <PictureOutlined />,
+                    label: "上传图片",
+                    disabled: !supportsVision,
+                  },
+                  {
+                    key: "upload-text",
+                    icon: <FileTextOutlined />,
+                    label: "导入文本文件",
+                  },
+                ],
+                onClick: ({ key }) => {
+                  if (key === "screenshot") {
+                    void captureScreenshot();
+                  } else if (key === "upload-image") {
+                    fileInputRef.current?.click();
+                  } else if (key === "upload-text") {
+                    textFileInputRef.current?.click();
+                  }
+                },
+              }}
+            >
+              <Tooltip title="添加附件">
+                <Button
+                  className="composer-add-button"
+                  type="text"
+                  icon={<PlusOutlined />}
+                  aria-label="添加附件"
+                />
+              </Tooltip>
+            </Dropdown>
+            <Tooltip title="立即读取当前页面">
               <Button
+                className="composer-page-action"
                 type="text"
                 icon={<FileSearchOutlined />}
-                onClick={onReadPage}
-                loading={shortcutState.readPageLoading}
                 disabled={shortcutState.disabled}
-                aria-label="读取页面"
+                onClick={onReadPage}
+                aria-label="读取当前页面"
               />
             </Tooltip>
-            <Tooltip title={elementPickerActive ? "取消选择元素" : "选择元素"}>
+            <Tooltip
+              title={elementPickerActive ? "取消选择页面元素" : "选择页面元素"}
+            >
               <Button
+                className={`composer-page-action${
+                  elementPickerActive ? " is-active" : ""
+                }`}
                 type="text"
                 danger={elementPickerActive}
                 icon={elementPickerActive ? <CloseOutlined /> : <AimOutlined />}
-                onClick={elementPickerActive ? onCancelElementPick : onPickElement}
-                loading={shortcutState.elementPickerLoading}
                 disabled={shortcutState.disabled}
-                aria-label={elementPickerActive ? "取消选择元素" : "选择元素"}
+                onClick={
+                  elementPickerActive ? onCancelElementPick : onPickElement
+                }
+                aria-label={
+                  elementPickerActive ? "取消选择页面元素" : "选择页面元素"
+                }
               />
             </Tooltip>
-            <Tooltip title={supportsVision ? "附加截图" : "当前检测结果不支持图片输入"}>
+            <ModelProfileControl
+              profiles={modelProfiles}
+              activeProfileId={activeModelProfileId}
+              disabled={agentBusy}
+              onChange={onChangeModelProfile}
+            />
+            <McpModeControl
+              selection={externalMcpSelection}
+              servers={externalMcpServers}
+              disabled={!permissions.enableTools}
+              onChange={onChangeExternalMcpSelection}
+              onOpenSettings={() => onOpenSettings("mcp")}
+            />
+            <Popover
+              placement="topLeft"
+              trigger="click"
+              content={
+                <div className="composer-capabilities">
+                  <div className="composer-capabilities-heading">
+                    本轮能力
+                  </div>
+                  <PermissionSwitch
+                    icon={<GlobalOutlined />}
+                    label="联网搜索"
+                    checked={permissions.enableWebSearch}
+                    disabled={!permissions.supportsWebSearch}
+                    tooltip={
+                      permissions.supportsWebSearch
+                        ? "允许本轮对话使用联网搜索"
+                        : "当前模型/接口未检测到联网搜索能力，可在模型管理中重新检测"
+                    }
+                    onChange={(checked) =>
+                      onUpdatePermission({ enableWebSearch: checked })
+                    }
+                  />
+                  <PermissionSwitch
+                    icon={<FileSearchOutlined />}
+                    label="附带页面"
+                    checked={permissions.includePageContext}
+                    tooltip="发送前自动附带当前页面上下文"
+                    onChange={(checked) =>
+                      onUpdatePermission({ includePageContext: checked })
+                    }
+                  />
+                  <PermissionSwitch
+                    icon={<ToolOutlined />}
+                    label="允许工具"
+                    checked={permissions.enableTools}
+                    tooltip="允许 AI 调用页面、网络、截图等工具"
+                    onChange={(checked) =>
+                      onUpdatePermission({ enableTools: checked })
+                    }
+                  />
+                </div>
+              }
+            >
               <Button
+                className="composer-capability-trigger"
                 type="text"
-                icon={<CameraOutlined />}
-                onClick={captureScreenshot}
-                disabled={!supportsVision || shortcutState.disabled}
-                loading={shortcutState.screenshotLoading}
-                aria-label="附加截图"
-              />
-            </Tooltip>
-            <Tooltip title={supportsVision ? "上传图片" : "当前检测结果不支持图片输入"}>
-              <Button
-                type="text"
-                icon={<PictureOutlined />}
-                onClick={() => fileInputRef.current?.click()}
-                disabled={!supportsVision}
-                aria-label="上传图片"
-              />
-            </Tooltip>
+                icon={<ToolOutlined />}
+                aria-label="调整本轮能力"
+              >
+                能力
+              </Button>
+            </Popover>
+            <ExecutionApprovalModeBar
+              mode={executionApprovalMode}
+              scopeLabel={executionApprovalScopeLabel}
+              onChange={onChangeExecutionApprovalMode}
+            />
+            {contextUsage ? (
+              <Popover
+                placement="topLeft"
+                trigger="click"
+                content={<ContextUsageDetails report={contextUsage} />}
+              >
+                <Button
+                  className="context-usage-trigger"
+                  type="text"
+                  icon={<PieChartOutlined />}
+                  aria-label={`查看上下文占用，约 ${contextUsagePercent(contextUsage)}%`}
+                >
+                  {contextUsagePercent(contextUsage)}%
+                </Button>
+              </Popover>
+            ) : null}
           </div>
           <div className="composer-run-actions">
             {agentBusy ? (
@@ -1155,6 +1403,14 @@ export function ChatPanel({
         multiple
         hidden
         onChange={(event) => void addFiles(event.target.files)}
+      />
+      <input
+        ref={textFileInputRef}
+        type="file"
+        accept=".txt,.md,.markdown,.json,.jsonl,.log,.csv,.tsv,.yaml,.yml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.java,.go,.rs,.sh,text/*,application/json"
+        multiple
+        hidden
+        onChange={(event) => void addTextFiles(event.target.files)}
       />
       <Drawer
         className="background-work-drawer"
@@ -1417,6 +1673,45 @@ export function ChatPanel({
   );
 }
 
+function AgentBudgetDecisionCard({
+  pending,
+  onResolve,
+}: {
+  pending: PendingAgentBudgetRequest;
+  onResolve: (decision: AgentRunBudgetExtensionDecision) => void;
+}) {
+  const { request } = pending;
+  return (
+    <section
+      className="agent-budget-decision"
+      aria-labelledby={`agent-budget-title-${pending.id}`}
+    >
+      <div className="agent-budget-decision-copy">
+        <strong id={`agent-budget-title-${pending.id}`}>
+          <SafetyCertificateOutlined /> 需要确认是否继续
+        </strong>
+        <span>
+          本轮{request.label}已使用 {formatAgentRunBudgetAmount(request.kind, request.used)}，
+          当前上限 {formatAgentRunBudgetAmount(request.kind, request.limit)}。
+          继续后上限增至 {formatAgentRunBudgetAmount(request.kind, request.nextLimit)}。
+        </span>
+      </div>
+      <div className="agent-budget-decision-actions">
+        <Button size="small" onClick={() => onResolve("summarize")}>
+          停止并总结
+        </Button>
+        <Button
+          size="small"
+          type="primary"
+          onClick={() => onResolve("continue")}
+        >
+          继续执行
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 function formatDelegatedTaskClipboard(task: DelegatedTaskSnapshot): string {
   const criteria = task.request.acceptanceCriteria.length
     ? `\n\n完成标准：\n${task.request.acceptanceCriteria
@@ -1510,7 +1805,7 @@ function ToolApprovalCard({
   const titleId = `tool-approval-title-${approval.id}`;
   const descriptionId = `tool-approval-description-${approval.id}`;
   const cardRef = useRef<HTMLElement>(null);
-  const [argumentsExpanded, setArgumentsExpanded] = useState(false);
+  const [detailsExpanded, setDetailsExpanded] = useState(false);
   const formattedArguments = useMemo(
     () => formatApprovalArguments(approval.arguments),
     [approval.arguments],
@@ -1518,7 +1813,7 @@ function ToolApprovalCard({
 
   useEffect(() => {
     cardRef.current?.focus({ preventScroll: true });
-    setArgumentsExpanded(false);
+    setDetailsExpanded(false);
   }, [approval.id]);
 
   const isDecisionBarrier =
@@ -1528,6 +1823,28 @@ function ToolApprovalCard({
     approval,
     isDecisionBarrier,
   );
+  const displayToolName = approval.externalMcp?.toolName ?? approval.toolName;
+  const runMenuItems = [
+    ...(approval.allowForConversationOriginAvailable && approval.conversationOrigin
+      ? [
+          {
+            key: "allow_conversation_origin",
+            label: "本对话自动运行",
+          },
+        ]
+      : []),
+    ...(approval.externalMcp
+      ? [
+          {
+            key: "allow_external_mcp",
+            label: "始终运行此 MCP",
+          },
+        ]
+      : []),
+  ];
+  const approvalSummary = approval.externalMcp
+    ? `是否运行 ${displayToolName}？`
+    : approval.preview?.summary || `是否运行 ${displayToolName}？`;
 
   return (
     <section
@@ -1539,41 +1856,93 @@ function ToolApprovalCard({
       aria-describedby={descriptionId}
       tabIndex={-1}
     >
-      <div className="tool-approval-attention">
-        <div className="tool-approval-title">
-          <ToolOutlined />
-          <span id={titleId}>需要你的确认</span>
+      <button
+        type="button"
+        className="tool-approval-summary-toggle"
+        onClick={() => setDetailsExpanded((current) => !current)}
+        aria-expanded={detailsExpanded}
+        aria-controls={`tool-approval-details-${approval.id}`}
+      >
+        <span className="tool-approval-title">
+          <ToolOutlined aria-hidden="true" />
+          <span id={titleId} title={displayToolName}>{displayToolName}</span>
+          {approval.externalMcp ? (
+            <span
+              className="tool-approval-origin"
+              title={approval.externalMcp.serverName}
+            >
+              {approval.externalMcp.serverName}
+            </span>
+          ) : (
+            <span
+              className={`tool-approval-risk ${isDecisionBarrier ? "is-high" : ""}`}
+            >
+              {isDecisionBarrier ? "高风险" : "需确认"}
+            </span>
+          )}
+        </span>
+        <RightOutlined
+          className={`disclosure-chevron${detailsExpanded ? " is-expanded" : ""}`}
+          aria-hidden="true"
+        />
+      </button>
+      <div className="tool-approval-prompt-row">
+        <Typography.Text id={descriptionId} className="tool-approval-copy">
+          {approvalSummary}
+        </Typography.Text>
+        <div className="tool-approval-actions">
+          <Button size="small" onClick={() => onResolve("deny")}>取消</Button>
+          {runMenuItems.length > 0 ? (
+            <Dropdown.Button
+              type="primary"
+              size="small"
+              icon={<DownOutlined aria-hidden="true" />}
+              overlayClassName="tool-approval-run-menu"
+              placement="bottomRight"
+              onClick={() => onResolve("allow_once")}
+              menu={{
+                items: runMenuItems,
+                onClick: ({ key }) =>
+                  onResolve(key as ToolApprovalDecision),
+              }}
+            >
+              运行
+            </Dropdown.Button>
+          ) : (
+            <Button
+              type="primary"
+              size="small"
+              onClick={() => onResolve("allow_once")}
+            >
+              运行
+            </Button>
+          )}
         </div>
-        <Tag color="orange">{approval.toolName}</Tag>
       </div>
-      <div className="tool-approval-body">
-        <Typography.Paragraph
-          id={descriptionId}
-          className="tool-approval-copy"
-        >
-          Agent 正在等待授权，确认前不会继续执行这个操作。
-        </Typography.Paragraph>
-        <div
-          className={`tool-approval-policy ${
-            isDecisionBarrier ? "is-decision-barrier" : "is-task-grant"
-          }`}
-          role="note"
-        >
-          <strong>
-            {isDecisionBarrier
-              ? "高风险操作 · 必须逐次确认"
-              : "普通操作 · 可由当前聊天授权覆盖"}
-          </strong>
+      {detailsExpanded ? (
+      <div
+        id={`tool-approval-details-${approval.id}`}
+        className="tool-approval-body"
+      >
+        <div className="tool-approval-detail-row" role="note">
+          <strong>{isDecisionBarrier ? "必须逐次确认" : "授权范围"}</strong>
           <span>{policyDescription}</span>
         </div>
         {approval.allowForConversationOriginAvailable &&
         approval.conversationOrigin ? (
           <div className="tool-approval-run-scope" role="note">
-            选择“替我审批并继续”后，当前聊天可在
+            下拉选择“当前聊天自动运行”后，可在
             <strong> {approval.conversationOrigin} </strong>
             自动批准普通页面操作、视觉观察和聚合 Network 证据。切换聊天、域名、
             Profile、Provider 或关闭开关后立即失效；提交、发送、删除、敏感字段、
             原始响应体和规则修改仍会逐次确认。
+          </div>
+        ) : null}
+        {approval.externalMcp ? (
+          <div className="tool-approval-run-scope is-external" role="note">
+            下拉选择“此后自动运行”会允许
+            <strong> {approval.externalMcp.serverName} </strong>
+            的读取、写入、删除和未知工具跳过后续审批，直到你在 MCP 设置中撤销。
           </div>
         ) : null}
         {approval.requester ? (
@@ -1617,52 +1986,20 @@ function ToolApprovalCard({
           <div className="tool-approval-args-heading">
             <Typography.Text strong>操作参数</Typography.Text>
             <Typography.Text type="secondary">
-              {formattedArguments.length} 字符
+              约 {formatEstimatedTokenCount(estimateTextTokens(formattedArguments))}
             </Typography.Text>
-            <Button
-              type="text"
-              size="small"
-              icon={
-                <RightOutlined
-                  className={`disclosure-chevron${argumentsExpanded ? " is-expanded" : ""}`}
-                  aria-hidden="true"
-                />
-              }
-              onClick={() => setArgumentsExpanded((current) => !current)}
-              aria-expanded={argumentsExpanded}
-              aria-controls={`tool-approval-args-${approval.id}`}
-            >
-              {argumentsExpanded ? "收起" : "展开"}
-            </Button>
           </div>
-          {argumentsExpanded ? (
-            <pre
-              id={`tool-approval-args-${approval.id}`}
-              className="tool-approval-args"
-              tabIndex={0}
-              aria-label={`${approval.toolName} 操作参数`}
-            >
-              {formattedArguments}
-            </pre>
-          ) : null}
-        </div>
-        <div className="tool-approval-actions">
-          <Button danger onClick={() => onResolve("deny")}>拒绝</Button>
-          <Button onClick={() => onResolve("allow_once")}>仅本次允许</Button>
-          {approval.allowForConversationOriginAvailable &&
-          approval.conversationOrigin ? (
-            <Tooltip title="仅当前聊天与当前域名；可随时通过输入框上方的开关关闭">
-              <Button
-                type="primary"
-                onClick={() => onResolve("allow_conversation_origin")}
-                aria-label={`此聊天在 ${approval.conversationOrigin} 自动允许页面操作`}
-              >
-                替我审批并继续
-              </Button>
-            </Tooltip>
-          ) : null}
+          <pre
+            id={`tool-approval-args-${approval.id}`}
+            className="tool-approval-args"
+            tabIndex={0}
+            aria-label={`${approval.toolName} 操作参数`}
+          >
+            {formattedArguments}
+          </pre>
         </div>
       </div>
+      ) : null}
     </section>
   );
 }
@@ -1672,12 +2009,14 @@ function ExecutionTargetBar({
   mode,
   foregroundTab,
   queuedCount,
+  unavailable = false,
   onFocus,
 }: {
   target: ExecutionTaskBinding["target"];
   mode: "task" | "tool";
   foregroundTab?: BrowserTargetTab;
   queuedCount: number;
+  unavailable?: boolean;
   onFocus: (tabId: number) => void;
 }) {
   const viewingAnotherTab =
@@ -1701,11 +2040,15 @@ function ExecutionTargetBar({
         <AimOutlined />
       </span>
       <span className="execution-target-copy">
-        <strong title={taskTitle}>
-          {mode === "task" ? "后台执行" : "工具目标"} · {taskTitle}
+        <strong title={unavailable ? `原目标：${taskTitle}` : taskTitle}>
+          {unavailable
+            ? `${mode === "task" ? "后台执行" : "工具目标"} · 目标页已关闭`
+            : `${mode === "task" ? "后台执行" : "工具目标"} · ${taskTitle}`}
         </strong>
         <span>
-          {viewingAnotherTab
+          {unavailable
+            ? `原目标：${taskTitle}；页面相关工具不会再发送到该 Tab`
+            : viewingAnotherTab
             ? mode === "task"
               ? `当前浏览：${foregroundTitle}；新消息将作为独立任务排队到此页`
               : `当前浏览：${foregroundTitle}；后续工具调用仍发送到此页`
@@ -1714,7 +2057,7 @@ function ExecutionTargetBar({
               }`}
         </span>
       </span>
-      {viewingAnotherTab ? (
+      {viewingAnotherTab && !unavailable ? (
         <Button
           size="small"
           onClick={() => onFocus(target.tabId)}
@@ -1858,6 +2201,7 @@ function ExecutionApprovalModeBar({
 
   return (
     <Dropdown
+      overlayClassName="execution-approval-menu"
       open={menuOpen}
       onOpenChange={setMenuOpen}
       trigger={["click"]}
@@ -1881,31 +2225,26 @@ function ExecutionApprovalModeBar({
         },
       }}
     >
-      <button
-        type="button"
+      <Button
+        type="text"
+        size="small"
         className={`execution-approval-mode is-${mode}`}
+        icon={active.icon}
         aria-label={`切换执行审批模式，当前为${active.title}`}
         aria-haspopup="menu"
         aria-expanded={menuOpen}
+        title={
+          mode === "ask"
+            ? active.description
+            : `${scopeLabel ?? "当前页面"} · 当前聊天`
+        }
       >
-        <span className="execution-approval-mode-copy" aria-live="polite">
-          {active.icon}
-          <span>
-            <strong>{active.title}</strong>
-            <span className="execution-approval-mode-scope">
-              {mode === "ask"
-                ? active.description
-                : `${scopeLabel ?? "当前页面"} · 当前聊天`}
-            </span>
-          </span>
-        </span>
-        <span
-          className={`execution-approval-mode-chevron${menuOpen ? " is-expanded" : ""}`}
+        <strong aria-live="polite">{active.title}</strong>
+        <DownOutlined
+          className={`composer-control-chevron${menuOpen ? " is-expanded" : ""}`}
           aria-hidden="true"
-        >
-          <DownOutlined />
-        </span>
-      </button>
+        />
+      </Button>
     </Dropdown>
   );
 }
@@ -1937,8 +2276,16 @@ function formatApprovalPolicyDescription(
   return "当前调用属于受限的页面证据读取或可撤销操作，可由同一聊天和域名的普通操作授权覆盖。";
 }
 
-function renderRichContent(content: string): ReactNode {
-  return <MarkdownContent content={content} />;
+function renderRichContent(
+  content: string,
+  repairFlattenedBlocks = false,
+): ReactNode {
+  return (
+    <MarkdownContent
+      content={content}
+      repairFlattenedBlocks={repairFlattenedBlocks}
+    />
+  );
 }
 
 function visibleMessageContent(
@@ -1976,47 +2323,125 @@ function renderImageAttachments(attachments: ChatImageAttachment[]): ReactNode {
   );
 }
 
-function getToolMessageSummary(message: ChatMessage): string {
-  const { content, toolResultMeta } = message;
-  const parsed = parseJsonObject(content);
-  const size = toolResultMeta
-    ? toolResultMeta.truncated
-      ? ` · ${formatCharCount(toolResultMeta.displayedSourceCharCount)}/${formatCharCount(toolResultMeta.originalCharCount)} · 已截断`
-      : ` · ${formatCharCount(toolResultMeta.originalCharCount)} · 完整`
-    : ` · ${formatCharCount(content.length)}`;
-  if (parsed) {
-    const count = typeof parsed.count === "number" ? ` · ${parsed.count} matches` : "";
-    const returned =
-      typeof parsed.returnedCount === "number"
-        ? ` · ${parsed.returnedCount} returned`
-        : "";
-    const truncated =
-      parsed.truncated === true
-        ? " · 数据源已截断"
-        : parsed.truncated === false
-          ? " · 数据源完整"
-          : "";
-    const query = typeof parsed.query === "string" ? ` · ${parsed.query}` : "";
-    const patchId = typeof parsed.patchId === "string" ? ` · ${parsed.patchId}` : "";
-    return `工具结果已收起${count}${returned}${truncated}${query}${patchId}${size}`;
-  }
+const CONTEXT_USAGE_LABELS: Record<AiContextUsageCategory, string> = {
+  system: "系统提示",
+  tool_definitions: "工具定义",
+  conversation: "对话",
+  page_context: "页面上下文",
+  tool_results: "MCP 与工具结果",
+  other: "协议开销",
+};
 
-  return `工具结果已收起${size}`;
+function ContextUsageDetails({
+  report,
+}: {
+  report: AiContextUsageSnapshot;
+}): ReactNode {
+  const percentage = contextUsagePercent(report);
+  const rows = (
+    Object.entries(report.breakdown) as Array<
+      [AiContextUsageCategory, number]
+    >
+  ).filter(([, tokens]) => tokens > 0);
+
+  return (
+    <div className="context-usage-popover" aria-label="上下文占用明细">
+      <div className="context-usage-heading">
+        <strong>上下文占用</strong>
+        <span>{percentage}%</span>
+      </div>
+      <div className="context-usage-total">
+        约 {formatEstimatedTokenCount(report.estimatedInputTokens)} / {formatEstimatedTokenCount(report.contextWindowTokens)}
+      </div>
+      <div
+        className="context-usage-meter"
+        role="img"
+        aria-label={`约使用 ${percentage}% 上下文`}
+      >
+        {rows.map(([category, tokens]) => (
+          <span
+            key={category}
+            className={`context-usage-segment is-${category}`}
+            style={{ flexGrow: tokens }}
+          />
+        ))}
+        {report.contextWindowTokens > report.estimatedInputTokens ? (
+          <span
+            className="context-usage-segment is-unused"
+            style={{
+              flexGrow:
+                report.contextWindowTokens - report.estimatedInputTokens,
+            }}
+          />
+        ) : null}
+      </div>
+      <div className="context-usage-list">
+        {rows.map(([category, tokens]) => (
+          <div className="context-usage-row" key={category}>
+            <span>
+              <i className={`context-usage-dot is-${category}`} />
+              {CONTEXT_USAGE_LABELS[category]}
+            </span>
+            <strong>约 {formatEstimatedTokenCount(tokens)}</strong>
+          </div>
+        ))}
+      </div>
+      <div className="context-usage-reserve">
+        输入预算 {formatEstimatedTokenCount(report.inputBudgetTokens)} · 输出预留 {formatEstimatedTokenCount(report.outputReserveTokens)}
+      </div>
+      {report.omittedMessageCount > 0 || report.compactedMessageCount > 0 ? (
+        <div className="context-usage-compaction" role="note">
+          发送前已省略 {report.omittedMessageCount} 条消息、压缩 {report.compactedMessageCount} 条消息。
+        </div>
+      ) : null}
+      <div className="context-usage-note">
+        估算值；实际 token 数以当前模型的 tokenizer 为准。
+      </div>
+    </div>
+  );
+}
+
+function getToolMessageSummary(message: ChatMessage): string {
+  const size = message.toolResultMeta?.truncated
+    ? `${formatToolResultTokens(message, "displayed")}/${formatToolResultTokens(message, "original")} · 已截断`
+    : formatToolResultTokens(message, "original");
+  return `${size} · ${isFailedToolMessage(message) ? "失败" : "完成"}`;
+}
+
+function getToolDisplayName(message: ChatMessage): string {
+  return message.toolDisplayName?.trim() || message.toolName?.trim() || "未命名调用";
+}
+
+function isFailedToolMessage(message: ChatMessage): boolean {
+  const parsed = parseJsonObject(message.content);
+  return Boolean(parsed && (typeof parsed.error === "string" || parsed.isError === true));
 }
 
 function getExpandedToolResultLabel(message: ChatMessage): string {
   const meta = message.toolResultMeta;
   if (!meta) {
-    return `结果 · ${formatCharCount(message.content.length)}`;
+    return `结果 · ${formatToolResultTokens(message, "original")}`;
   }
   if (meta.truncated) {
-    return `已显示 ${formatCharCount(meta.displayedSourceCharCount)} / 原始 ${formatCharCount(meta.originalCharCount)}`;
+    return `已显示 ${formatToolResultTokens(message, "displayed")} / 原始约 ${formatToolResultTokens(message, "original")}`;
   }
-  return `完整结果 · ${formatCharCount(meta.originalCharCount)}`;
+  return `完整结果 · ${formatToolResultTokens(message, "original")}`;
 }
 
-function formatCharCount(count: number): string {
-  return count >= 1000 ? `${Math.round(count / 100) / 10}k chars` : `${count} chars`;
+function formatToolResultTokens(
+  message: ChatMessage,
+  target: "displayed" | "original",
+): string {
+  const meta = message.toolResultMeta;
+  if (!meta || !meta.truncated) {
+    return `≈${formatEstimatedTokenCount(estimateTextTokens(message.content))}`;
+  }
+  const sample = message.content.slice(0, meta.displayedSourceCharCount);
+  const tokenCount =
+    target === "displayed"
+      ? estimateTextTokens(sample)
+      : estimateTokensFromCharacterCount(meta.originalCharCount, sample);
+  return `≈${formatEstimatedTokenCount(tokenCount)}`;
 }
 
 const TOOL_RESULT_VIRTUAL_LINE_THRESHOLD = 240;
@@ -2385,6 +2810,63 @@ function delegatedTaskEventLabel(
   }[eventType];
 }
 
+function ModelProfileControl({
+  profiles,
+  activeProfileId,
+  disabled,
+  onChange,
+}: {
+  profiles: Array<{ id: string; name: string; model: string }>;
+  activeProfileId: string;
+  disabled: boolean;
+  onChange: (profileId: string) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const active =
+    profiles.find((profile) => profile.id === activeProfileId) ?? profiles[0];
+  return (
+    <Tooltip
+      title={
+        disabled
+          ? "当前回复完成后可切换模型"
+          : "切换已保存的模型；下一条消息生效"
+      }
+    >
+      <Dropdown
+        trigger={["click"]}
+        open={menuOpen}
+        onOpenChange={setMenuOpen}
+        disabled={disabled || profiles.length === 0}
+        menu={{
+          selectable: true,
+          selectedKeys: active ? [active.id] : [],
+          items: profiles.map((profile) => ({
+            key: profile.id,
+            label: profile.model || profile.name,
+          })),
+          onClick: ({ key }) => {
+            onChange(key);
+            setMenuOpen(false);
+          },
+        }}
+      >
+        <Button
+          size="small"
+          className="model-profile-button"
+          aria-label={`切换模型，当前为${active?.model ?? "未配置"}`}
+        >
+          <span>{active?.model || "选择模型"}</span>
+          <DownOutlined
+            className={`composer-control-chevron${
+              menuOpen ? " is-expanded" : ""
+            }`}
+          />
+        </Button>
+      </Dropdown>
+    </Tooltip>
+  );
+}
+
 function PermissionSwitch({
   icon,
   label,
@@ -2418,6 +2900,101 @@ function PermissionSwitch({
   );
 }
 
+function McpModeControl({
+  selection,
+  servers,
+  disabled,
+  onChange,
+  onOpenSettings,
+}: {
+  selection: ExternalMcpSelection;
+  servers: ExternalMcpServerSummary[];
+  disabled: boolean;
+  onChange: (selection: ExternalMcpSelection) => void;
+  onOpenSettings: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const enabledServers = servers.filter((server) => server.enabled);
+  const selectedServer =
+    selection.mode === "selected"
+      ? enabledServers.find((server) => selection.serverIds.includes(server.id))
+      : undefined;
+  const label =
+    selection.mode === "auto"
+      ? "MCP 自动"
+      : selectedServer
+        ? `MCP · ${selectedServer.name}`
+        : "MCP 关闭";
+  const items = [
+    { key: "off", label: "关闭外部 MCP" },
+    { key: "auto", label: "自动选择已启用 MCP", disabled: enabledServers.length === 0 },
+    ...(enabledServers.length > 0
+      ? [{ type: "divider" as const }]
+      : []),
+    ...enabledServers.map((server) => ({
+      key: `server:${server.id}`,
+      label: `仅使用 ${server.name}`,
+    })),
+    { type: "divider" as const },
+    { key: "settings", label: "管理 MCP…" },
+  ];
+  return (
+    <Tooltip
+      title={
+        disabled
+          ? "先开启工具调用"
+          : "控制当前聊天是否向 AI 暴露已启用的第三方 MCP 工具"
+      }
+    >
+      <Dropdown
+        trigger={["click"]}
+        open={menuOpen}
+        onOpenChange={setMenuOpen}
+        disabled={disabled}
+        menu={{
+          items,
+          selectedKeys:
+            selection.mode === "selected" && selectedServer
+              ? [`server:${selectedServer.id}`]
+              : [selection.mode],
+          onClick: ({ key }) => {
+            if (key === "settings") {
+              setMenuOpen(false);
+              onOpenSettings();
+              return;
+            }
+            if (key === "auto" || key === "off") {
+              setMenuOpen(false);
+              onChange({ mode: key, serverIds: [] });
+              return;
+            }
+            if (key.startsWith("server:")) {
+              setMenuOpen(false);
+              onChange({
+                mode: "selected",
+                serverIds: [key.slice("server:".length)],
+              });
+            }
+          },
+        }}
+      >
+        <Button
+          size="small"
+          className={`permission-mcp-button${disabled ? " is-disabled" : ""}`}
+          icon={<ApiOutlined />}
+        >
+          {label}
+          <DownOutlined
+            className={`composer-control-chevron${
+              menuOpen ? " is-expanded" : ""
+            }`}
+          />
+        </Button>
+      </Dropdown>
+    </Tooltip>
+  );
+}
+
 function downloadDataUrl(dataUrl: string, filename: string): void {
   const anchor = document.createElement("a");
   anchor.href = dataUrl;
@@ -2447,6 +3024,11 @@ function downloadTextFile(
 function sanitizeDownloadName(filename: string): string {
   const trimmed = filename.trim() || "image.png";
   return trimmed.replace(/[<>:"|?*\x00-\x1f]/g, "-");
+}
+
+function formatImportedTextFile(filename: string, content: string): string {
+  const normalizedName = filename.trim() || "未命名文件";
+  return [`[导入文件：${normalizedName}]`, content].join("\n");
 }
 
 function fileToAttachment(file: File): Promise<ChatImageAttachment> {

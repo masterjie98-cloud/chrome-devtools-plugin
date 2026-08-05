@@ -2,6 +2,7 @@ import type { DomElementInfo, PageSnapshot } from "../../shared/dom";
 import type { CollaborationWorkspaceSnapshot } from "../../shared/collaborationWorkspace";
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
 import type { AgentTaskStatePatch } from "../../shared/agentTaskState";
+import type { AiContextUsageSnapshot } from "../../shared/aiContextUsage";
 import {
   appendAgentSessionEvent,
   createAgentSessionSnapshot,
@@ -25,9 +26,15 @@ import {
 } from "../../shared/agentRunBudget";
 import { createMessageId } from "../../shared/messaging";
 import {
+  estimateTextTokens,
+  estimateTokensFromCharacterCount,
+  formatEstimatedTokenCount,
+} from "../../shared/tokenEstimate";
+import {
   MCP_TOOL_NAMES,
   normalizeMcpToolName,
 } from "../../shared/mcpTools";
+import { isExternalMcpToolName } from "../../shared/externalMcp";
 import { getToolPolicy } from "../../shared/toolPolicy";
 import { TOOL_NAMES } from "../../shared/tools";
 import type { ChatImageAttachment, ChatMessage } from "../types";
@@ -66,6 +73,7 @@ import {
 import {
   arbitrateAgentFinalResult,
   createAgentResultEvidenceState,
+  needsSelfContainedReportRepair,
   recordAgentResultEvidence,
 } from "./agentResultEvidence";
 import { isMcpToolTransportError } from "./mcpTransport";
@@ -93,12 +101,19 @@ const READ_ONLY_NO_PROGRESS_NOTICE =
   "检测到相同只读工具和参数已连续两次返回相同的语义结果。为避免无进展循环，Agent 已停止重复调用；请基于已有结果总结，或调整工具、参数后再继续。";
 const INCREMENTAL_ACTIVITY_REPEAT_NOTICE =
   "本轮已经读取过一次增量页面活动。请完整总结第一次返回的事件窗口，并把 activity.nextCursor 留给用户下一次询问；不要在同一轮继续轮询。";
+const UNRELATED_EXTERNAL_MCP_BROWSER_VERIFY_NOTICE =
+  "browser_verify 仅用于验证本轮对当前浏览器页面或浏览器状态产生的修改。当前只有外部 MCP 查询，没有待验证的页面修改；请基于外部 MCP 证据继续查询或直接生成报告。";
 const CROSS_ROUND_NO_PROGRESS_THRESHOLD = 3;
 
 interface RepeatedReadOnlyObservation {
   toolName: string;
   count: number;
 }
+
+type ToolClientMetadataByName = ReadonlyMap<
+  string,
+  AiFunctionToolDefinition["clientMetadata"]
+>;
 
 interface FailedPreExecutionToolCall {
   toolName: string;
@@ -147,6 +162,7 @@ export interface RunAutonomousAgentSessionParams {
   onVisibleContent: (content: string) => void;
   onStatusUpdate?: (status: string) => void;
   onSessionUpdate?: (session: AgentSessionSnapshot) => void;
+  onContextUsage?: (report: AiContextUsageSnapshot) => void;
 }
 
 export interface RunAutonomousAgentSessionResult {
@@ -231,6 +247,7 @@ export async function runAutonomousAgentSession(
           context,
           tools: params.tools,
           abortSignal: params.abortSignal,
+          onContextUsage: params.onContextUsage,
           onDelta: (delta) => {
             initialDeltaReceived = true;
             streamedContent += delta;
@@ -277,6 +294,21 @@ export async function runAutonomousAgentSession(
     const maxToolRounds = params.config.maxToolRounds;
     const seenToolSignatures = new Map<string, number>();
     const toolNameCounts = new Map<string, number>();
+    const toolClientMetadataByName = new Map(
+      (params.tools ?? []).map((tool) => [
+        tool.function.name,
+        tool.clientMetadata,
+      ]),
+    );
+    const isRuntimeReadOnlyToolCall = (toolCall: AiRequestedToolCall) =>
+      isReadOnlyToolCall(toolCall, toolClientMetadataByName);
+    const isRuntimeLoopGuardedObservationToolCall = (
+      toolCall: AiRequestedToolCall,
+    ) =>
+      isLoopGuardedObservationToolCall(
+        toolCall,
+        toolClientMetadataByName,
+      );
     let incrementalActivityReadCount = 0;
     let lastReadOnlyBatchCallSignature = "";
     let lastReadOnlyBatchResultFingerprint = "";
@@ -288,6 +320,7 @@ export async function runAutonomousAgentSession(
     >();
     let executionProgressVersion = 0;
     let postMutationVerificationRequired = false;
+    let externalMcpToolAttempted = false;
     let blockedReason = "";
     const evidenceLossNotices = new Set<string>();
     let resultEvidence = createAgentResultEvidenceState(params.input);
@@ -325,6 +358,7 @@ export async function runAutonomousAgentSession(
         visibleContent,
         onVisibleContent: params.onVisibleContent,
         onStatusUpdate: params.onStatusUpdate,
+        onContextUsage: params.onContextUsage,
         runBudget,
         reserveBudget,
         continuationInstruction: incrementalActivitySummaryRequested
@@ -367,10 +401,16 @@ export async function runAutonomousAgentSession(
       const requestedMonitoringStart =
         monitoringSetupOnly &&
         requestedToolCalls.some(isActivityMonitorStart);
+      const requestedExternalMcpTool = requestedToolCalls.some((toolCall) =>
+        isExternalMcpToolName(toolCall.name),
+      );
       const blockNoProgressReadOnlyBatch =
         consecutiveIdenticalReadOnlyBatches >= 2 &&
         requestedBatchCallSignature === lastReadOnlyBatchCallSignature &&
-        isNoProgressObservationBatch(requestedToolCalls);
+        isNoProgressObservationBatch(
+          requestedToolCalls,
+          isRuntimeLoopGuardedObservationToolCall,
+        );
       const blockedRepeatResults: AiToolResultMessage[] = [];
       const replanBlockedResults: AiToolResultMessage[] = [];
       let repeatedPreExecutionFailureNotice = "";
@@ -378,6 +418,28 @@ export async function runAutonomousAgentSession(
         | RepeatedReadOnlyObservation
         | undefined;
       const executableToolCalls = requestedToolCalls.filter((toolCall) => {
+        if (
+          isBrowserVerifyToolCall(toolCall) &&
+          !postMutationVerificationRequired &&
+          (externalMcpToolAttempted || requestedExternalMcpTool)
+        ) {
+          blockedRepeatResults.push({
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            content: JSON.stringify(
+              {
+                blocked: true,
+                errorCode: "UNRELATED_BROWSER_VERIFICATION",
+                retryable: false,
+                reason: UNRELATED_EXTERNAL_MCP_BROWSER_VERIFY_NOTICE,
+              },
+              null,
+              2,
+            ),
+          });
+          return false;
+        }
+
         if (blockNoProgressReadOnlyBatch) {
           blockedRepeatResults.push({
             toolCallId: toolCall.id,
@@ -436,6 +498,7 @@ export async function runAutonomousAgentSession(
         const priorRepeatCount = getReadOnlyObservationRepeatCount(
           toolCall,
           readOnlyObservationCounts,
+          isRuntimeLoopGuardedObservationToolCall,
         );
         if (priorRepeatCount >= 2) {
           const observation = {
@@ -458,6 +521,7 @@ export async function runAutonomousAgentSession(
           return false;
         }
 
+        const toolNameCount = toolNameCounts.get(toolCall.name) ?? 0;
         const signature = getToolCallSignature(toolCall);
         const priorFailure = findFailedPreExecutionToolCall(
           toolCall,
@@ -505,7 +569,6 @@ export async function runAutonomousAgentSession(
         }
         const seenCount = seenToolSignatures.get(signature) ?? 0;
         seenToolSignatures.set(signature, seenCount + 1);
-        const toolNameCount = toolNameCounts.get(toolCall.name) ?? 0;
         toolNameCounts.set(toolCall.name, toolNameCount + 1);
 
         if (seenCount > 0 && isScreenshotToolCall(toolCall)) {
@@ -547,7 +610,9 @@ export async function runAutonomousAgentSession(
       if (!visibleContent.trim()) {
         emitStatus(
           params,
-          `第 ${round + 1} 轮：正在执行页面工具 ${summarizeToolNames(
+          `第 ${round + 1} 轮：正在执行${describeToolBatchKind(
+            executableToolCalls,
+          )} ${summarizeToolNames(
             executableToolCalls,
           )}…`,
         );
@@ -571,7 +636,23 @@ export async function runAutonomousAgentSession(
           toolCalls: requestedToolCalls.map(toAgentToolCallSnapshot),
         },
       );
-      await reserveBudget(() => runBudget.consumeToolCalls(requestedToolCalls));
+      await reserveBudget(() =>
+        runBudget.consumeToolCalls(executableToolCalls, (toolCall) => {
+          if (
+            isExternalMcpReadOnlyToolCall(
+              toolCall,
+              toolClientMetadataByName,
+            )
+          ) {
+            return { effectful: false, sensitive: false };
+          }
+          const policy = getToolPolicy(toolCall.name, toolCall.arguments);
+          return {
+            effectful: policy.mutatesBrowser || policy.openWorld,
+            sensitive: policy.sensitive,
+          };
+        }),
+      );
 
       const executedToolResults =
         executableToolCalls.length > 0
@@ -587,13 +668,22 @@ export async function runAutonomousAgentSession(
               (elapsedSeconds) => {
                 emitStatus(
                   params,
-                  `第 ${round + 1} 轮：正在执行页面工具 ${summarizeToolNames(
+                  `第 ${round + 1} 轮：正在执行${describeToolBatchKind(
+                    executableToolCalls,
+                  )} ${summarizeToolNames(
                     executableToolCalls,
                   )}…（已等待 ${elapsedSeconds}s）`,
                 );
               },
             )
           : [];
+      if (
+        executableToolCalls.some((toolCall) =>
+          isExternalMcpToolName(toolCall.name),
+        )
+      ) {
+        externalMcpToolAttempted = true;
+      }
       throwIfAborted(params.abortSignal);
       const taskBindingFailure = executedToolResults.find(
         isTaskBindingStaleResult,
@@ -643,7 +733,7 @@ export async function runAutonomousAgentSession(
       const mutationMayHaveExecuted = executableToolCalls.some((toolCall) => {
         const result = executedResultsById.get(toolCall.id);
         return Boolean(
-          !isReadOnlyToolCall(toolCall) &&
+          toolCallMayMutateCurrentBrowser(toolCall) &&
           result &&
           !isAgentToolResultDefinitelyNotExecuted(result.content),
         );
@@ -652,10 +742,11 @@ export async function runAutonomousAgentSession(
         executableToolCalls,
         executedToolResults,
         readOnlyObservationCounts,
+        isRuntimeLoopGuardedObservationToolCall,
       );
       const successfulReadObservation =
         executableToolCalls.length > 0 &&
-        executableToolCalls.every(isReadOnlyToolCall) &&
+        executableToolCalls.every(isRuntimeReadOnlyToolCall) &&
         executableToolCalls.some((toolCall) => {
           const result = executedResultsById.get(toolCall.id);
           return Boolean(
@@ -681,7 +772,10 @@ export async function runAutonomousAgentSession(
       }
       if (
         !blockNoProgressReadOnlyBatch &&
-        isNoProgressObservationBatch(requestedToolCalls)
+        isNoProgressObservationBatch(
+          requestedToolCalls,
+          isRuntimeLoopGuardedObservationToolCall,
+        )
       ) {
         const resultFingerprint = getToolBatchResultFingerprint(toolResults);
         if (
@@ -963,6 +1057,7 @@ export async function runAutonomousAgentSession(
           visibleContent,
           onVisibleContent: params.onVisibleContent,
           onStatusUpdate: params.onStatusUpdate,
+          onContextUsage: params.onContextUsage,
           runBudget,
           reserveBudget,
         });
@@ -1010,6 +1105,7 @@ export async function runAutonomousAgentSession(
           visibleContent,
           onVisibleContent: params.onVisibleContent,
           onStatusUpdate: params.onStatusUpdate,
+          onContextUsage: params.onContextUsage,
           runBudget,
           reserveBudget,
         });
@@ -1063,6 +1159,7 @@ export async function runAutonomousAgentSession(
                 : undefined,
             forceToolChoice: replanBlockedResults.length > 0,
             abortSignal: params.abortSignal,
+            onContextUsage: params.onContextUsage,
             onDelta: (delta) => {
               firstDeltaReceived = true;
               firstChunk += delta;
@@ -1147,6 +1244,7 @@ export async function runAutonomousAgentSession(
             visibleContent,
             onVisibleContent: params.onVisibleContent,
             onStatusUpdate: params.onStatusUpdate,
+            onContextUsage: params.onContextUsage,
             runBudget,
             reserveBudget,
             continuationInstruction:
@@ -1203,6 +1301,7 @@ export async function runAutonomousAgentSession(
             visibleContent,
             onVisibleContent: params.onVisibleContent,
             onStatusUpdate: params.onStatusUpdate,
+            onContextUsage: params.onContextUsage,
             runBudget,
             reserveBudget,
             continuationInstruction:
@@ -1222,6 +1321,49 @@ export async function runAutonomousAgentSession(
           params.onVisibleContent(
             sanitizeAssistantVisibleContent(visibleContent),
           );
+          break;
+        }
+        if (
+          needsSelfContainedReportRepair(
+            params.input,
+            firstContent,
+            toolExchanges.length,
+          )
+        ) {
+          session = publishEvent(
+            session,
+            params.onSessionUpdate,
+            "context",
+            "模型没有输出承诺的报告正文；Agent 正在基于已有工具证据重新生成自包含报告。",
+          );
+          const reportContent = await requestSelfContainedReportRewrite({
+            config: params.config,
+            messages: params.messages,
+            input: params.input,
+            attachments: activeAttachments,
+            context,
+            toolExchanges,
+            visualCheckpoint: latestVisualCheckpoint,
+            tools: params.tools,
+            abortSignal: params.abortSignal,
+            visibleContent,
+            onVisibleContent: params.onVisibleContent,
+            onStatusUpdate: params.onStatusUpdate,
+            onContextUsage: params.onContextUsage,
+            runBudget,
+            reserveBudget,
+          });
+          const completedReport = reportContent || firstContent;
+          visibleContent = appendParagraph(visibleContent, completedReport);
+          params.onVisibleContent(
+            sanitizeAssistantVisibleContent(visibleContent),
+          );
+          currentAssistantContent = completedReport;
+          aiResult = {
+            content: completedReport,
+            rawContent: completedReport,
+            toolCalls: [],
+          };
           break;
         }
         if (
@@ -1252,6 +1394,7 @@ export async function runAutonomousAgentSession(
             visibleContent,
             onVisibleContent: params.onVisibleContent,
             onStatusUpdate: params.onStatusUpdate,
+            onContextUsage: params.onContextUsage,
             runBudget,
             reserveBudget,
           });
@@ -1329,6 +1472,7 @@ export async function runAutonomousAgentSession(
             enableTools: true,
             requireContinuation: true,
             abortSignal: params.abortSignal,
+            onContextUsage: params.onContextUsage,
             onDelta: (delta) => {
               nudgeDeltaReceived = true;
               nudgeChunk += delta;
@@ -1447,6 +1591,7 @@ export async function runAutonomousAgentSession(
           visibleContent,
           onVisibleContent: params.onVisibleContent,
           onStatusUpdate: params.onStatusUpdate,
+          onContextUsage: params.onContextUsage,
           runBudget,
           reserveBudget,
           skipBudgetReservation: true,
@@ -1720,8 +1865,8 @@ function describeModelStreamEvent(
       return `${prefix}AI 正在选择下一步工具…`;
     }
     if (event.argumentLength > 0) {
-      return `${prefix}AI 正在生成 ${event.name} 的调用参数…（${formatCharCount(
-        event.argumentLength,
+      return `${prefix}AI 正在生成 ${event.name} 的调用参数…（约 ${formatEstimatedTokenCount(
+        estimateTokensFromCharacterCount(event.argumentLength),
       )}）`;
     }
     return `${prefix}AI 准备调用 ${event.name}…`;
@@ -1750,6 +1895,22 @@ function summarizeToolNames(toolCalls: AiRequestedToolCall[]): string {
   return toolCalls.map((toolCall) => toolCall.name).join(", ");
 }
 
+function describeToolBatchKind(toolCalls: AiRequestedToolCall[]): string {
+  if (toolCalls.length === 0) {
+    return "工具";
+  }
+  const externalCount = toolCalls.filter((toolCall) =>
+    isExternalMcpToolName(toolCall.name),
+  ).length;
+  if (externalCount === toolCalls.length) {
+    return " MCP 工具";
+  }
+  if (externalCount > 0) {
+    return "混合工具";
+  }
+  return "页面工具";
+}
+
 function summarizeToolResultsForStatus(
   toolResults: AiToolResultMessage[],
 ): string {
@@ -1760,7 +1921,7 @@ function summarizeToolResultsForStatus(
   return toolResults
     .map((result) => {
       const parsed = parseToolResultJson(result.content);
-      const size = formatCharCount(result.content.length);
+      const size = `约 ${formatEstimatedTokenCount(estimateTextTokens(result.content))}`;
       if (parsed) {
         const count =
           typeof parsed.count === "number" ? `${parsed.count} matches` : "";
@@ -1788,7 +1949,10 @@ function summarizeToolResultsForStatus(
 function describeExpectedToolOutcome(
   toolCalls: AiRequestedToolCall[],
 ): string {
-  if (toolCalls.every(isReadOnlyToolCall)) {
+  if (toolCalls.every((toolCall) => isExternalMcpToolName(toolCall.name))) {
+    return "获得完成外部 MCP 任务所需的证据；外部 MCP 结果不使用当前页面的 browser_verify 验证。";
+  }
+  if (toolCalls.every((toolCall) => isReadOnlyToolCall(toolCall))) {
     return "获得能减少不确定性的页面、网络或运行状态证据。";
   }
   return "完成用户要求的最小状态变更；随后必须通过独立只读观察验证结果。";
@@ -1809,10 +1973,6 @@ function parseToolResultJson(content: string): Record<string, unknown> | null {
   }
 }
 
-function formatCharCount(count: number): string {
-  return count >= 1000 ? `${Math.round(count / 100) / 10}k chars` : `${count} chars`;
-}
-
 async function summarizeAfterToolLoopStop(params: {
   config: AiConfig;
   messages: ChatMessage[];
@@ -1826,6 +1986,7 @@ async function summarizeAfterToolLoopStop(params: {
   visibleContent: string;
   onVisibleContent: (content: string) => void;
   onStatusUpdate?: (status: string) => void;
+  onContextUsage?: (report: AiContextUsageSnapshot) => void;
   runBudget: AgentRunBudget;
   reserveBudget: ReserveAgentRunBudget;
   skipBudgetReservation?: boolean;
@@ -1844,6 +2005,7 @@ async function summarizeAfterToolLoopStop(params: {
     visualCheckpoint: params.visualCheckpoint,
     tools: params.tools,
     abortSignal: params.abortSignal,
+    onContextUsage: params.onContextUsage,
     onDelta: (delta) => {
       summaryChunk += delta;
       params.onVisibleContent(
@@ -1876,6 +2038,7 @@ async function requestToolContinuationAfterPlanningText(params: {
   visibleContent: string;
   onVisibleContent: (content: string) => void;
   onStatusUpdate?: (status: string) => void;
+  onContextUsage?: (report: AiContextUsageSnapshot) => void;
   runBudget: AgentRunBudget;
   reserveBudget: ReserveAgentRunBudget;
   continuationInstruction?: string;
@@ -1896,6 +2059,70 @@ async function requestToolContinuationAfterPlanningText(params: {
   }
 }
 
+async function requestSelfContainedReportRewrite(params: {
+  config: AiConfig;
+  messages: ChatMessage[];
+  input: string;
+  attachments: ChatImageAttachment[];
+  context: AgentContext;
+  toolExchanges: AiToolExchange[];
+  visualCheckpoint?: AiVisualCheckpoint;
+  tools?: AiFunctionToolDefinition[];
+  abortSignal?: AbortSignal;
+  visibleContent: string;
+  onVisibleContent: (content: string) => void;
+  onStatusUpdate?: (status: string) => void;
+  onContextUsage?: (report: AiContextUsageSnapshot) => void;
+  runBudget: AgentRunBudget;
+  reserveBudget: ReserveAgentRunBudget;
+}): Promise<string> {
+  let chunk = "";
+  let deltaReceived = false;
+  await params.reserveBudget(() => params.runBudget.consumeModelRequest());
+  const result = await withStatusTicks(
+    () =>
+      streamAiChatAfterTools({
+        config: params.config,
+        messages: params.messages,
+        input: params.input,
+        attachments: params.attachments,
+        context: params.context,
+        toolExchanges: params.toolExchanges,
+        visualCheckpoint: params.visualCheckpoint,
+        tools: params.tools,
+        abortSignal: params.abortSignal,
+        onContextUsage: params.onContextUsage,
+        enableTools: false,
+        requireContinuation: true,
+        continuationInstruction:
+          "Your previous draft referred to a report as already shown, but the visible final answer did not contain the report body. Using only the existing tool results, write the complete self-contained report now in the user's language. Include the verified scope, sources, important counts, abnormal resources, coverage limits, and concise next checks supported by evidence. Use Markdown headings and tables where they improve repeated-field comparisons. Do not call another tool, mention this correction, or refer to content above or in tool cards.",
+        onDelta: (delta) => {
+          deltaReceived = true;
+          chunk += delta;
+        },
+        onStreamEvent: createModelProgressHandler({
+          getBaseContent: () => params.visibleContent,
+          onVisibleContent: params.onVisibleContent,
+          onStatusUpdate: params.onStatusUpdate,
+          markProgressReceived: () => {
+            deltaReceived = true;
+          },
+          phase: "summary",
+        }),
+      }),
+    (elapsedSeconds) => {
+      if (deltaReceived) {
+        return;
+      }
+      emitStatus(
+        params,
+        `工具查询已完成，正在重新生成报告正文…（已等待 ${elapsedSeconds}s）`,
+      );
+    },
+  );
+  return sanitizeAssistantVisibleContent(result.content || chunk);
+}
+
 async function streamToolContinuation(
   params: {
     config: AiConfig;
@@ -1910,6 +2137,7 @@ async function streamToolContinuation(
     visibleContent: string;
     onVisibleContent: (content: string) => void;
     onStatusUpdate?: (status: string) => void;
+    onContextUsage?: (report: AiContextUsageSnapshot) => void;
     runBudget: AgentRunBudget;
     reserveBudget: ReserveAgentRunBudget;
     continuationInstruction?: string;
@@ -1931,6 +2159,7 @@ async function streamToolContinuation(
         visualCheckpoint: params.visualCheckpoint,
         tools: params.tools,
         abortSignal: params.abortSignal,
+        onContextUsage: params.onContextUsage,
         enableTools: true,
         requireContinuation: true,
         continuationInstruction: params.continuationInstruction,
@@ -2194,25 +2423,72 @@ function findFailedPreExecutionToolCall(
 
 function isNoProgressObservationBatch(
   toolCalls: AiRequestedToolCall[],
+  isReadOnly: (toolCall: AiRequestedToolCall) => boolean = isReadOnlyToolCall,
 ): boolean {
   return (
     toolCalls.length > 0 &&
     toolCalls.every(
       (toolCall) =>
-        isReadOnlyToolCall(toolCall) && !isTimingOnlyWaitCall(toolCall),
+        isReadOnly(toolCall) && !isTimingOnlyWaitCall(toolCall),
     )
   );
 }
 
-function isReadOnlyToolCall(toolCall: AiRequestedToolCall): boolean {
+function isReadOnlyToolCall(
+  toolCall: AiRequestedToolCall,
+  toolMetadataByName?: ToolClientMetadataByName,
+): boolean {
+  if (isExternalMcpReadOnlyToolCall(toolCall, toolMetadataByName)) {
+    return true;
+  }
   const policy = getToolPolicy(toolCall.name, toolCall.arguments);
   return !policy.mutatesBrowser && !policy.openWorld;
+}
+
+function isExternalMcpReadOnlyToolCall(
+  toolCall: Pick<AiRequestedToolCall, "name">,
+  toolMetadataByName?: ToolClientMetadataByName,
+): boolean {
+  const metadata = toolMetadataByName?.get(toolCall.name);
+  const annotations = metadata?.annotations;
+  return Boolean(
+    metadata?.source === "external_mcp" &&
+      annotations?.readOnlyHint === true &&
+      annotations.destructiveHint !== true &&
+      annotations.openWorldHint !== true,
+  );
+}
+
+function isLoopGuardedObservationToolCall(
+  toolCall: AiRequestedToolCall,
+  toolMetadataByName?: ToolClientMetadataByName,
+): boolean {
+  const metadata = toolMetadataByName?.get(toolCall.name);
+  return (
+    metadata?.source === "external_mcp" ||
+    isExternalMcpToolName(toolCall.name) ||
+    isReadOnlyToolCall(toolCall, toolMetadataByName)
+  );
+}
+
+function toolCallMayMutateCurrentBrowser(
+  toolCall: AiRequestedToolCall,
+): boolean {
+  if (isExternalMcpToolName(toolCall.name)) {
+    return false;
+  }
+  return getToolPolicy(toolCall.name, toolCall.arguments).mutatesBrowser;
+}
+
+function isBrowserVerifyToolCall(toolCall: AiRequestedToolCall): boolean {
+  return normalizeMcpToolName(toolCall.name) === MCP_TOOL_NAMES.BROWSER_VERIFY;
 }
 
 function recordReadOnlyToolObservations(
   toolCalls: AiRequestedToolCall[],
   toolResults: AiToolResultMessage[],
   observationCounts: Map<string, number>,
+  isReadOnly: (toolCall: AiRequestedToolCall) => boolean = isReadOnlyToolCall,
 ): RepeatedReadOnlyObservation | undefined {
   const resultsById = new Map(
     toolResults.map((result) => [result.toolCallId, result]),
@@ -2220,7 +2496,7 @@ function recordReadOnlyToolObservations(
   let repeatedObservation: RepeatedReadOnlyObservation | undefined;
 
   for (const toolCall of toolCalls) {
-    if (!isReadOnlyToolCall(toolCall) || isTimingOnlyWaitCall(toolCall)) {
+    if (!isReadOnly(toolCall) || isTimingOnlyWaitCall(toolCall)) {
       continue;
     }
     const result = resultsById.get(toolCall.id);
@@ -2252,8 +2528,9 @@ function recordReadOnlyToolObservations(
 function getReadOnlyObservationRepeatCount(
   toolCall: AiRequestedToolCall,
   observationCounts: Map<string, number>,
+  isReadOnly: (toolCall: AiRequestedToolCall) => boolean = isReadOnlyToolCall,
 ): number {
-  if (!isReadOnlyToolCall(toolCall) || isTimingOnlyWaitCall(toolCall)) {
+  if (!isReadOnly(toolCall) || isTimingOnlyWaitCall(toolCall)) {
     return 0;
   }
   const signaturePrefix = `${getToolCallSignature(toolCall)}\n`;
@@ -2363,6 +2640,11 @@ function stripVolatileToolResultFields(
   toolName = "",
 ): unknown {
   if (Array.isArray(value)) {
+    const normalizedExternalMcpSample =
+      normalizeExternalMcpSampleForFingerprint(value, path, toolName);
+    if (normalizedExternalMcpSample) {
+      return normalizedExternalMcpSample;
+    }
     return value.map((item, index) =>
       stripVolatileToolResultFields(
         item,
@@ -2398,6 +2680,14 @@ function isVolatileToolResultField(
     return true;
   }
 
+  if (
+    isExternalMcpToolName(toolName) &&
+    isExternalMcpEnvelopePath(path) &&
+    EXTERNAL_MCP_VOLATILE_ENVELOPE_FIELDS.has(key)
+  ) {
+    return true;
+  }
+
   const normalizedName = normalizeMcpToolName(toolName) ?? toolName;
   if (normalizedName !== MCP_TOOL_NAMES.BROWSER_GET_CONTEXT_DIGEST) {
     return false;
@@ -2406,6 +2696,66 @@ function isVolatileToolResultField(
     (path.length === 0 &&
       CONTEXT_DIGEST_VOLATILE_ROOT_FIELDS.has(key)) ||
     CONTEXT_DIGEST_VOLATILE_PATHS.has(fieldPath)
+  );
+}
+
+const EXTERNAL_MCP_VOLATILE_ENVELOPE_FIELDS = new Set([
+  "observed_at",
+  "observedAt",
+  "evidence_ref",
+  "evidenceRef",
+]);
+
+function isExternalMcpEnvelopePath(path: string[]): boolean {
+  return (
+    path.length === 0 ||
+    (path.length === 1 && path[0] === "structuredContent")
+  );
+}
+
+function normalizeExternalMcpSampleForFingerprint(
+  value: unknown[],
+  path: string[],
+  toolName: string,
+): unknown[] | undefined {
+  if (
+    !isExternalMcpToolName(toolName) ||
+    !toolName.toLowerCase().includes("prometheus")
+  ) {
+    return undefined;
+  }
+
+  const fieldName = path.at(-1);
+  if (fieldName === "value" && isPrometheusSampleTuple(value)) {
+    return [
+      "<prometheus-sample-time>",
+      stripVolatileToolResultFields(value[1], [...path, "1"], toolName),
+    ];
+  }
+  if (
+    fieldName === "values" &&
+    value.length > 0 &&
+    value.every(
+      (sample) => Array.isArray(sample) && isPrometheusSampleTuple(sample),
+    )
+  ) {
+    return value.map((sample, index) => [
+      "<prometheus-sample-time>",
+      stripVolatileToolResultFields(
+        (sample as unknown[])[1],
+        [...path, String(index), "1"],
+        toolName,
+      ),
+    ]);
+  }
+  return undefined;
+}
+
+function isPrometheusSampleTuple(value: unknown[]): boolean {
+  return (
+    value.length >= 2 &&
+    typeof value[0] === "number" &&
+    Number.isFinite(value[0])
   );
 }
 

@@ -70,6 +70,15 @@ test("context budgeting removes old history but preserves the latest tool exchan
       (message) => message.content === "current task",
     ),
   );
+  assert.equal(
+    Object.values(fitted.report.breakdown).reduce(
+      (total, tokens) => total + tokens,
+      0,
+    ),
+    fitted.report.estimatedInputTokens,
+  );
+  assert.ok(fitted.report.breakdown.system > 0);
+  assert.ok(fitted.report.breakdown.tool_results > 0);
 });
 
 test("context budgeting fails locally when tool schemas consume the whole window", () => {

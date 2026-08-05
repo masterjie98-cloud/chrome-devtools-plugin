@@ -23,6 +23,7 @@ import {
 import {
   getToolPolicy,
   type ToolCapability,
+  type ToolPolicy,
   type ToolPolicyClass,
 } from "../shared/toolPolicy";
 import { isDirectMcpStateResource } from "../shared/mcpResources";
@@ -51,6 +52,7 @@ import {
   type WsClientRole,
   type McpAvailableTool,
   type McpListToolsResultPayload,
+  type ExternalMcpResultPayload,
   normalizeBrowserToolResultData,
   type StateGetResultPayload,
   type BrowserToolResultPayload,
@@ -60,6 +62,10 @@ import {
   type McpToPluginMessage,
   type McpWsAck,
 } from "../shared/wsProtocol";
+import type {
+  ExternalMcpServerConfig,
+  ExternalMcpServerSummary,
+} from "../shared/externalMcp";
 import {
   RUNTIME_BUILD_ID,
   RUNTIME_SCHEMA_HASH,
@@ -207,11 +213,53 @@ type BrowserToolCaller = (
 ) => Promise<unknown>;
 
 export interface AdditionalMcpToolBackend {
-  listTools: () => Promise<McpAvailableTool[]>;
+  listTools: (options?: { serverIds?: string[] }) => Promise<McpAvailableTool[]>;
   callTool: (
     toolName: string,
     args: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
   ) => Promise<unknown>;
+  getToolPolicy?: (
+    toolName: string,
+    args: Record<string, unknown>,
+  ) => ToolPolicy | undefined;
+  getToolOrigin?: (
+    toolName: string,
+  ) =>
+    | {
+        externalMcpServerId: string;
+        externalMcpServerName: string;
+        externalMcpToolName: string;
+      }
+    | undefined;
+  listServers?: ExternalMcpManagementBackend["listServers"];
+  upsertServer?: ExternalMcpManagementBackend["upsertServer"];
+  removeServer?: ExternalMcpManagementBackend["removeServer"];
+  setServerEnabled?: ExternalMcpManagementBackend["setServerEnabled"];
+  setServerReadOnlyTrust?: ExternalMcpManagementBackend["setServerReadOnlyTrust"];
+  setServerAutoApprove?: ExternalMcpManagementBackend["setServerAutoApprove"];
+  testServer?: ExternalMcpManagementBackend["testServer"];
+}
+
+export interface ExternalMcpManagementBackend {
+  listServers: () => ExternalMcpServerSummary[];
+  upsertServer: (
+    server: ExternalMcpServerConfig,
+  ) => Promise<ExternalMcpServerSummary[]>;
+  removeServer: (serverId: string) => Promise<ExternalMcpServerSummary[]>;
+  setServerEnabled: (
+    serverId: string,
+    enabled: boolean,
+  ) => Promise<ExternalMcpServerSummary[]>;
+  setServerReadOnlyTrust: (
+    serverId: string,
+    trusted: boolean,
+  ) => Promise<ExternalMcpServerSummary[]>;
+  setServerAutoApprove: (
+    serverId: string,
+    enabled: boolean,
+  ) => Promise<ExternalMcpServerSummary[]>;
+  testServer: (serverId: string) => Promise<ExternalMcpServerSummary[]>;
 }
 
 type ToolAuthorizer = (
@@ -779,7 +827,11 @@ export function startPluginWebSocketServer(
     > & { requestId?: string; taskContext?: ToolTaskContext } = {},
   ): Promise<AuthorizationReceipt> {
     throwIfExecutionAborted(authorizationOptions.signal);
-    const policy = getToolPolicy(toolName, args);
+    const policy = resolveMcpToolPolicy(
+      additionalMcpBackend,
+      toolName,
+      args,
+    );
     const requesterSessionId =
       clientSessionIds.get(requester) ?? browserStateHub.getActiveSession().sessionId;
     // A restarted daemon can restore an old target before the browser worker
@@ -886,6 +938,7 @@ export function startPluginWebSocketServer(
       );
     }
     const requestedAt = nowDate();
+    const externalMcpOrigin = additionalMcpBackend?.getToolOrigin?.(toolName);
     const message: McpToPluginMessage = {
       requestId: approvalId,
       command: WS_COMMANDS.APPROVAL_REQUEST,
@@ -914,6 +967,15 @@ export function startPluginWebSocketServer(
         },
         target: requestedTarget,
         preview: buildApprovalPreview(toolName, args, policy),
+        ...(externalMcpOrigin
+          ? {
+              externalMcp: {
+                serverId: externalMcpOrigin.externalMcpServerId,
+                serverName: externalMcpOrigin.externalMcpServerName,
+                toolName: externalMcpOrigin.externalMcpToolName,
+              },
+            }
+          : {}),
       },
     };
 
@@ -1207,7 +1269,8 @@ export function startPluginWebSocketServer(
   }
 
   function replayStateToObserver(socket: WebSocket): void {
-    const state = browserStateHub.snapshot(clientSessionIds.get(socket));
+    const sessionId = clientSessionIds.get(socket) ?? "default";
+    const state = browserStateHub.snapshot(sessionId);
 
     if (state.activeTab) {
       sendRawMessage(socket, {
@@ -1274,6 +1337,15 @@ export function startPluginWebSocketServer(
         payload: {
           session,
         },
+      });
+    }
+
+    for (const event of daemonAgentRunner.listPendingBudgetRequests(sessionId)) {
+      sendRawMessage(socket, {
+        requestId: createMessageId(),
+        command: WS_COMMANDS.DAEMON_AGENT_EVENT,
+        sentAt: new Date().toISOString(),
+        payload: event,
       });
     }
 
@@ -1359,12 +1431,34 @@ export function startPluginWebSocketServer(
   ): Promise<boolean> {
     if (message.command === WS_COMMANDS.DAEMON_AGENT_CANCEL) {
       const sessionId = clientSessionIds.get(socket) ?? "default";
-      daemonAgentRunner.cancel(
+      const accepted = daemonAgentRunner.cancel(
         sessionId,
         message.payload.conversationId,
         message.payload.runId,
         message.payload.reason,
       );
+      const session = browserStateHub
+        .snapshot(sessionId)
+        .agentSessions.find(
+          (candidate) => candidate.id === message.payload.runId,
+        );
+      sendRawMessage(socket, {
+        requestId: message.requestId,
+        command: WS_COMMANDS.DAEMON_AGENT_CANCEL_RESULT,
+        sentAt: new Date().toISOString(),
+        payload: {
+          runId: message.payload.runId,
+          conversationId: message.payload.conversationId,
+          accepted,
+          state: accepted ? "cancelling" : "not_active",
+          ...(session ? { session } : {}),
+        },
+      });
+      return true;
+    }
+    if (message.command === WS_COMMANDS.DAEMON_AGENT_BUDGET_DECISION) {
+      const sessionId = clientSessionIds.get(socket) ?? "default";
+      daemonAgentRunner.resolveBudgetDecision(sessionId, message.payload);
       return true;
     }
     if (message.command !== WS_COMMANDS.DAEMON_AGENT_START) {
@@ -2043,9 +2137,11 @@ async function handlePluginMessage(
       await handlePluginRequestedMcpToolList(
         socket,
         message.requestId,
+        message.payload.includeLocal !== false,
         message.payload.includeExternal !== false,
         additionalMcpBackend,
         SIDEPANEL_COLLABORATION_AVAILABLE_TOOLS,
+        message.payload.externalServerIds,
       );
       break;
     case WS_COMMANDS.MCP_TOOL_CALL:
@@ -2259,9 +2355,11 @@ async function handleUiMessage(
       await handlePluginRequestedMcpToolList(
         socket,
         message.requestId,
+        message.payload.includeLocal !== false,
         message.payload.includeExternal !== false,
         additionalMcpBackend,
         SIDEPANEL_COLLABORATION_AVAILABLE_TOOLS,
+        message.payload.externalServerIds,
       );
       break;
     case WS_COMMANDS.MCP_TOOL_CALL:
@@ -2302,6 +2400,19 @@ async function handleUiMessage(
         additionalMcpBackend,
       );
       break;
+    case WS_COMMANDS.EXTERNAL_MCP_LIST:
+    case WS_COMMANDS.EXTERNAL_MCP_UPSERT:
+    case WS_COMMANDS.EXTERNAL_MCP_REMOVE:
+    case WS_COMMANDS.EXTERNAL_MCP_SET_ENABLED:
+    case WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST:
+    case WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE:
+    case WS_COMMANDS.EXTERNAL_MCP_TEST:
+      await handleExternalMcpManagement(
+        socket,
+        message,
+        additionalMcpBackend,
+      );
+      break;
     case WS_COMMANDS.BROWSER_TOOL_CALL:
       sendBrowserToolResult(socket, message.requestId, {
         ok: false,
@@ -2339,8 +2450,11 @@ async function handleObserverMessage(
       await handlePluginRequestedMcpToolList(
         socket,
         message.requestId,
+        message.payload.includeLocal !== false,
         message.payload.includeExternal !== false,
         additionalMcpBackend,
+        [],
+        message.payload.externalServerIds,
       );
       break;
     case WS_COMMANDS.MCP_TOOL_CALL:
@@ -2380,12 +2494,14 @@ async function handleMcpAdapterMessage(
       await handlePluginRequestedMcpToolList(
         socket,
         message.requestId,
+        message.payload.includeLocal !== false,
         message.payload.includeExternal !== false,
         additionalMcpBackend,
         [
           ...ADAPTER_ROUTING_AVAILABLE_TOOLS,
           ...MCP_COLLABORATION_AVAILABLE_TOOLS,
         ],
+        message.payload.externalServerIds,
       );
       break;
     case WS_COMMANDS.MCP_TOOL_CALL:
@@ -2820,7 +2936,11 @@ async function handlePluginRequestedMcpTool(
     const effectiveToolName = normalizedToolName ?? toolName;
     const sessionId =
       boundSessionId ?? browserStateHub.getActiveSession().sessionId;
-    const policy = getToolPolicy(effectiveToolName, validatedArgs);
+    const policy = resolveMcpToolPolicy(
+      additionalMcpBackend,
+      effectiveToolName,
+      validatedArgs,
+    );
     const authorizationStartedAt = Date.now();
     const authorization = await executionBroker.waitForInput({
       connectionId,
@@ -2914,10 +3034,9 @@ async function handlePluginRequestedMcpTool(
           );
         }
         if (additionalMcpBackend) {
-          return raceWithSignal(
-            additionalMcpBackend.callTool(toolName, validatedArgs),
+          return additionalMcpBackend.callTool(toolName, validatedArgs, {
             signal,
-          );
+          });
         }
         throw new Error(`Unsupported MCP tool: ${toolName}`);
       },
@@ -2967,7 +3086,11 @@ async function handlePluginRequestedMcpTool(
     const failedSessionId =
       boundSessionId ?? browserStateHub.getActiveSession().sessionId;
     const failedToolName = normalizedToolName ?? toolName;
-    const failedPolicy = getToolPolicy(failedToolName, args);
+    const failedPolicy = resolveMcpToolPolicy(
+      additionalMcpBackend,
+      failedToolName,
+      args,
+    );
     await recordToolAuditBestEffort(
       stateStore,
       requestId,
@@ -2998,24 +3121,120 @@ async function handlePluginRequestedMcpTool(
   }
 }
 
+async function handleExternalMcpManagement(
+  socket: WebSocket,
+  message: ValidPluginToMcpMessage,
+  backend?: AdditionalMcpToolBackend,
+): Promise<void> {
+  if (!backend?.listServers) {
+    sendExternalMcpResult(socket, message.requestId, {
+      ok: false,
+      servers: [],
+      error: "当前 daemon 未启用外部 MCP 管理器。",
+    });
+    return;
+  }
+  try {
+    let servers: ExternalMcpServerSummary[];
+    switch (message.command) {
+      case WS_COMMANDS.EXTERNAL_MCP_LIST:
+        servers = backend.listServers();
+        break;
+      case WS_COMMANDS.EXTERNAL_MCP_UPSERT:
+        if (!backend.upsertServer) throw new Error("MCP 配置写入不可用。");
+        servers = await backend.upsertServer(message.payload.server);
+        break;
+      case WS_COMMANDS.EXTERNAL_MCP_REMOVE:
+        if (!backend.removeServer) throw new Error("MCP 配置删除不可用。");
+        servers = await backend.removeServer(message.payload.serverId);
+        break;
+      case WS_COMMANDS.EXTERNAL_MCP_SET_ENABLED:
+        if (!backend.setServerEnabled) throw new Error("MCP 启停不可用。");
+        servers = await backend.setServerEnabled(
+          message.payload.serverId,
+          message.payload.enabled,
+        );
+        break;
+      case WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST:
+        if (!backend.setServerReadOnlyTrust) {
+          throw new Error("MCP 只读信任设置不可用。");
+        }
+        servers = await backend.setServerReadOnlyTrust(
+          message.payload.serverId,
+          message.payload.trusted,
+        );
+        break;
+      case WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE:
+        if (!backend.setServerAutoApprove) {
+          throw new Error("MCP 自动运行设置不可用。");
+        }
+        servers = await backend.setServerAutoApprove(
+          message.payload.serverId,
+          message.payload.enabled,
+        );
+        break;
+      case WS_COMMANDS.EXTERNAL_MCP_TEST:
+        if (!backend.testServer) throw new Error("MCP 连接测试不可用。");
+        servers = await backend.testServer(message.payload.serverId);
+        break;
+      default:
+        return;
+    }
+    sendExternalMcpResult(socket, message.requestId, { ok: true, servers });
+  } catch (error) {
+    sendExternalMcpResult(socket, message.requestId, {
+      ok: false,
+      servers: backend.listServers(),
+      error: error instanceof Error ? error.message : "外部 MCP 操作失败。",
+    });
+  }
+}
+
+function resolveMcpToolPolicy(
+  backend: AdditionalMcpToolBackend | undefined,
+  toolName: string,
+  args: Record<string, unknown>,
+): ToolPolicy {
+  return backend?.getToolPolicy?.(toolName, args) ?? getToolPolicy(toolName, args);
+}
+
+function sendExternalMcpResult(
+  socket: WebSocket,
+  requestId: string,
+  payload: ExternalMcpResultPayload,
+): void {
+  if (socket.readyState !== socket.OPEN) {
+    return;
+  }
+  const message: McpToPluginMessage = {
+    requestId,
+    command: WS_COMMANDS.EXTERNAL_MCP_RESULT,
+    sentAt: new Date().toISOString(),
+    payload,
+  };
+  socket.send(JSON.stringify(message));
+}
+
 async function handlePluginRequestedMcpToolList(
   socket: WebSocket,
   requestId: string,
+  includeLocal: boolean,
   includeExternal: boolean,
   additionalMcpBackend?: AdditionalMcpToolBackend,
   connectionLocalTools: readonly McpAvailableTool[] = [],
+  externalServerIds?: string[],
 ): Promise<void> {
   try {
-    const localTools = listRuntimeMcpTools();
+    const localTools = includeLocal ? listRuntimeMcpTools() : [];
     const externalTools = includeExternal && additionalMcpBackend
-      ? await additionalMcpBackend.listTools()
+      ? await additionalMcpBackend.listTools({ serverIds: externalServerIds })
       : [];
     const deduped = new Map<string, McpAvailableTool>();
 
     for (const tool of [
       ...externalTools,
       ...localTools,
-      ...connectionLocalTools,
+      ...(includeLocal ? connectionLocalTools : []),
     ]) {
       deduped.set(tool.name, tool);
     }

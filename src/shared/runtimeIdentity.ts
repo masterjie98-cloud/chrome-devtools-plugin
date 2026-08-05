@@ -76,6 +76,28 @@ export function parseRuntimeHandshakeFailure(
   return error;
 }
 
+export function parseFailedProtocolAck(
+  raw: unknown,
+): { requestId: string; error: string } | null {
+  try {
+    const parsed = JSON.parse(String(raw)) as Record<string, unknown>;
+    if (
+      typeof parsed.requestId === "string" &&
+      parsed.ok === false &&
+      typeof parsed.error === "string" &&
+      parsed.error.trim()
+    ) {
+      return {
+        requestId: parsed.requestId,
+        error: parsed.error.trim(),
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function fnv1a32(value: string): string {
   let hash = 0x811c9dc5;
   for (let index = 0; index < value.length; index += 1) {

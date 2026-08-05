@@ -36,6 +36,15 @@ export interface AgentBudgetedToolCall {
   arguments: Record<string, unknown>;
 }
 
+export interface AgentToolBudgetClassification {
+  effectful: boolean;
+  sensitive: boolean;
+}
+
+export type AgentToolBudgetClassifier = (
+  call: AgentBudgetedToolCall,
+) => AgentToolBudgetClassification;
+
 export type AgentRunBudgetKind =
   | "model_requests"
   | "tool_calls"
@@ -105,15 +114,16 @@ export class AgentRunBudget {
 
   consumeToolCalls(
     calls: readonly AgentBudgetedToolCall[],
+    classifyTool: AgentToolBudgetClassifier = classifyToolWithBuiltInPolicy,
   ): AgentRunBudgetSnapshot {
     this.assertDuration();
     const requestedToolCalls = calls.length;
-    const requestedEffectfulToolCalls = calls.filter((call) => {
-      const policy = getToolPolicy(call.name, call.arguments);
-      return policy.mutatesBrowser || policy.openWorld;
-    }).length;
-    const requestedSensitiveToolCalls = calls.filter((call) =>
-      getToolPolicy(call.name, call.arguments).sensitive,
+    const classifications = calls.map(classifyTool);
+    const requestedEffectfulToolCalls = classifications.filter(
+      (classification) => classification.effectful,
+    ).length;
+    const requestedSensitiveToolCalls = classifications.filter(
+      (classification) => classification.sensitive,
     ).length;
 
     if (this.toolCalls + requestedToolCalls > this.limits.maxToolCalls) {
@@ -210,6 +220,16 @@ export class AgentRunBudget {
       this.snapshot(),
     );
   }
+}
+
+function classifyToolWithBuiltInPolicy(
+  call: AgentBudgetedToolCall,
+): AgentToolBudgetClassification {
+  const policy = getToolPolicy(call.name, call.arguments);
+  return {
+    effectful: policy.mutatesBrowser || policy.openWorld,
+    sensitive: policy.sensitive,
+  };
 }
 
 export function createAgentRunBudgetExtensionRequest(

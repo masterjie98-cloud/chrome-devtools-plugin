@@ -27,6 +27,7 @@ import type {
 } from "../shared/debugger";
 import { MESSAGE_TYPES } from "../shared/messages";
 import type { BrowserActivityCursor } from "../shared/browserActivity";
+import type { AiContextUsageSnapshot } from "../shared/aiContextUsage";
 import {
   createMessageId,
   isExtensionEvent,
@@ -35,6 +36,13 @@ import {
 } from "../shared/messaging";
 import type { DnrRuleSummary, HeaderRuleInput } from "../shared/network";
 import { MCP_AI_TOOL_DEFINITIONS, MCP_TOOL_NAMES } from "../shared/mcpTools";
+import {
+  DEFAULT_EXTERNAL_MCP_SELECTION,
+  externalMcpToolAllowed,
+  normalizeExternalMcpSelection,
+  type ExternalMcpSelection,
+  type ExternalMcpServerSummary,
+} from "../shared/externalMcp";
 import { getToolPolicy } from "../shared/toolPolicy";
 import {
   TOOL_NAMES,
@@ -45,6 +53,8 @@ import {
 import { useBrowserStateHub } from "./hooks/useBrowserStateHub";
 import { useToolDispatcher } from "./hooks/useToolDispatcher";
 import {
+  activateAiProfile,
+  applyAiModelCapabilities,
   isAiConfigured,
   getActiveConfig,
   loadProfilesState,
@@ -54,6 +64,7 @@ import {
   type AiProfilesState,
 } from "./services/aiConfig";
 import {
+  detectAiCapabilities,
   toAiToolDefinitions,
   type AiFunctionToolDefinition,
   type AiRequestedToolCall,
@@ -77,11 +88,14 @@ import type {
   ChatMessage,
   ExecutionTaskBinding,
   PendingToolApproval,
+  PendingAgentBudgetRequest,
   QueuedChatSubmission,
 } from "./types";
+import type { AgentRunBudgetExtensionDecision } from "../shared/agentRunBudget";
 import type {
   ActiveTabSnapshot,
   ApprovalRequestPayload,
+  McpAvailableTool,
 } from "../shared/wsProtocol";
 import type { AgentSessionSnapshot } from "../shared/agentSession";
 import type { CollaborationItemInput } from "../shared/collaborationWorkspace";
@@ -109,6 +123,7 @@ import {
   type ChatBranchPlan,
 } from "./chatBranches";
 import {
+  clearUnavailableConversationTarget,
   createStoredConversation,
   conversationSearchText,
   DEFAULT_CHAT_GREETING,
@@ -140,6 +155,12 @@ import {
   isStaleDelegatedTaskTargetError,
   STALE_DELEGATED_TASK_SUMMARY,
 } from "./services/delegatedTaskErrors";
+import type { AiSettingsTab } from "./components/AiSettingsDrawer";
+import {
+  buildMcpCapabilityOverview,
+  getCapabilityOverviewLocale,
+  isGeneratedMcpCapabilityGreeting,
+} from "./services/mcpCapabilityGreeting";
 
 const ChatPanel = lazy(() =>
   import("./components/ChatPanel").then((module) => ({
@@ -178,11 +199,23 @@ function toChatMessages(
   conversation: StoredChatConversation,
 ): ChatMessage[] {
   return conversation.messages.length
-    ? conversation.messages.map((message) => ({
+    ? conversation.messages.map((message, index) => ({
         ...message,
+        ...(index === 0 &&
+        message.role === "assistant" &&
+        isGeneratedMcpCapabilityGreeting(
+          message.content,
+          DEFAULT_CHAT_GREETING,
+        )
+          ? { content: DEFAULT_CHAT_GREETING }
+          : {}),
         source:
           message.source ??
-          (message.role === "user" ? "user" : "extension_ai"),
+          (message.role === "user"
+            ? "user"
+            : message.role === "tool"
+              ? "system"
+              : "extension_ai"),
       }))
     : createInitialChat();
 }
@@ -338,8 +371,10 @@ export function App() {
   const [selectedTargetTabId, setSelectedTargetTabId] = useState<number>();
   const [foregroundTab, setForegroundTab] = useState<BrowserTargetTab>();
   const [profilesState, setProfilesState] = useState<AiProfilesState>(() => loadProfilesState());
+  const modelCapabilityProbeSequenceRef = useRef(0);
   const aiConfig = getActiveConfig(profilesState);
   const [aiSettingsOpen, setAiSettingsOpen] = useState(false);
+  const [aiSettingsTab, setAiSettingsTab] = useState<AiSettingsTab>("model");
   const agentRunRegistryRef = useRef(new AgentRunRegistry());
   const [agentRunsRevision, setAgentRunsRevision] = useState(0);
   const [conversationTarget, setConversationTarget] =
@@ -347,10 +382,26 @@ export function App() {
   const conversationTargetRef = useRef<StoredConversationTarget | undefined>(
     undefined,
   );
+  const [unavailableTargetTabIds, setUnavailableTargetTabIds] = useState<
+    ReadonlySet<number>
+  >(() => new Set());
   const [conversationActivityCursor, setConversationActivityCursor] =
     useState<BrowserActivityCursor>();
   const conversationActivityCursorRef =
     useRef<BrowserActivityCursor | undefined>(undefined);
+  const [conversationMcpSelection, setConversationMcpSelection] =
+    useState<ExternalMcpSelection>({ ...DEFAULT_EXTERNAL_MCP_SELECTION });
+  const conversationMcpSelectionsRef = useRef(
+    new Map<string, ExternalMcpSelection>([
+      [initialConversationId, { ...DEFAULT_EXTERNAL_MCP_SELECTION }],
+    ]),
+  );
+  const [contextUsageByConversation, setContextUsageByConversation] = useState(
+    () => new Map<string, AiContextUsageSnapshot>(),
+  );
+  const [externalMcpServers, setExternalMcpServers] = useState<
+    ExternalMcpServerSummary[]
+  >([]);
   const [activityMonitorAction, setActivityMonitorAction] = useState<
     "restart" | "stop"
   >();
@@ -377,6 +428,34 @@ export function App() {
   const [pendingToolApprovals, setPendingToolApprovals] = useState<
     PendingToolApproval[]
   >([]);
+  const pendingAgentBudgetResolversRef = useRef(
+    new Map<
+      string,
+      (decision: AgentRunBudgetExtensionDecision) => void
+    >(),
+  );
+  const [pendingAgentBudgetRequests, setPendingAgentBudgetRequests] = useState<
+    PendingAgentBudgetRequest[]
+  >([]);
+  const resolveAgentBudgetRequest = (
+    requestId: string,
+    decision: AgentRunBudgetExtensionDecision,
+  ) => {
+    pendingAgentBudgetResolversRef.current.get(requestId)?.(decision);
+  };
+  const cancelAgentBudgetRequest = (requestId: string) => {
+    pendingAgentBudgetResolversRef.current.get(requestId)?.("summarize");
+  };
+  const cancelConversationAgentBudgetRequests = (conversationId: string) => {
+    for (const pending of pendingAgentBudgetRequests) {
+      if (pending.conversationId !== conversationId) {
+        continue;
+      }
+      pendingAgentBudgetResolversRef.current
+        .get(pending.id)
+        ?.("summarize");
+    }
+  };
   const resolveAllPendingToolApprovals = (
     decision: ToolApprovalDecision,
   ) => {
@@ -428,11 +507,44 @@ export function App() {
     setConversationTarget(target);
   };
 
+  const markTargetAvailable = (tabId: number) => {
+    setUnavailableTargetTabIds((current) => {
+      if (!current.has(tabId)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.delete(tabId);
+      return next;
+    });
+  };
+
+  const markTargetUnavailable = (tabId: number) => {
+    setUnavailableTargetTabIds((current) => {
+      if (current.has(tabId)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.add(tabId);
+      return next;
+    });
+  };
+
   const replaceConversationActivityCursor = (
     cursor: BrowserActivityCursor | undefined,
   ) => {
     conversationActivityCursorRef.current = cursor;
     setConversationActivityCursor(cursor);
+  };
+
+  const replaceConversationMcpSelection = (
+    value: ExternalMcpSelection,
+    conversationId = conversationIdRef.current,
+  ) => {
+    const selection = normalizeExternalMcpSelection(value);
+    conversationMcpSelectionsRef.current.set(conversationId, selection);
+    if (conversationId === conversationIdRef.current) {
+      setConversationMcpSelection(selection);
+    }
   };
 
   const replaceActivityCursorForConversation = (
@@ -752,6 +864,12 @@ export function App() {
               toChatMessages(conversation),
             ]),
           );
+          conversationMcpSelectionsRef.current = new Map(
+            workspace.conversations.map((conversation) => [
+              conversation.id,
+              normalizeExternalMcpSelection(conversation.externalMcpSelection),
+            ]),
+          );
           conversationIdRef.current = active.id;
           setActiveConversationId(active.id);
           setConversationCreatedAt(active.createdAt);
@@ -761,6 +879,10 @@ export function App() {
           });
           replaceConversationTarget(active.target);
           replaceConversationActivityCursor(active.activityCursor);
+          replaceConversationMcpSelection(
+            normalizeExternalMcpSelection(active.externalMcpSelection),
+            active.id,
+          );
           replaceChatMessages(messages);
           setChatDraft(active.draft);
           setStoredConversations(workspace.conversations);
@@ -799,6 +921,7 @@ export function App() {
         draft: chatDraft,
         target: conversationTarget,
         activityCursor: conversationActivityCursor,
+        externalMcpSelection: conversationMcpSelection,
         forkedFromConversationId: conversationOrigin.conversationId,
         forkedFromMessageId: conversationOrigin.messageId,
       });
@@ -822,6 +945,7 @@ export function App() {
     conversationOrigin.conversationId,
     conversationOrigin.messageId,
     conversationActivityCursor,
+    conversationMcpSelection,
     conversationTarget,
     workspaceHydrated,
   ]);
@@ -922,15 +1046,55 @@ export function App() {
     if (!workspaceHydrated || !conversationTarget?.tabId) {
       return;
     }
+    let cancelled = false;
+    const recoveryConversationId = activeConversationId;
+    const recoveryTarget = conversationTarget;
     void runTool(TOOL_NAMES.BROWSER_SET_TARGET_TAB, {
-      tabId: conversationTarget.tabId,
-    }).catch((error) => {
-      api.warning(
-        `当前对话绑定的 Tab ${conversationTarget.tabId} 已不可用：${
-          error instanceof Error ? error.message : "无法恢复目标页"
-        }。请新建对话绑定其他 Tab。`,
-      );
-    });
+      tabId: recoveryTarget.tabId,
+    })
+      .then((data) => {
+        if (
+          cancelled ||
+          conversationIdRef.current !== recoveryConversationId ||
+          conversationTargetRef.current?.tabId !== recoveryTarget.tabId
+        ) {
+          return;
+        }
+        const result = data as BrowserTargetSetResult;
+        markTargetAvailable(recoveryTarget.tabId);
+        setTargetTabs(result.tabs);
+        setSelectedTargetTabId(result.selectedTabId);
+      })
+      .catch((error) => {
+        if (
+          cancelled ||
+          conversationIdRef.current !== recoveryConversationId ||
+          conversationTargetRef.current?.tabId !== recoveryTarget.tabId
+        ) {
+          return;
+        }
+        markTargetUnavailable(recoveryTarget.tabId);
+        replaceConversationTarget(undefined);
+        replaceConversationActivityCursor(undefined);
+        setStoredConversations((current) =>
+          current.map((conversation) =>
+            conversation.id === recoveryConversationId
+              ? clearUnavailableConversationTarget(
+                  conversation,
+                  recoveryTarget.tabId,
+                )
+              : conversation,
+          ),
+        );
+        api.warning(
+          `原绑定 Tab ${recoveryTarget.tabId} 已失效：${
+            error instanceof Error ? error.message : "无法恢复目标页"
+          }。旧页面绑定已解除，下一条消息会绑定当前可用页面。`,
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [activeConversationId, conversationTarget?.tabId, workspaceHydrated]);
 
   useEffect(() => {
@@ -1014,18 +1178,42 @@ export function App() {
     };
   }, []);
 
-  const refreshAiToolDefinitions = async (): Promise<
+  const refreshAiToolDefinitions = async (
+    selection: ExternalMcpSelection = conversationMcpSelection,
+  ): Promise<
     AiFunctionToolDefinition[]
   > => {
+    const normalizedSelection = normalizeExternalMcpSelection(selection);
     try {
-      const tools = await mcpBridge.listMcpTools();
-      const nextDefinitions = toAiToolDefinitions(tools);
-      if (nextDefinitions.length > 0) {
+      const tools = await mcpBridge.listMcpTools({
+        includeLocal: normalizedSelection.mode !== "selected",
+        includeExternal: normalizedSelection.mode !== "off",
+        ...(normalizedSelection.mode === "selected"
+          ? { externalServerIds: normalizedSelection.serverIds }
+          : {}),
+      });
+      const filteredTools = tools.filter((tool) =>
+        externalMcpToolAllowed(
+          tool.name,
+          tool.externalMcpServerId,
+          normalizedSelection,
+        ),
+      );
+      const nextDefinitions = toAiToolDefinitions(filteredTools);
+      if (
+        nextDefinitions.length > 0 ||
+        normalizedSelection.mode === "selected"
+      ) {
         setAiToolDefinitions(nextDefinitions);
         return nextDefinitions;
       }
     } catch {
-      // Fall through to the local fallback list.
+      if (normalizedSelection.mode === "selected") {
+        setAiToolDefinitions([]);
+        return [];
+      }
+      // Automatic and browser-only modes can retain the last known local list
+      // during a transient daemon reconnect.
     }
 
     return aiToolDefinitions.length > 0
@@ -1034,8 +1222,33 @@ export function App() {
   };
 
   useEffect(() => {
-    void refreshAiToolDefinitions();
+    void refreshAiToolDefinitions(conversationMcpSelection);
   }, []);
+
+  const refreshExternalMcpServers = async (): Promise<
+    ExternalMcpServerSummary[]
+  > => {
+    if (!mcpBridge.isConnected()) {
+      setExternalMcpServers([]);
+      return [];
+    }
+    try {
+      const servers = await mcpBridge.listExternalMcpServers();
+      setExternalMcpServers(servers);
+      return servers;
+    } catch {
+      setExternalMcpServers([]);
+      return [];
+    }
+  };
+
+  useEffect(() => {
+    if (hubState.connected) {
+      void refreshExternalMcpServers();
+    } else {
+      setExternalMcpServers([]);
+    }
+  }, [hubState.connected]);
 
   useEffect(() => {
     if (typeof chrome === "undefined" || !chrome.runtime?.onMessage) {
@@ -1302,11 +1515,16 @@ export function App() {
       await saveProfilesStateSecure(nextState);
       setProfilesState(nextState);
       setAiSettingsOpen(false);
-      api.success("AI 配置已保存");
+      api.success("模型设置已保存");
     } catch (error) {
-      api.error("AI 配置保存失败，原配置未被替换。");
+      api.error("模型设置保存失败，原设置未被替换。");
       throw error;
     }
+  };
+
+  const openAiSettings = (tab: AiSettingsTab = "model") => {
+    setAiSettingsTab(tab);
+    setAiSettingsOpen(true);
   };
 
   const updateActiveAiConfig = (patch: Partial<AiConfig>) => {
@@ -1322,6 +1540,59 @@ export function App() {
     void saveProfilesStateSecure(nextState).catch(() => {
       api.error("AI 权限设置保存失败，请重试。");
     });
+  };
+
+  const changeActiveAiProfile = (profileId: string) => {
+    const previousState = profilesState;
+    const nextState = activateAiProfile(previousState, profileId);
+    if (nextState === previousState) {
+      return;
+    }
+    const active = nextState.profiles.find(
+      (profile) => profile.id === nextState.activeProfileId,
+    );
+    if (!active) {
+      return;
+    }
+    const probeSequence = ++modelCapabilityProbeSequenceRef.current;
+    setProfilesState(nextState);
+    void saveProfilesStateSecure(nextState)
+      .then(async () => {
+        api.success(`已切换到 ${active.config.model || active.name}，下一条消息生效。`);
+        try {
+          const capabilityResult = await detectAiCapabilities(active.config);
+          if (modelCapabilityProbeSequenceRef.current !== probeSequence) {
+            return;
+          }
+          setProfilesState((currentState) => {
+            const detectedState = applyAiModelCapabilities(
+              currentState,
+              active.id,
+              capabilityResult,
+            );
+            void saveProfilesStateSecure(detectedState).catch(() => {
+              api.warning("模型能力探测完成，但结果保存失败。");
+            });
+            return detectedState;
+          });
+        } catch (error) {
+          if (modelCapabilityProbeSequenceRef.current === probeSequence) {
+            api.warning(
+              error instanceof Error
+                ? `已切换模型，能力探测失败：${error.message}`
+                : "已切换模型，但能力探测失败。",
+            );
+          }
+        }
+      })
+      .catch(() => {
+        if (modelCapabilityProbeSequenceRef.current !== probeSequence) {
+          return;
+        }
+        modelCapabilityProbeSequenceRef.current += 1;
+        setProfilesState(previousState);
+        api.error("模型切换保存失败，已恢复原模型。");
+      });
   };
 
   const publishDelegatedTaskResult = async (
@@ -1414,11 +1685,60 @@ export function App() {
           { syncToMcp: false, conversationId: runConversationId },
         );
 
+    const capabilityLocale =
+      !delegatedTask && outgoingAttachments.length === 0
+        ? getCapabilityOverviewLocale(input)
+        : undefined;
+    if (capabilityLocale) {
+      const selection = normalizeExternalMcpSelection(
+        conversationMcpSelectionsRef.current.get(runConversationId) ??
+          DEFAULT_EXTERNAL_MCP_SELECTION,
+      );
+      let externalTools: McpAvailableTool[] = [];
+      if (selection.mode !== "off" && mcpBridge.isConnected()) {
+        try {
+          const tools = await mcpBridge.listMcpTools({
+            includeLocal: false,
+            includeExternal: true,
+            ...(selection.mode === "selected"
+              ? { externalServerIds: selection.serverIds }
+              : {}),
+          });
+          externalTools = tools.filter(
+            (tool): tool is McpAvailableTool =>
+              Boolean(tool.externalMcpServerId) &&
+              externalMcpToolAllowed(
+                tool.name,
+                tool.externalMcpServerId,
+                selection,
+              ),
+          );
+        } catch {
+          // A capability probe is optional. Keep the base assistant overview available.
+        }
+      }
+      const assistantMessage = appendChat(
+        {
+          role: "assistant",
+          content: buildMcpCapabilityOverview(externalTools, capabilityLocale),
+        },
+        { syncToMcp: false, conversationId: runConversationId },
+      );
+      syncAiConversationToMcp(
+        userMessage,
+        assistantMessage,
+        assistantMessage.content,
+        false,
+        runConversationId,
+      );
+      return;
+    }
+
     if (!isAiConfigured(runConfig)) {
       const assistantConfigMessage = appendChat(
         {
           role: "assistant",
-          content: "请先打开 AI 配置，填入 API URL 和 Model。API Key 可留空。",
+          content: "请先打开设置 → 模型管理，填入 API URL 和模型 ID。API Key 可留空。",
         },
         { syncToMcp: false, conversationId: runConversationId },
       );
@@ -1439,7 +1759,7 @@ export function App() {
           delegatedTask.conversationId,
         );
       }
-      setAiSettingsOpen(true);
+      openAiSettings("model");
       return;
     }
 
@@ -1489,8 +1809,11 @@ export function App() {
           signal: aiAbortController.signal,
         });
       }
+      const runMcpSelection =
+        conversationMcpSelectionsRef.current.get(runConversationId) ??
+        DEFAULT_EXTERNAL_MCP_SELECTION;
       const runtimeAiTools = runConfig.enableTools
-        ? await refreshAiToolDefinitions()
+        ? await refreshAiToolDefinitions(runMcpSelection)
         : undefined;
 
       const result = await mcpBridge.runDaemonAgentSession(
@@ -1507,6 +1830,12 @@ export function App() {
             selectedElement,
             collaborationWorkspace: hubState.collaborationWorkspace,
             activityCursor: conversationActivityCursorRef.current,
+            toolScope:
+              runMcpSelection.mode === "selected"
+                ? "external_only"
+                : runMcpSelection.mode === "off"
+                  ? "browser"
+                  : "mixed",
           },
           tools: runtimeAiTools,
           executionBinding,
@@ -1535,6 +1864,18 @@ export function App() {
                 status,
                 runConversationId,
               );
+            }
+          },
+          onContextUsage: (report) => {
+            if (
+              isCurrentAgentRun() &&
+              !deletedAgentConversationIdsRef.current.has(runConversationId)
+            ) {
+              setContextUsageByConversation((current) => {
+                const next = new Map(current);
+                next.set(runConversationId, report);
+                return next;
+              });
             }
           },
           onSessionUpdate: (session) => {
@@ -1583,6 +1924,11 @@ export function App() {
                 role: "tool",
                 content: message.content,
                 toolName: message.toolName,
+                toolSource: message.toolSource,
+                toolDisplayName: message.toolDisplayName,
+                toolServerName: message.toolServerName,
+                toolRequestArguments: message.requestArguments,
+                toolResultMeta: message.resultMeta,
                 attachments: message.attachments,
               },
               {
@@ -1591,6 +1937,41 @@ export function App() {
               },
             );
           },
+          onBudgetExtensionRequest: (request) =>
+            new Promise<AgentRunBudgetExtensionDecision>((resolve) => {
+              let settled = false;
+              const settle = (decision: AgentRunBudgetExtensionDecision) => {
+                if (settled) {
+                  return;
+                }
+                settled = true;
+                pendingAgentBudgetResolversRef.current.delete(
+                  request.budgetRequestId,
+                );
+                setPendingAgentBudgetRequests((current) =>
+                  current.filter(
+                    (pending) => pending.id !== request.budgetRequestId,
+                  ),
+                );
+                resolve(decision);
+              };
+              pendingAgentBudgetResolversRef.current.set(
+                request.budgetRequestId,
+                settle,
+              );
+              setPendingAgentBudgetRequests((current) => [
+                ...current.filter(
+                  (pending) => pending.id !== request.budgetRequestId,
+                ),
+                {
+                  id: request.budgetRequestId,
+                  runId: request.runId,
+                  conversationId: request.conversationId,
+                  request,
+                },
+              ]);
+            }),
+          onBudgetExtensionCancelled: cancelAgentBudgetRequest,
         },
         aiAbortController.signal,
       );
@@ -1645,10 +2026,15 @@ export function App() {
       if (deletedAgentConversationIdsRef.current.has(runConversationId)) {
         return;
       }
+      const cancelled = aiAbortController.signal.aborted;
       const detail =
         error instanceof Error ? error.message : "AI request failed.";
-      const errorContent = `AI 请求失败：${detail}`;
-      api.error(detail);
+      const errorContent = cancelled
+        ? "Agent 已取消。"
+        : `AI 请求失败：${detail}`;
+      if (!cancelled) {
+        api.error(detail);
+      }
       updateChatMessageContent(
         assistantMessage.id,
         errorContent,
@@ -1749,8 +2135,8 @@ export function App() {
       return false;
     }
     if (!isAiConfigured(aiConfig)) {
-      api.warning("请先完成插件 AI 配置，再接受 Codex 委托。");
-      setAiSettingsOpen(true);
+      api.warning("请先在模型管理中完成模型设置，再接受 Codex 委托。");
+      openAiSettings("model");
       return false;
     }
     if (runningTool && activeAgentRuns.length === 0) {
@@ -2054,6 +2440,7 @@ export function App() {
     }
     if (!conversationTargetRef.current) {
       replaceConversationTarget(selectedTarget);
+      markTargetAvailable(selectedTarget.tabId);
     }
 
     const submission: QueuedChatSubmission = {
@@ -2088,6 +2475,7 @@ export function App() {
       const conversationId = conversationIdRef.current;
       agentRunRegistryRef.current.cancel(conversationId);
       resolveConversationToolApprovals(conversationId, "deny");
+      cancelConversationAgentBudgetRequests(conversationId);
       api.info("已优先排队，正在停止当前回复…");
     } else {
       api.success("已加入待发送队列");
@@ -2116,6 +2504,7 @@ export function App() {
     if (submission) {
       agentRunRegistryRef.current.cancel(submission.conversationId);
       resolveConversationToolApprovals(submission.conversationId, "deny");
+      cancelConversationAgentBudgetRequests(submission.conversationId);
     }
     api.info("已调整为下一条并停止当前回复…");
   };
@@ -2124,6 +2513,7 @@ export function App() {
     const conversationId = conversationIdRef.current;
     agentRunRegistryRef.current.cancel(conversationId);
     resolveConversationToolApprovals(conversationId, "deny");
+    cancelConversationAgentBudgetRequests(conversationId);
     api.info("正在停止 Agent…");
   };
 
@@ -2139,6 +2529,7 @@ export function App() {
       | "reason"
       | "sessionId"
       | "revision"
+      | "externalMcp"
     >,
     onDecision?: (decision: ToolApprovalDecision) => void,
     requestConversationId = conversationIdRef.current,
@@ -2257,6 +2648,7 @@ export function App() {
         allowForConversationOriginAvailable: Boolean(
           conversationOriginGrant,
         ),
+        externalMcp: context?.externalMcp,
       };
       pendingToolApprovalResolversRef.current.set(call.id, settle);
       setPendingToolApprovals((current) => [
@@ -2266,7 +2658,7 @@ export function App() {
     });
   };
 
-  const resolveToolApproval = (
+  const resolveToolApproval = async (
     approvalId: string,
     decision: ToolApprovalDecision,
   ) => {
@@ -2280,6 +2672,27 @@ export function App() {
       api.success(
         `当前聊天将在 ${pending.conversationOrigin} 自动允许符合范围的页面操作。`,
       );
+    }
+    if (decision === "allow_external_mcp") {
+      if (!pending?.externalMcp) {
+        api.error("该审批没有可识别的 MCP Server，无法开启自动运行。");
+        return;
+      }
+      try {
+        const servers = await mcpBridge.setExternalMcpServerAutoApprove(
+          pending.externalMcp.serverId,
+          true,
+        );
+        setExternalMcpServers(servers);
+        api.success(
+          `已允许 ${pending.externalMcp.serverName} 的全部工具自动运行；可在 MCP 设置中撤销。`,
+        );
+      } catch (error) {
+        api.error(
+          error instanceof Error ? error.message : "MCP 自动运行设置失败。",
+        );
+        return;
+      }
     }
     pendingToolApprovalResolversRef.current.get(approvalId)?.(decision);
   };
@@ -2414,6 +2827,7 @@ export function App() {
       }),
     );
     if (!response.ok) {
+      markTargetUnavailable(tabId);
       api.error(response.error.message);
     }
   };
@@ -2587,7 +3001,7 @@ export function App() {
     ChatImageAttachment | undefined
   > => {
     if (!aiConfig.supportsVision) {
-      api.warning("当前检测结果不支持图片输入；保存 AI 配置会重新检测。");
+      api.warning("当前检测结果不支持图片输入；可在模型管理中重新检测。");
       return undefined;
     }
 
@@ -2628,6 +3042,9 @@ export function App() {
       draft,
       target: conversationTargetRef.current,
       activityCursor: conversationActivityCursorRef.current,
+      externalMcpSelection:
+        conversationMcpSelectionsRef.current.get(conversationIdRef.current) ??
+        DEFAULT_EXTERNAL_MCP_SELECTION,
       forkedFromConversationId: conversationOrigin.conversationId,
       forkedFromMessageId: conversationOrigin.messageId,
     });
@@ -2646,6 +3063,10 @@ export function App() {
     });
     replaceConversationTarget(conversation.target);
     replaceConversationActivityCursor(conversation.activityCursor);
+    replaceConversationMcpSelection(
+      normalizeExternalMcpSelection(conversation.externalMcpSelection),
+      conversation.id,
+    );
     replaceChatMessages(messages);
     setChatDraft(conversation.draft);
   };
@@ -2716,6 +3137,7 @@ export function App() {
         new DOMException("所属本地对话已删除。", "AbortError"),
       );
       resolveConversationToolApprovals(conversationId, "deny");
+      cancelConversationAgentBudgetRequests(conversationId);
     }
     if (deletionPlan.removeQueuedSubmissions) {
       replaceQueuedChatSubmissions((current) =>
@@ -2731,6 +3153,15 @@ export function App() {
       return false;
     }
     conversationMessagesRef.current.delete(conversationId);
+    conversationMcpSelectionsRef.current.delete(conversationId);
+    setContextUsageByConversation((current) => {
+      if (!current.has(conversationId)) {
+        return current;
+      }
+      const next = new Map(current);
+      next.delete(conversationId);
+      return next;
+    });
     saveConversationSnapshot(conversations, conversationIdRef.current);
     api.success(
       orphanedTaskCount > 0
@@ -2752,6 +3183,7 @@ export function App() {
       updatedAt: now,
       messages,
       draft: "",
+      externalMcpSelection: DEFAULT_EXTERNAL_MCP_SELECTION,
     });
     const conversations = upsertPersistableConversation(
       upsertPersistableConversation(
@@ -2797,6 +3229,9 @@ export function App() {
       draft: "",
       target: conversationTargetRef.current,
       activityCursor: conversationActivityCursorRef.current,
+      externalMcpSelection:
+        conversationMcpSelectionsRef.current.get(sourceConversationId) ??
+        DEFAULT_EXTERNAL_MCP_SELECTION,
       forkedFromConversationId: sourceConversationId,
       forkedFromMessageId: plan.sourceMessageId,
     });
@@ -3058,6 +3493,9 @@ export function App() {
     pendingToolApprovals,
     activeConversationId,
   );
+  const currentConversationBudgetRequest = pendingAgentBudgetRequests.find(
+    (request) => request.conversationId === activeConversationId,
+  );
   const currentConversationQueue = listConversationQueue(
     queuedChatSubmissions,
     activeConversationId,
@@ -3081,6 +3519,14 @@ export function App() {
     activeAgentRuns.length === 0 || currentConversationRun
       ? runningTool
       : null;
+  const currentContextUsage = contextUsageByConversation.get(
+    activeConversationId,
+  );
+  const visibleContextUsage =
+    currentContextUsage?.model === aiConfig.model &&
+    currentContextUsage.contextWindowTokens === aiConfig.contextWindowTokens
+      ? currentContextUsage
+      : undefined;
 
   return (
     <ConfigProvider
@@ -3090,6 +3536,7 @@ export function App() {
           colorPrimary: "#1677ff",
           colorSuccess: "#00a878",
           borderRadius: 6,
+          fontSize: 13,
           fontFamily:
             '-apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "Helvetica Neue", Arial, sans-serif',
         },
@@ -3108,6 +3555,7 @@ export function App() {
                 children: (
                   <Suspense fallback={<div className="panel-loading">Loading chat...</div>}>
                     <ChatPanel
+                      key={activeConversationId}
                       messages={displayedChatMessages}
                       busy={
                         Boolean(currentConversationRunningTool) ||
@@ -3115,6 +3563,12 @@ export function App() {
                       }
                       agentBusy={currentConversationAgentBusy}
                       aiConfigured={isAiConfigured(aiConfig)}
+                      modelProfiles={profilesState.profiles.map((profile) => ({
+                        id: profile.id,
+                        name: profile.name,
+                        model: profile.config.model,
+                      }))}
+                      activeModelProfileId={profilesState.activeProfileId}
                       supportsVision={aiConfig.supportsVision}
                       hubConnected={hubState.connected}
                       permissions={{
@@ -3123,15 +3577,21 @@ export function App() {
                         enableTools: aiConfig.enableTools,
                         includePageContext: aiConfig.includePageContext,
                       }}
+                      externalMcpSelection={conversationMcpSelection}
+                      externalMcpServers={externalMcpServers}
                       contextLabel={getContextLabel(
                         aiConfig,
                         Boolean(pageSnapshot),
                         Boolean(selectedElement),
                       )}
+                      contextUsage={visibleContextUsage}
                       streamingMessageId={
                         currentConversationRun?.assistantMessageId
                       }
                       pendingToolApprovals={currentConversationApprovals}
+                      pendingAgentBudgetRequest={
+                        currentConversationBudgetRequest
+                      }
                       executionApprovalMode={
                         conversationOriginApproval?.mode ?? "ask"
                       }
@@ -3145,6 +3605,7 @@ export function App() {
                       activeExecutionBinding={
                         currentConversationExecutionBinding
                       }
+                      unavailableTargetTabIds={unavailableTargetTabIds}
                       backgroundConversationWork={backgroundConversationWork}
                       selectedToolTarget={
                         conversationTarget ? hubState.activeTab : undefined
@@ -3189,6 +3650,7 @@ export function App() {
                       }
                       onSend={handleSendChat}
                       onStop={handleStopAi}
+                      onChangeModelProfile={changeActiveAiProfile}
                       onRemoveQueuedMessage={removeQueuedChatSubmission}
                       onClearQueuedMessages={clearQueuedChatSubmissions}
                       onRunQueuedMessageNow={runQueuedChatSubmissionNow}
@@ -3207,6 +3669,7 @@ export function App() {
                       onForkMessage={forkEditedMessage}
                       onDraftChange={setChatDraft}
                       onResolveToolApproval={resolveToolApproval}
+                      onResolveAgentBudgetRequest={resolveAgentBudgetRequest}
                       onChangeExecutionApprovalMode={changeExecutionApprovalMode}
                       onFocusExecutionTarget={(tabId) =>
                         void focusExecutionTarget(tabId)
@@ -3223,8 +3686,12 @@ export function App() {
                       onCaptureScreenshot={captureScreenshotAttachment}
                       onAttachmentRejected={(reason) => api.warning(reason)}
                       onUpdatePermission={(patch) => updateActiveAiConfig(patch)}
+                      onChangeExternalMcpSelection={(selection) => {
+                        replaceConversationMcpSelection(selection);
+                        void refreshAiToolDefinitions(selection);
+                      }}
                       onClearChat={clearChat}
-                      onOpenSettings={() => setAiSettingsOpen(true)}
+                      onOpenSettings={openAiSettings}
                     />
                   </Suspense>
                 ),
@@ -3287,6 +3754,7 @@ export function App() {
             <Suspense fallback={null}>
               <AiSettingsDrawer
                 open={aiSettingsOpen}
+                initialTab={aiSettingsTab}
                 profilesState={profilesState}
                 bridgeConnected={hubState.connected}
                 activeTargetLabel={
@@ -3295,6 +3763,7 @@ export function App() {
                 pageContextSynced={Boolean(hubState.pageContext)}
                 onClose={() => setAiSettingsOpen(false)}
                 onSave={handleSaveProfiles}
+                onMcpServersChange={setExternalMcpServers}
               />
             </Suspense>
           ) : null}

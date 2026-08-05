@@ -15,6 +15,43 @@ import {
 } from "../shared/agentTaskState";
 import { BROWSER_ACTIVITY_KINDS } from "../shared/browserActivity";
 
+const externalMcpServerIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
+const externalMcpStringRecordSchema = z
+  .record(z.string().min(1).max(160), z.string().max(16_000))
+  .refine((value) => Object.keys(value).length <= 100, "Too many entries");
+const externalMcpTransportSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("stdio"),
+      command: z.string().min(1).max(1_000),
+      args: z.array(z.string().max(4_000)).max(100),
+      cwd: z.string().min(1).max(4_000).optional(),
+      env: externalMcpStringRecordSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("streamable-http"),
+      url: z.string().min(1).max(4_000),
+      headers: externalMcpStringRecordSchema.optional(),
+    })
+    .strict(),
+]);
+const externalMcpServerSchema = z
+  .object({
+    id: externalMcpServerIdSchema,
+    name: z.string().min(1).max(80),
+    enabled: z.boolean(),
+    trustReadOnlyTools: z.boolean().optional(),
+    autoApproveTools: z.boolean().optional(),
+    description: z.string().min(1).max(1_000).optional(),
+    timeoutMs: z.number().int().min(1_000).max(300_000).optional(),
+    disabledTools: z.array(z.string().min(1).max(200)).max(200).optional(),
+    importRequestedEnabled: z.boolean().optional(),
+    transport: externalMcpTransportSchema,
+  })
+  .strict();
+
 const rectSchema = z.object({
   x: z.number(),
   y: z.number(),
@@ -447,6 +484,7 @@ const daemonAgentStartSchema = z
           .strict()
           .optional(),
         contextReadError: z.string().max(2_000).optional(),
+        toolScope: z.enum(["browser", "mixed", "external_only"]).optional(),
       })
       .strict(),
     tools: z
@@ -461,6 +499,25 @@ const daemonAgentStartSchema = z
                 parameters: z.unknown(),
               })
               .strict(),
+            clientMetadata: z
+              .object({
+                source: z.enum(["builtin", "external_mcp"]),
+                displayName: z.string().min(1).max(200).optional(),
+                externalMcpServerId: z.string().min(1).max(200).optional(),
+                externalMcpServerName: z.string().min(1).max(200).optional(),
+                externalMcpToolName: z.string().min(1).max(200).optional(),
+                annotations: z
+                  .object({
+                    readOnlyHint: z.boolean().optional(),
+                    destructiveHint: z.boolean().optional(),
+                    idempotentHint: z.boolean().optional(),
+                    openWorldHint: z.boolean().optional(),
+                  })
+                  .strict()
+                  .optional(),
+              })
+              .strict()
+              .optional(),
           })
           .strict(),
       )
@@ -593,6 +650,17 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
       .strict(),
   }),
   baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.DAEMON_AGENT_BUDGET_DECISION),
+    payload: z
+      .object({
+        runId: z.string().min(1).max(200),
+        conversationId: z.string().min(1).max(200),
+        budgetRequestId: z.string().min(1).max(200),
+        decision: z.enum(["continue", "summarize"]),
+      })
+      .strict(),
+  }),
+  baseMessageSchema.extend({
     command: z.literal(WS_COMMANDS.COLLABORATION_ITEM_UPSERT),
     payload: z
       .object({
@@ -685,7 +753,12 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
   baseMessageSchema.extend({
     command: z.literal(WS_COMMANDS.MCP_LIST_TOOLS),
     payload: z.object({
+      includeLocal: z.boolean().optional(),
       includeExternal: z.boolean().optional(),
+      externalServerIds: z
+        .array(z.string().regex(/^[A-Za-z0-9_-]{1,80}$/))
+        .max(20)
+        .optional(),
     }),
   }),
   baseMessageSchema.extend({
@@ -696,6 +769,49 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
         taskContext: taskContextSchema.optional(),
       })
       .strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.EXTERNAL_MCP_LIST),
+    payload: z.object({}).strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.EXTERNAL_MCP_UPSERT),
+    payload: z.object({ server: externalMcpServerSchema }).strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.EXTERNAL_MCP_REMOVE),
+    payload: z.object({ serverId: externalMcpServerIdSchema }).strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.EXTERNAL_MCP_SET_ENABLED),
+    payload: z
+      .object({
+        serverId: externalMcpServerIdSchema,
+        enabled: z.boolean(),
+      })
+      .strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST),
+    payload: z
+      .object({
+        serverId: externalMcpServerIdSchema,
+        trusted: z.boolean(),
+      })
+      .strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE),
+    payload: z
+      .object({
+        serverId: externalMcpServerIdSchema,
+        enabled: z.boolean(),
+      })
+      .strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.EXTERNAL_MCP_TEST),
+    payload: z.object({ serverId: externalMcpServerIdSchema }).strict(),
   }),
   baseMessageSchema.extend({
     command: z.literal(WS_COMMANDS.STATE_GET),

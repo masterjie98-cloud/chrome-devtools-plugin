@@ -38,10 +38,7 @@ The scaffold can install deps, build daemon/MCP (`build:node`), generate
 LaunchAgent is optional. Then load Chrome unpacked from `dist/`
 (`npm run build:extension` if needed) and paste the Bridge Token.
 
-```bash
-npm run update:local    # later updates: git pull + rebuild
-npm run release         # maintainers: release-it tag + GitHub Release
-```
+维护者使用 `npm run release` 生成并发布版本化 ZIP；普通使用者的应用内更新只走正式 Release ZIP，daemon 不会操作 git。
 
 ### Optional: shareable zip (Windows + macOS)
 
@@ -135,23 +132,52 @@ Chrome extensions do not update files themselves. Update behavior in the sidepan
 
 - **Daemon disconnected:** start the installed daemon; users without an installed
   daemon must first download a Release ZIP manually.
-- **Git checkout daemon:** `检查更新` / `由 Daemon 执行更新` runs fast-forward
-  `git pull`, install/build, restart, then prompts for extension reload.
+- **Source checkout daemon:** it may report a newer formal Release, but automatic
+  update is disabled. Maintainers update and build source explicitly; the daemon
+  never runs git, package installation, or build commands.
 - **Release ZIP daemon:** the same UI downloads only the exact versioned assets
   from this repository's latest formal GitHub Release, verifies SHA-256 and
   archive structure, transactionally swaps the installed runtime/extension,
   restarts, then prompts for extension reload.
 
-CLI equivalent from a git clone:
-
-```bash
-npm run update:local
-```
-
 An installation made from a ZIP older than the auto-updater must be manually
 upgraded once. GitHub account/release integrity remains the update trust root;
 SHA-256 protects artifact integrity but is not a substitute for an offline
 release-signing key.
+
+## Third-party MCP servers
+
+The extension AI can use user-registered MCP servers through the local daemon.
+Open `设置 → MCP` and import a common `mcpServers` JSON object. Supported
+transports are local stdio (`command` + `args`) and remote Streamable HTTP.
+Remote imports accept both `type: "streamable-http"` with `url` and the common
+host aliases `type: "streamableHttp"` with `baseUrl`. Optional `description`,
+`timeout`/`timeoutMs`, and `disabledTools` are preserved and enforced.
+Importing only stores a disabled configuration; enabling or testing explicitly
+starts the command/connection. Remote endpoints require HTTPS, except loopback
+localhost HTTP. Legacy SSE transport is rejected.
+
+New conversations default to `MCP 自动`; the side panel probes only `tools/list`
+and shows a bounded capability summary before the first user message. The chat
+toolbar can still choose `MCP 关闭`, `MCP 自动`, or one specified enabled server
+per conversation. External tools are namespaced and bounded. They require the
+existing open-world approval by default. A user may explicitly trust one
+server's MCP read-only annotations; only tools declaring `readOnlyHint: true`
+without a conflicting destructive hint then skip repeated approval. The compact
+approval row also exposes an explicit per-server “auto-run all tools” choice.
+That choice is persisted by the daemon, applies only to the selected server
+across chats, includes read/write/delete/unknown tools, and can be revoked from
+`设置 → MCP`. It never grants automatic approval to browser tools or another
+MCP server. Transport type or HTTP method is never treated as proof of read-only
+behavior. Environment variables and HTTP headers stay in the daemon's private
+`daemon.json` (0600) and are not copied into Chrome extension storage.
+
+Models remain independently selectable. In `设置 → 模型管理`, either
+enter a model ID manually or query an OpenAI-compatible Provider via
+`GET /v1/models`; a Provider root such as `https://llm.example.com/` is resolved
+to `/v1/models` for discovery and `/v1/chat/completions` for chat. The configured
+API Key is sent only to that Provider and the returned IDs only populate the
+local selector.
 
 ## Codex MCP adapter
 

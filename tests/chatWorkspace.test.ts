@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  clearUnavailableConversationTarget,
   DEFAULT_CHAT_GREETING,
   MAX_STORED_CONVERSATIONS,
   conversationSearchText,
@@ -13,7 +14,7 @@ import {
 } from "../src/sidepanel/services/chatWorkspace";
 import type { ChatMessage } from "../src/sidepanel/types";
 
-test("stored conversations omit tool results, attachments, and runtime status", () => {
+test("stored conversations retain bounded tool audit details but omit secrets, attachments, and runtime status", () => {
   const messages: ChatMessage[] = [
     {
       id: "user-1",
@@ -36,7 +37,17 @@ test("stored conversations omit tool results, attachments, and runtime status", 
       id: "tool-1",
       role: "tool",
       toolName: "browser_query_dom",
+      toolSource: "external_mcp",
+      toolDisplayName: "prometheus_query",
+      toolServerName: "Prometheus Infra MCP",
+      toolRequestArguments:
+        '{"query":"up","apiKey":"request-secret"}',
       content: '{"authorization":"secret"}',
+      toolResultMeta: {
+        originalCharCount: 26,
+        displayedSourceCharCount: 26,
+        truncated: false,
+      },
       createdAt: "2026-07-14T00:00:01.000Z",
     },
     {
@@ -63,6 +74,22 @@ test("stored conversations omit tool results, attachments, and runtime status", 
       createdAt: "2026-07-14T00:00:00.000Z",
     },
     {
+      id: "tool-1",
+      role: "tool",
+      toolName: "browser_query_dom",
+      toolSource: "external_mcp",
+      toolDisplayName: "prometheus_query",
+      toolServerName: "Prometheus Infra MCP",
+      toolRequestArguments: '{\n  "query": "up",\n  "apiKey": "[redacted]"\n}',
+      content: '{\n  "authorization": "[redacted]"\n}',
+      toolResultMeta: {
+        originalCharCount: 26,
+        displayedSourceCharCount: 26,
+        truncated: false,
+      },
+      createdAt: "2026-07-14T00:00:01.000Z",
+    },
+    {
       id: "assistant-1",
       role: "assistant",
       content: "Done",
@@ -70,7 +97,9 @@ test("stored conversations omit tool results, attachments, and runtime status", 
     },
   ]);
   assert.equal(JSON.stringify(stored).includes("SECRET_BYTES"), false);
-  assert.equal(JSON.stringify(stored).includes("authorization"), false);
+  assert.equal(JSON.stringify(stored).includes("request-secret"), false);
+  assert.equal(JSON.stringify(stored).includes('"secret"'), false);
+  assert.equal(JSON.stringify(stored).includes("prometheus_query"), true);
 });
 
 test("conversation target persists a fixed Tab without URL credentials or query data", () => {
@@ -103,6 +132,35 @@ test("conversation target persists a fixed Tab without URL credentials or query 
     }).conversations[0]?.target,
     undefined,
   );
+});
+
+test("an unavailable restored Tab clears the target and its activity cursor without touching a newer binding", () => {
+  const stored = createStoredConversation({
+    id: "conversation-stale-target",
+    createdAt: "2026-08-05T00:00:00.000Z",
+    updatedAt: "2026-08-05T00:00:01.000Z",
+    messages: [
+      {
+        id: "user-stale-target",
+        role: "user",
+        content: "Continue the investigation",
+        createdAt: "2026-08-05T00:00:00.000Z",
+      },
+    ],
+    draft: "",
+    target: {
+      tabId: 17,
+      title: "Closed page",
+      url: "https://example.test/closed",
+    },
+    activityCursor: { streamId: "activity-stale", sequence: 9 },
+  });
+
+  const cleared = clearUnavailableConversationTarget(stored, 17);
+  assert.equal(cleared.target, undefined);
+  assert.equal(cleared.activityCursor, undefined);
+  assert.equal(cleared.messages[0]?.content, "Continue the investigation");
+  assert.equal(clearUnavailableConversationTarget(stored, 18), stored);
 });
 
 test("conversation activity cursor persists a stream identity and sequence", () => {
@@ -138,6 +196,34 @@ test("conversation activity cursor persists a stream identity and sequence", () 
     }).conversations[0]?.activityCursor,
     undefined,
   );
+});
+
+test("conversation MCP mode persists without making a greeting-only chat durable", () => {
+  const stored = createStoredConversation({
+    id: "conversation-mcp-mode",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:01.000Z",
+    messages: [
+      {
+        id: "assistant-ready-mcp",
+        role: "assistant",
+        source: "extension_ai",
+        content: DEFAULT_CHAT_GREETING,
+        createdAt: "2026-07-14T00:00:00.000Z",
+      },
+    ],
+    draft: "",
+    externalMcpSelection: {
+      mode: "selected",
+      serverIds: ["mcp_filesystem"],
+    },
+  });
+
+  assert.deepEqual(stored.externalMcpSelection, {
+    mode: "selected",
+    serverIds: ["mcp_filesystem"],
+  });
+  assert.equal(isEmptyStoredConversation(stored), true);
 });
 
 test("workspace normalization deduplicates, sorts, and bounds conversations", () => {
@@ -248,7 +334,7 @@ test("a greeting-only conversation remains ephemeral until it has real state", (
   assert.equal(isEmptyStoredConversation(withUserMessage), false);
 });
 
-test("tool-heavy runs do not evict the bounded user and assistant history", () => {
+test("tool-heavy runs preserve primary history and the latest bounded audit trail", () => {
   const userMessage: ChatMessage = {
     id: "user-before-tools",
     role: "user",
@@ -271,9 +357,10 @@ test("tool-heavy runs do not evict the bounded user and assistant history", () =
     draft: "",
   });
 
-  assert.deepEqual(stored.messages.map((message) => message.id), [
-    "user-before-tools",
-  ]);
+  assert.equal(stored.messages[0]?.id, "user-before-tools");
+  assert.equal(stored.messages.length, 49);
+  assert.equal(stored.messages[1]?.id, "tool-52");
+  assert.equal(stored.messages.at(-1)?.id, "tool-99");
 });
 
 test("conversation history supports full-text search and explicit Markdown/JSON export", () => {

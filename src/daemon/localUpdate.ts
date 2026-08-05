@@ -1,5 +1,4 @@
-import { spawnSync } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -14,7 +13,7 @@ import {
   type GithubRelease,
 } from "./releaseUpdate";
 
-export type LocalUpdateInstallMode = "git" | "release-zip";
+export type LocalUpdateInstallMode = "development" | "release-zip";
 
 export interface LocalUpdateCheckResult {
   ok: true;
@@ -52,7 +51,6 @@ export interface LocalUpdateRunResult {
 
 interface LocalUpdateOptions {
   fetchImpl?: typeof fetch;
-  skipGitFetch?: boolean;
 }
 
 export function resolveProjectRootFromDaemon(): string {
@@ -68,7 +66,7 @@ export async function checkLocalUpdate(
   if (await isReleaseZipInstallation(projectRoot)) {
     return checkReleaseZipUpdate(projectRoot, options.fetchImpl);
   }
-  return checkGitUpdate(projectRoot, options);
+  return checkDevelopmentUpdate(projectRoot, options.fetchImpl);
 }
 
 export async function runLocalUpdate(
@@ -78,7 +76,14 @@ export async function runLocalUpdate(
   if (await isReleaseZipInstallation(projectRoot)) {
     return runReleaseZipUpdate(projectRoot, options);
   }
-  return runGitUpdate(projectRoot, options);
+  return {
+    ok: false,
+    error:
+      "自动更新仅支持 Release ZIP 安装。当前是源码开发目录，请由维护者自行切换代码版本并构建；daemon 不会执行 git、依赖安装或构建命令。",
+    projectRoot,
+    installMode: "development",
+    restartScheduled: false,
+  };
 }
 
 async function checkReleaseZipUpdate(
@@ -173,138 +178,40 @@ async function runReleaseZipUpdate(
   }
 }
 
-async function checkGitUpdate(
+async function checkDevelopmentUpdate(
   projectRoot: string,
-  options: LocalUpdateOptions,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<LocalUpdateCheckResult> {
-  await assertGitRepo(projectRoot);
   const packageJson = JSON.parse(
     await readFile(join(projectRoot, "package.json"), "utf8"),
   );
   const currentVersion = String(packageJson.version ?? "").trim() || "0.0.0";
-  const currentCommit = git(projectRoot, ["rev-parse", "HEAD"]) ?? "";
-  const branch = git(projectRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
-
-  if (!options.skipGitFetch) {
-    git(projectRoot, ["fetch", "--quiet", "--tags", "origin"], true);
-  }
-  const upstream =
-    git(projectRoot, ["rev-parse", "--abbrev-ref", "@{upstream}"]) ??
-    (branch ? `origin/${branch}` : "origin/main");
-  const remoteCommit = git(projectRoot, ["rev-parse", upstream]);
-  const repository =
-    parseGithubRepo(git(projectRoot, ["remote", "get-url", "origin"])) ??
-    DEFAULT_UPDATE_REPOSITORY;
-  const release = await fetchReleaseBestEffort(repository, options.fetchImpl);
-  const commitUpdate =
-    Boolean(remoteCommit) &&
-    Boolean(currentCommit) &&
-    remoteCommit !== currentCommit;
+  const repository = normalizeUpdateRepository(
+    process.env.AI_DEVTOOLS_UPDATE_REPOSITORY || DEFAULT_UPDATE_REPOSITORY,
+  );
+  const release = await fetchReleaseBestEffort(repository, fetchImpl);
   const releaseUpdate = Boolean(
     release?.version && isVersionNewer(release.version, currentVersion),
   );
-  const updateAvailable = commitUpdate || releaseUpdate;
-
-  const parts: string[] = [];
-  if (commitUpdate) parts.push(`git 远端 ${upstream} 有新提交`);
-  if (releaseUpdate) parts.push(`GitHub Release ${release?.tag} 新于当前 ${currentVersion}`);
   return {
     ok: true,
-    updateAvailable,
+    updateAvailable: releaseUpdate,
     currentVersion,
-    currentCommit,
-    remoteCommit,
+    currentCommit: "",
+    remoteCommit: null,
     latestReleaseTag: release?.tag ?? null,
     latestReleaseVersion: release?.version ?? null,
     releaseUrl: release?.htmlUrl ?? null,
     releaseAssetName: null,
     projectRoot,
-    branch,
-    installMode: "git",
-    autoUpdateSupported: true,
+    branch: null,
+    installMode: "development",
+    autoUpdateSupported: false,
     message:
-      parts.length > 0
-        ? parts.join("；")
-        : "已是最新（未发现更新的 git 提交或更高 Release 版本）。",
+      releaseUpdate
+        ? `GitHub Release ${release?.tag} 新于当前 ${currentVersion}；源码开发目录不会自动更新，请手动下载 Release ZIP 或由维护者更新源码。`
+        : "源码开发目录不参与自动更新；未发现更高的正式 Release。",
   };
-}
-
-async function runGitUpdate(
-  projectRoot: string,
-  options: { noRestart?: boolean },
-): Promise<LocalUpdateRunResult> {
-  await assertGitRepo(projectRoot);
-  const updateScript = join(projectRoot, "scripts", "update-local.mjs");
-  await access(updateScript);
-  const beforeVersion = JSON.parse(
-    await readFile(join(projectRoot, "package.json"), "utf8"),
-  ).version as string;
-  const result = spawnSync(process.execPath, [updateScript, "--no-restart"], {
-    cwd: projectRoot,
-    encoding: "utf8",
-    env: process.env,
-    timeout: 15 * 60_000,
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  const combined = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
-  const logTail = combined.slice(-4_000);
-  if (result.status !== 0) {
-    return {
-      ok: false,
-      currentVersion: beforeVersion,
-      error: `update:local failed (exit ${result.status}): ${logTail || "no output"}`,
-      projectRoot,
-      installMode: "git",
-      restartScheduled: false,
-    };
-  }
-  const packageJson = JSON.parse(
-    await readFile(join(projectRoot, "package.json"), "utf8"),
-  );
-  let notice: { version?: string; buildId?: string; commit?: string } = {};
-  try {
-    notice = JSON.parse(
-      await readFile(join(projectRoot, "dist", "update-notice.json"), "utf8"),
-    ) as typeof notice;
-  } catch {
-    // The build succeeded but an older branch may not emit a notice.
-  }
-  return {
-    ok: true,
-    currentVersion: beforeVersion,
-    newVersion: String(packageJson.version ?? notice.version ?? ""),
-    commit: notice.commit,
-    buildId: notice.buildId,
-    logTail,
-    projectRoot,
-    installMode: "git",
-    restartScheduled: !options.noRestart,
-  };
-}
-
-async function assertGitRepo(projectRoot: string): Promise<void> {
-  const inside = git(projectRoot, ["rev-parse", "--is-inside-work-tree"]);
-  if (inside !== "true") {
-    throw new Error(
-      "当前目录既不是有效 Release ZIP 安装，也不是 git clone 开发目录。",
-    );
-  }
-}
-
-function git(
-  projectRoot: string,
-  args: string[],
-  allowFailure = false,
-): string | null {
-  const result = spawnSync("git", args, {
-    cwd: projectRoot,
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    if (allowFailure) return null;
-    return null;
-  }
-  return result.stdout.trim();
 }
 
 async function fetchReleaseBestEffort(
@@ -316,10 +223,4 @@ async function fetchReleaseBestEffort(
   } catch {
     return null;
   }
-}
-
-function parseGithubRepo(remote: string | null): string | null {
-  if (!remote) return null;
-  const match = remote.match(/github\.com[:/](.+?)(?:\.git)?$/i);
-  return match?.[1] ? normalizeUpdateRepository(match[1].replace(/\.git$/i, "")) : null;
 }

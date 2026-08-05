@@ -67,11 +67,37 @@ test("protocol role policy permits only role-specific inbound commands", () => {
     true,
   );
   assert.equal(
+    isCommandAllowedForRole("ui", WS_COMMANDS.EXTERNAL_MCP_UPSERT),
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole("plugin", WS_COMMANDS.EXTERNAL_MCP_UPSERT),
+    false,
+  );
+  assert.equal(
+    isCommandAllowedForRole("mcp", WS_COMMANDS.EXTERNAL_MCP_LIST),
+    false,
+  );
+  assert.equal(
     isCommandAllowedForRole("ui", WS_COMMANDS.DAEMON_AGENT_START),
     true,
   );
   assert.equal(
     isCommandAllowedForRole("plugin", WS_COMMANDS.DAEMON_AGENT_START),
+    false,
+  );
+  assert.equal(
+    isCommandAllowedForRole(
+      "ui",
+      WS_COMMANDS.DAEMON_AGENT_BUDGET_DECISION,
+    ),
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole(
+      "plugin",
+      WS_COMMANDS.DAEMON_AGENT_BUDGET_DECISION,
+    ),
     false,
   );
   assert.equal(
@@ -92,6 +118,72 @@ test("protocol role policy permits only role-specific inbound commands", () => {
   );
   assert.equal(
     isCommandAllowedForRole("ui", WS_COMMANDS.COLLABORATION_WORKSPACE_UPDATED),
+    false,
+  );
+});
+
+test("external MCP management input is bounded and UI-only", () => {
+  const parsed = pluginToMcpMessageSchema.safeParse({
+    requestId: "external-mcp-upsert-1",
+    command: WS_COMMANDS.EXTERNAL_MCP_UPSERT,
+    sentAt: "2026-08-04T00:00:00.000Z",
+    payload: {
+      server: {
+        id: "mcp_fixture",
+        name: "Fixture",
+        enabled: false,
+        transport: {
+          type: "stdio",
+          command: "node",
+          args: ["server.mjs"],
+          env: { TOKEN: "not-a-real-secret" },
+        },
+      },
+    },
+  });
+  assert.equal(parsed.success, true);
+  assert.equal(
+    inboundMessageByteLimit(WS_COMMANDS.EXTERNAL_MCP_UPSERT),
+    128 * 1024,
+  );
+  assert.equal(
+    pluginToMcpMessageSchema.safeParse({
+      requestId: "external-mcp-trust-1",
+      command: WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST,
+      sentAt: "2026-08-04T00:00:00.000Z",
+      payload: { serverId: "mcp_fixture", trusted: true },
+    }).success,
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole(
+      "ui",
+      WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST,
+    ),
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole(
+      "mcp",
+      WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST,
+    ),
+    false,
+  );
+  assert.equal(
+    pluginToMcpMessageSchema.safeParse({
+      requestId: "external-mcp-auto-approve-1",
+      command: WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE,
+      sentAt: "2026-08-04T00:00:00.000Z",
+      payload: { serverId: "mcp_fixture", enabled: true },
+    }).success,
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole("ui", WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE),
+    true,
+  );
+  assert.equal(
+    isCommandAllowedForRole("mcp", WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE),
     false,
   );
 });
@@ -151,6 +243,29 @@ test("daemon Agent start is bounded, UI-only protocol input", () => {
       input: "inspect the page",
       attachments: [],
       context: {},
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "extmcp__fixture__query",
+            description: "Fixture query",
+            parameters: { type: "object" },
+          },
+          clientMetadata: {
+            source: "external_mcp",
+            displayName: "query",
+            externalMcpServerId: "fixture",
+            externalMcpServerName: "Fixture MCP",
+            externalMcpToolName: "query",
+            annotations: {
+              readOnlyHint: true,
+              destructiveHint: false,
+              idempotentHint: true,
+              openWorldHint: false,
+            },
+          },
+        },
+      ],
       egressDestinations: ["https://provider.example"],
     },
   });
@@ -158,6 +273,24 @@ test("daemon Agent start is bounded, UI-only protocol input", () => {
   assert.equal(
     inboundMessageByteLimit(WS_COMMANDS.DAEMON_AGENT_START),
     8 * 1024 * 1024,
+  );
+  assert.equal(
+    pluginToMcpMessageSchema.safeParse({
+      requestId: "budget-decision-1",
+      command: WS_COMMANDS.DAEMON_AGENT_BUDGET_DECISION,
+      sentAt: "2026-08-04T00:00:00.000Z",
+      payload: {
+        runId: "run-1",
+        conversationId: "conversation-1",
+        budgetRequestId: "budget-request-1",
+        decision: "continue",
+      },
+    }).success,
+    true,
+  );
+  assert.equal(
+    inboundMessageByteLimit(WS_COMMANDS.DAEMON_AGENT_BUDGET_DECISION),
+    4 * 1024,
   );
 });
 

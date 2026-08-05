@@ -391,6 +391,56 @@ test("daemon advertises the assigned role and protocol limits", async () => {
   }
 });
 
+test("MCP tool listing can exclude every local browser tool", async () => {
+  const externalTool = {
+    name: "extmcp__fixture__query_1234567",
+    title: "query",
+    description: "Read fixture data",
+    externalMcpServerId: "fixture",
+    externalMcpServerName: "Fixture MCP",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+      additionalProperties: false,
+    },
+  };
+  const daemon = startPluginWebSocketServer(0, {
+    listTools: async () => [externalTool],
+    callTool: async () => ({ content: [] }),
+  });
+  const address = await daemon.ready();
+  const socket = await connectRole(
+    `ws://${address.host}:${address.port}`,
+    "ui",
+    "external-only-tools",
+  );
+
+  try {
+    const responsePromise = waitForCommand(
+      socket,
+      WS_COMMANDS.MCP_LIST_TOOLS_RESULT,
+    );
+    socket.send(
+      JSON.stringify({
+        requestId: "external-only-tool-list",
+        command: WS_COMMANDS.MCP_LIST_TOOLS,
+        sentAt: new Date().toISOString(),
+        payload: {
+          includeLocal: false,
+          includeExternal: true,
+          externalServerIds: ["fixture"],
+        },
+      }),
+    );
+    const response = await responsePromise;
+    assert.equal(response.payload.ok, true);
+    assert.deepEqual(response.payload.tools, [externalTool]);
+  } finally {
+    socket.close();
+    await daemon.close();
+  }
+});
+
 test("daemon rejects a command above its message-specific byte budget", async () => {
   const daemon = startPluginWebSocketServer(0);
   const address = await daemon.ready();

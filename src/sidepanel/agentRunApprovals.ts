@@ -3,7 +3,8 @@ import type { ApprovalRequestPayload } from "../shared/wsProtocol";
 export type ToolApprovalDecision =
   | "deny"
   | "allow_once"
-  | "allow_conversation_origin";
+  | "allow_conversation_origin"
+  | "allow_external_mcp";
 
 export type ExecutionApprovalMode = "ask" | "agent" | "full";
 

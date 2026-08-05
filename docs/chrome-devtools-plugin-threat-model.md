@@ -1,8 +1,9 @@
 ## Executive summary
 
-本次模型覆盖 Release ZIP 自动更新、daemon 托管 Agent、浏览器工具执行和本地源码
-定位边界。最高风险一是 GitHub 发布账号被控制后，daemon 会安装攻击者发布的代码；
-二是 Provider 凭据、页面内容和浏览器写能力跨过 Side Panel → daemon 边界。当前实现
+本次模型覆盖 Release ZIP 自动更新、daemon 托管 Agent、第三方 MCP、浏览器工具执行和
+本地源码定位边界。最高风险一是 GitHub 发布账号被控制后，daemon 会安装攻击者发布的
+代码；二是用户启用恶意 stdio MCP 后发生本机代码执行；三是 Provider 凭据、页面内容和
+浏览器写能力跨过 Side Panel → daemon 边界。当前实现
 通过固定发布源与双摘要、严格 WebSocket 角色/Schema、任务与 Tab 绑定、原有工具审批、
 内存态凭据和只返回编辑器定位 URI 降低风险；GitHub 发布身份、当前用户权限和本地
 Bridge Token 仍是关键信任根。
@@ -11,11 +12,16 @@ Bridge Token 仍是关键信任根。
 
 - 范围：`src/daemon/localUpdate.ts`、`src/daemon/releaseUpdate.ts`、
   `src/daemon/agentRunner.ts`、`src/mcp/wsServer.ts`、`src/mcp/wsSchemas.ts`、
-  `src/mcp/workspaceTools.ts`、`scripts/package-local.mjs`、
+  `src/mcp/workspaceTools.ts`、`src/daemon/externalMcpRegistry.ts`、
+  `src/shared/externalMcp.ts`、`scripts/package-local.mjs`、
   `scripts/bundle-portable-node.mjs`、重启/安装脚本和 `.release-it.json`。
 - 假设 Release 发布到公开仓库 `masterjie98-cloud/chrome-devtools-plugin`，普通用户
   不需要 GitHub Token。
 - 假设默认流程是自动检查、用户确认后安装，不进行静默无人值守覆盖。
+- 假设第三方 MCP 由本机单用户显式导入；导入不执行，只有启用/测试才连接；用户理解
+  `npx`/`uvx` 等命令在首次启动时可能自行下载代码。按 server 开启“全部工具自动运行”
+  是额外的高风险明示授权，包含读取、写入、删除和未知工具，且对连接到同一 daemon 的
+  聊天生效，直到用户在设置中撤销。
 - 假设拥有当前用户文件写权限的本地攻击者不在本功能防护范围内；该攻击者原本就能
   修改已解压扩展和 daemon 文件。
 - 假设 Side Panel 已安全保存用户配置的 Provider 凭据，并只通过已认证 loopback
@@ -38,6 +44,10 @@ Bridge Token 仍是关键信任根。
   task/conversation/Tab 绑定、目标新鲜度和工具策略检查。
 - 本地源码定位器：仅在配置的工作区根内匹配 Source Map，返回文件 URI、行列和编辑器
   URI/参数，不启动 shell 或编辑器进程。
+- 外部 MCP 注册器：托管用户配置的 stdio/Streamable HTTP Client，隔离工具命名空间，
+  限制连接/调用/结果大小。第三方工具默认进入既有 open-world 审批链；只有用户明确
+  信任某 server 的声明后，无 destructive 冲突的 `readOnlyHint: true` 工具可免重复审批；
+  用户也可对单个 server 明示开启全部工具自动运行，并在设置中撤销。
 - GitHub Release：托管正式版本 ZIP、SHA-256 和 GitHub 资产 digest。
 - 安装目录：固定的 `runtime`、`extension`、安装元数据与一个上一版本备份。
 - 重启辅助进程/LaunchAgent：等待旧 daemon 退出并启动新版本。
@@ -75,6 +85,24 @@ Bridge Token 仍是关键信任根。
   项目名或已配置根的精确路径选择，其他任意绝对路径会被拒绝。输出是 `file://`、
   `vscode://`、`cursor://` 及显式参数数组，
   不执行命令。证据：`src/mcp/workspaceTools.ts` `resolveSelectedRoot`、`editorTargets`。
+- Side Panel → MCP 配置：只有已认证 `ui` 角色可列举、写入、启停、测试或删除；单条
+  写入消息 128 KiB，Schema 限制 command/args/env/headers。配置写入 daemon 私有
+  `daemon.json`（0600），列表仅回传脱敏 summary。证据：`src/mcp/protocolPolicy.ts`、
+  `src/mcp/wsSchemas.ts`、`src/daemon/config.ts`。
+- daemon → stdio MCP：`StdioClientTransport` 直接使用 command/args，不构造 shell；仅
+  继承 SDK 安全环境变量并合并用户 env。导入不启动，启用/测试才 spawn。该进程仍拥有
+  当前 OS 用户权限，因此启用即信任本机代码执行。
+- daemon → Streamable HTTP MCP：远端强制 HTTPS，仅 loopback 可用 HTTP；禁止 URL
+  内嵌凭据，headers 保存在 daemon 配置。旧 SSE 配置拒绝。
+- 外部 MCP tool → Agent：工具名带 server 命名空间；新 chat 默认自动并仅以 `tools/list`
+  生成能力欢迎语，也可关闭/指定 server。未知外部工具由 `getToolPolicy` 归类为
+  open-world 并默认逐次审批；MCP annotation 是不可信提示，须用户显式信任 server，且
+  `readOnlyHint: true` 不得与 destructive hint 冲突。若用户对该 server 明示开启全部工具
+  自动运行，读取、写入、删除和未知工具均跳过逐次审批；设置按 server id 隔离、落在 daemon
+  私有配置中并可撤销，不扩散到浏览器工具或其他 server。结果上限 1 MiB。
+- Side Panel → AI Provider 模型发现：只向由当前 API URL 安全推导的同一 Provider
+  `GET /v1/models` 发送当前模型的 API Key；1 MiB 响应上限，只接受 `{data:[{id}]}`，
+  Provider origin 改变时在发送已有 Key 前确认。
 
 #### Diagram
 
@@ -84,6 +112,7 @@ flowchart LR
   P --> D["Local Daemon"]
   D --> M["AI Provider"]
   D --> B["Browser Executor"]
+  D --> X["User-configured MCP servers"]
   B --> W["Bound Web Page"]
   D --> S["Configured Source Roots"]
   D --> G["GitHub Release API"]
@@ -107,6 +136,8 @@ flowchart LR
 | 页面内容、截图和工具结果 | 可能包含业务或敏感页面数据 | C/I |
 | 任务、对话和 Tab 绑定 | 防止 Agent 写到错误页面或跨聊天授权 | I |
 | 本地源码与 Source Map | 可泄露项目结构和源码内容 | C/I |
+| MCP command、env 与 HTTP headers | 可启动本机代码或携带访问凭据 | C/I |
+| 外部 MCP 工具结果 | 可能包含本地文件、远端数据或敏感内容 | C/I |
 
 ## Attacker model
 
@@ -117,6 +148,8 @@ flowchart LR
 - 能获得 Bridge Token 并建立 `ui` 身份的本地进程可触发一次更新检查或安装。
 - 被调试页面可控制 DOM、Network、Console、Source Map URL 和部分错误文本，试图向
   Agent 注入指令或诱导其调用高风险工具。
+- 用户导入的 MCP 配置或远端 MCP server 可能恶意，尝试执行本机代码、返回提示注入、
+  外带工具参数或制造超大/挂起结果。
 
 ### Non-capabilities
 
@@ -141,6 +174,11 @@ flowchart LR
 | daemon Agent 工具执行 | 模型 tool call | daemon → MCP/browser | task/Tab 绑定、broker、审批、审计 | `src/mcp/wsServer.ts` `executeDaemonAgentTool` |
 | Source Map 根选择 | MCP 参数 | daemon → 本地文件系统 | 配置根白名单、root id、只读扫描 | `src/mcp/workspaceTools.ts` |
 | 编辑器定位输出 | Source Map 结果 | daemon → MCP client | URI 与参数数组；不启动进程 | `src/mcp/workspaceTools.ts` `editorTargets` |
+| `EXTERNAL_MCP_*` | 本地 WebSocket | Side Panel → daemon config | 仅 `ui` role；写入 128 KiB 上限 | `src/mcp/protocolPolicy.ts`, `src/mcp/wsSchemas.ts` |
+| stdio MCP 启动 | 启用/测试配置 | daemon → local process | command/args 直启，不走 shell；当前用户权限 | `src/daemon/externalMcpRegistry.ts` `createTransport` |
+| Streamable HTTP MCP | 启用/测试配置 | daemon → network | HTTPS 或 loopback HTTP；无 URL credential | `src/shared/externalMcp.ts` `assertSafeMcpHttpUrl` |
+| 外部 MCP tool call | Agent tool call | daemon → MCP server | 命名空间、默认 open-world 审批、显式 server read-only trust、可撤销的 per-server 全工具自动运行、60s/1MiB 上限 | `externalMcpRegistry.ts`, `src/shared/toolPolicy.ts` |
+| AI model list | 设置页显式点击 | Side Panel → AI Provider | 同源 URL 推导、HTTPS/loopback、origin 变更确认、GET、1MiB 上限 | `src/sidepanel/services/aiModelCatalog.ts` |
 
 ## Top abuse paths
 
@@ -158,6 +196,15 @@ flowchart LR
    `ui` 身份与 URL 策略仍是控制点；Token 与扩展身份同时泄露仍可能造成凭据/页面外带。
 10. 页面 Source Map 声称映射到任意本地路径 → 根选择只接受配置候选，定位器不执行
     编辑器命令，防止把 Source Map 变成本地任意文件/命令入口。
+11. 用户导入恶意 stdio MCP → 导入阶段不执行；启用/测试时仍会以当前用户权限启动，UI
+    明示风险且工具调用默认逐次审批，但 MCP 进程本身不受浏览器工具审批沙箱保护。若用户
+    额外信任 server 的只读声明，恶意 server 可谎报 annotation；若用户开启全部工具自动
+    运行，该 server 可在模型选择调用时跳过逐次确认执行任意已暴露能力，因此 UI 明示范围并
+    提供按 server 撤销入口。
+12. 远端 MCP 诱导把 headers 发到明文/伪造地址 → 非 loopback HTTP、URL 内嵌凭据和旧
+    SSE 被拒绝；HTTPS server 仍是用户选择的信任目标。
+13. 外部 MCP 返回超大内容或长期不响应 → 连接/调用超时、工具数和结果 1 MiB 上限；
+    单个 server 失败不移除其他 server 的工具。
 
 ## Threat model table
 
@@ -174,6 +221,9 @@ flowchart LR
 | TM-009 | 运行时异常或维护者误改 | Agent payload 被错误持久化/打印 | API Key 进入状态、日志或崩溃报告 | 长期凭据泄露 | Provider 凭据 | config 不进入 AgentSession；runner `finally` 清空 apiKey；持久化 schema 只含脱敏会话 | JS 内存无法保证立即擦除；错误堆栈策略需持续审计 | 添加禁止 secret 字段的 state/audit 单测；日志 sink 做键名级脱敏 | secret-field regression test 与日志扫描 | low | high | high |
 | TM-010 | 恶意/错误 Source Map | 页面可控制 map 路径与 sources | 读取配置根外源码或触发编辑器命令注入 | 本地源码泄露或命令执行 | 本地源码、主机 | 配置根白名单、稳定 root id、路径 containment、只返回 URI/argv | 编辑器 URI 仍由接收客户端决定是否打开 | 客户端打开前显示根/文件/行确认；保持 argv 数组且禁止 shell 拼接 | 记录 root id、相对路径和匹配置信度 | low | high | medium |
 | TM-011 | 非恶意高并发/模型循环 | 多对话同时运行或重复工具调用 | 耗尽 Provider、daemon 内存或浏览器执行队列 | 成本与可用性下降 | Provider 额度、daemon、浏览器 | 每 conversation 单 run、Token/轮次/时长预算、工具批次 fail-fast、消息/附件上限；Stop 经 broker 取消审批、队列和浏览器执行 | 多 conversation 总并发目前没有全局上限 | 增加 session/global 并发和累计 egress/Token 配额 | 并发 run、模型请求、工具次数、耗时与取消指标 | medium | medium | medium |
+| TM-012 | 恶意/被篡改 stdio MCP | 用户显式启用或测试配置 | 以当前用户权限读取文件、联网或执行代码 | 本机数据泄露或代码执行 | 用户文件、MCP secrets、daemon | 导入不执行；启用显式；command/args 不走 shell；私有配置 | stdio 进程本身无 OS 沙箱 | 后续支持可选 allowlist、容器/沙箱 profile 和签名 server catalog | 记录 server id、启动状态、退出码，不记录 env | medium | high | high |
+| TM-013 | 恶意远端 MCP | 用户启用 HTTPS endpoint | 收集 tool 参数、返回提示注入或敏感结果，或谎报 read-only annotation | 数据外带、Agent 误导 | 工具参数、结果、Provider 上下文 | HTTPS/loopback HTTP；URL 无凭据；外部工具默认 open-world 逐次审批；只读免批须用户逐 server 明确信任且拒绝 destructive 冲突；全工具自动运行须逐 server 明示、持久化并可撤销；chat 可关闭/指定 | TLS 与 annotation 都不能证明 server 业务可信；自动运行授权覆盖该 server 所有工具；headers 静态存储 | UI 展示明确 egress origin；支持 per-server 工具 allowlist | 审计 server id、tool name、trust/auto-run change、egress bytes | medium | high | high |
+| TM-014 | 损坏/恶意 MCP server | 能接受连接 | 卡死、工具洪泛或超大结果 | daemon/Agent 可用性下降 | daemon 内存、Provider 上下文 | 20 server、200 tools/server、连接/调用超时、1 MiB 结果上限；单 server 失败隔离 | 子进程 CPU/内存尚无 OS 级配额 | 增加进程资源限制和崩溃退避 | 连接耗时、timeout、result bytes、restart count | medium | medium | medium |
 
 ## Criticality calibration
 
@@ -197,12 +247,16 @@ flowchart LR
 | `src/mcp/wsSchemas.ts` | Agent 输入、附件和配置的有界验证 | TM-007, TM-009, TM-011 |
 | `src/mcp/wsServer.ts` | 合成 requester、审批、任务绑定与事件广播 | TM-007, TM-008, TM-011 |
 | `src/mcp/workspaceTools.ts` | Source Map 根白名单与非执行型编辑器定位 | TM-010 |
+| `src/shared/externalMcp.ts` | 导入规范化、URL/命令边界与工具命名空间 | TM-012, TM-013 |
+| `src/daemon/externalMcpRegistry.ts` | 子进程/HTTP 生命周期、结果边界和路由 | TM-012, TM-013, TM-014 |
+| `src/daemon/config.ts` | MCP secrets 的私有持久化和原子写入 | TM-012, TM-013 |
 | `scripts/bundle-portable-node.mjs` | 官方 Node 下载、摘要校验和发布包供应链 | TM-001, TM-002, TM-003 |
 
 ## Quality check
 
 - [x] 覆盖本地 WS、GitHub API、资产下载、归档、文件切换和重启入口。
 - [x] 覆盖 daemon Agent、Provider 凭据、浏览器工具审批和 Source Map 本地文件边界。
+- [x] 覆盖第三方 stdio/Streamable HTTP MCP 的导入、启停、凭据、审批与资源边界。
 - [x] 每个信任边界至少对应一个威胁。
 - [x] 区分运行时 updater、发版工具和测试。
 - [x] 明确 GitHub 发布身份和本地同用户攻击者假设。
