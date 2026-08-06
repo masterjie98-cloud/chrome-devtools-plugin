@@ -81,6 +81,45 @@ test("context budgeting removes old history but preserves the latest tool exchan
   assert.ok(fitted.report.breakdown.tool_results > 0);
 });
 
+test("context budgeting preserves the latest coherent conversation turn before page context", () => {
+  const previousUser = "请继续排查 fluent-bit-jmz5k 的 SIGBUS 根因";
+  const previousAssistant =
+    "已经定位到容器异常，并提出继续查询节点指标或对比正常节点。你希望继续哪一项？";
+  const automaticPageContext =
+    "UNTRUSTED_PAGE_CONTEXT\n" + "DNS management page ".repeat(1_500);
+  const fitted = fitMessagesToContextWindow(
+    [
+      { role: "system", content: "trusted system instruction" },
+      {
+        role: "user",
+        contextCategory: "conversation",
+        content: previousUser,
+      },
+      {
+        role: "assistant",
+        contextCategory: "conversation",
+        content: previousAssistant,
+      },
+      {
+        role: "user",
+        contextCategory: "page_context",
+        content: automaticPageContext,
+      },
+      {
+        role: "user",
+        contextCategory: "conversation",
+        content: "CURRENT_USER_REQUEST\n你自己决定",
+      },
+    ],
+    { contextWindowTokens: 8_192, maxOutputTokens: 2_048 },
+  );
+
+  const serialized = JSON.stringify(fitted.messages);
+  assert.match(serialized, /fluent-bit-jmz5k/);
+  assert.match(serialized, /你希望继续哪一项/);
+  assert.doesNotMatch(serialized, /DNS management page/);
+});
+
 test("context budgeting fails locally when tool schemas consume the whole window", () => {
   assert.throws(
     () =>

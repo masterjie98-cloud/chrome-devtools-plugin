@@ -91,6 +91,66 @@ test("general questions treat missing automatic page context as optional", async
   }
 });
 
+test("dependent follow-ups inherit the previous task instead of automatic page context", async () => {
+  const requestBodies: Array<Record<string, unknown>> = [];
+  const restore = installBrowserGlobals(requestBodies, {
+    choices: [{ message: { content: "我将继续查询节点指标。" } }],
+  });
+  try {
+    await streamAiChat({
+      config: { ...DEFAULT_AI_CONFIG, enableTools: false },
+      messages: [
+        {
+          id: "previous-user",
+          role: "user",
+          content: "请排查 fluent-bit-jmz5k 的 SIGBUS 根因。",
+          createdAt: "2026-08-06T10:40:00.000Z",
+        },
+        {
+          id: "previous-assistant",
+          role: "assistant",
+          content:
+            "下一步可以查询 rs-compute1 的磁盘指标，或对比正常 fluent-bit 节点。要继续哪个？",
+          createdAt: "2026-08-06T10:41:00.000Z",
+        },
+      ],
+      input: "你自己决定",
+      attachments: [],
+      context: {
+        pageSnapshot: {
+          url: "https://enterprise.example/dns",
+          title: "DNS 管理",
+          origin: "https://enterprise.example",
+          capturedAt: "2026-08-06T10:42:00.000Z",
+          visibleText: "DNS 管理 添加记录 查询记录",
+          domSummary: [],
+          nodeCount: 3,
+          truncated: false,
+        },
+      },
+      onDelta: () => undefined,
+    });
+
+    const requestMessages = requestBodies[0]?.messages as Array<{
+      role?: string;
+      content?: unknown;
+    }>;
+    const serializedMessages = JSON.stringify(requestMessages);
+    assert.match(serializedMessages, /CONVERSATION_CONTINUATION/);
+    assert.match(serializedMessages, /fluent-bit-jmz5k/);
+    assert.equal(
+      requestMessages.some(
+        (message) =>
+          message.role === "user" &&
+          String(message.content ?? "").startsWith("UNTRUSTED_PAGE_CONTEXT"),
+      ),
+      false,
+    );
+  } finally {
+    restore();
+  }
+});
+
 test("post-tool guidance requests minimum sufficient evidence without query exhaustion", () => {
   const prompt = buildPostToolEvidencePrompt();
   assert.match(prompt, /minimum sufficient evidence/);
