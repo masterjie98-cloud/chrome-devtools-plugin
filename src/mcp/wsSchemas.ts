@@ -14,6 +14,10 @@ import {
   AGENT_TASK_STATE_VERSION,
 } from "../shared/agentTaskState";
 import { BROWSER_ACTIVITY_KINDS } from "../shared/browserActivity";
+import {
+  AGENT_RUN_PHASES,
+  AGENT_RUN_SCHEMA_VERSION,
+} from "../shared/agentSession";
 
 const externalMcpServerIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
 const externalMcpStringRecordSchema = z
@@ -47,6 +51,9 @@ const externalMcpServerSchema = z
     description: z.string().min(1).max(1_000).optional(),
     timeoutMs: z.number().int().min(1_000).max(300_000).optional(),
     disabledTools: z.array(z.string().min(1).max(200)).max(200).optional(),
+    toolApprovalPolicies: z
+      .record(z.string().min(1).max(200), z.enum(["ask", "auto"]))
+      .optional(),
     importRequestedEnabled: z.boolean().optional(),
     transport: externalMcpTransportSchema,
   })
@@ -256,9 +263,14 @@ const agentSessionToolResultSchema = z.object({
 
 const agentSessionEventSchema = z.object({
   id: z.string().min(1),
+  sequence: z.number().int().nonnegative().optional(),
   type: z.enum([
     "started",
     "context",
+    "phase",
+    "heartbeat",
+    "diagnostic",
+    "compaction",
     "tool_calls",
     "tool_results",
     "completed",
@@ -270,6 +282,14 @@ const agentSessionEventSchema = z.object({
   summary: z.string(),
   data: z
     .object({
+      turnId: z.string().max(200).optional(),
+      phase: z.enum(AGENT_RUN_PHASES).optional(),
+      status: z.string().max(800).optional(),
+      providerStreamBytes: z.number().int().nonnegative().optional(),
+      errorCode: z.string().max(120).optional(),
+      beforeTokens: z.number().int().nonnegative().optional(),
+      afterTokens: z.number().int().nonnegative().optional(),
+      reason: z.string().max(800).optional(),
       contextReadError: z.string().optional(),
       toolCalls: z.array(agentSessionToolCallSchema).optional(),
       toolResults: z.array(agentSessionToolResultSchema).optional(),
@@ -306,6 +326,7 @@ const agentTaskStateSchema = z
   .strict();
 
 const agentSessionSchema = z.object({
+  schemaVersion: z.literal(AGENT_RUN_SCHEMA_VERSION).optional(),
   id: z.string().min(1),
   assistantMessageId: z.string().min(1).max(200).optional(),
   status: z.enum(["running", "completed", "blocked", "failed", "cancelled"]),
@@ -317,6 +338,76 @@ const agentSessionSchema = z.object({
   visibleContent: z.string().max(12_000).optional(),
   executionOwner: z
     .enum(["sidepanel", "extension_background", "daemon"])
+    .optional(),
+  phase: z.enum(AGENT_RUN_PHASES).optional(),
+  heartbeatAt: z.string().max(64).optional(),
+  diagnostics: z
+    .object({
+      phase: z.enum(AGENT_RUN_PHASES),
+      phaseStartedAt: z.string().max(64),
+      lastHeartbeatAt: z.string().max(64),
+      lastProgressAt: z.string().max(64),
+      lastStatus: z.string().max(800).optional(),
+      modelRequestCount: z.number().int().nonnegative(),
+      toolCallCount: z.number().int().nonnegative(),
+      completedToolCallCount: z.number().int().nonnegative(),
+      providerStreamBytes: z.number().int().nonnegative().optional(),
+      stalledSince: z.string().max(64).optional(),
+      lastErrorCode: z.string().max(120).optional(),
+      lastErrorSummary: z.string().max(1200).optional(),
+    })
+    .strict()
+    .optional(),
+  runtimeEnvironment: z
+    .object({
+      capturedAt: z.string().max(64),
+      runtimeBuildId: z.string().max(160),
+      model: z.string().max(300),
+      providerOrigin: z.string().max(1200),
+      contextWindowTokens: z.number().int().nonnegative(),
+      maxOutputTokens: z.number().int().nonnegative(),
+      toolScope: z.enum(["browser", "mixed", "external_only"]),
+      enabledToolNames: z.array(z.string().max(200)).max(200),
+      externalMcpServerIds: z.array(z.string().max(80)).max(40),
+      targetTabId: z.number().int().nonnegative().optional(),
+      targetId: z.string().max(200).optional(),
+      permissionMode: z.enum(["approval_required", "tools_disabled"]),
+    })
+    .strict()
+    .optional(),
+  turns: z
+    .array(
+      z
+        .object({
+          id: z.string().min(1).max(200),
+          index: z.number().int().positive(),
+          phase: z.enum(AGENT_RUN_PHASES),
+          status: z.enum(["running", "completed", "failed", "cancelled"]),
+          startedAt: z.string().max(64),
+          updatedAt: z.string().max(64),
+          completedAt: z.string().max(64).optional(),
+          toolCalls: z
+            .array(
+              agentSessionToolCallSchema.extend({
+                status: z.enum([
+                  "requested",
+                  "running",
+                  "returned",
+                  "failed",
+                  "cancelled",
+                ]),
+                requestedAt: z.string().max(64),
+                updatedAt: z.string().max(64),
+                completedAt: z.string().max(64).optional(),
+                resultCharCount: z.number().int().nonnegative().optional(),
+                errorCode: z.string().max(120).optional(),
+              }),
+            )
+            .max(16),
+        })
+        .strict(),
+    )
+    .max(40)
     .optional(),
   executionBinding: z
     .object({
@@ -457,6 +548,11 @@ const daemonAgentStartSchema = z
         z
           .object({
             id: z.string().min(1).max(200),
+            runId: z.string().max(200).optional(),
+            turnId: z.string().max(200).optional(),
+            toolCallId: z.string().max(200).optional(),
+            assistantMessageId: z.string().max(200).optional(),
+            conversationId: z.string().max(200).optional(),
             role: z.enum(["user", "assistant", "tool"]),
             content: z.string().max(500_000),
             createdAt: z.string().max(64),
@@ -806,6 +902,17 @@ export const pluginToMcpMessageSchema = z.discriminatedUnion("command", [
       .object({
         serverId: externalMcpServerIdSchema,
         enabled: z.boolean(),
+      })
+      .strict(),
+  }),
+  baseMessageSchema.extend({
+    command: z.literal(WS_COMMANDS.EXTERNAL_MCP_SET_TOOL_POLICY),
+    payload: z
+      .object({
+        serverId: externalMcpServerIdSchema,
+        toolName: z.string().min(1).max(200),
+        enabled: z.boolean().optional(),
+        approval: z.enum(["inherit", "ask", "auto"]).optional(),
       })
       .strict(),
   }),

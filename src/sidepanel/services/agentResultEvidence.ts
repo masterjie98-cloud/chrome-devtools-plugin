@@ -7,11 +7,20 @@ import {
 } from "./agentToolResult";
 import { isIncrementalActivitySummaryRequest } from "./activityToolCall";
 
-const BROWSER_EFFECT_INTENT =
-  /(?:点击|双击|填写|输入|选择|勾选|取消勾选|拖拽|滚动|提交|保存|更新|删除|移除|关闭|打开|跳转|导航|返回|刷新|上传|下载|修改|设置|启用|停用|mock|拦截|代理|click|type|fill|select|check|uncheck|drag|scroll|submit|save|update|delete|remove|close|open|navigate|go back|refresh|upload|modify|set|enable|disable)/i;
+const BROWSER_UI_EFFECT_INTENT =
+  /(?:点击|双击|填写|输入|选择|勾选|取消勾选|拖拽|滚动|提交|保存|更新|删除|移除|关闭|打开|跳转|导航|返回(?:上一页|前一页|原页面)|刷新|上传|下载|修改|设置|启用|停用|click|type|fill|select|check|uncheck|drag|scroll|submit|save|update|delete|remove|close|open|navigate|go back|refresh|upload|download|modify|set|enable|disable)/i;
 
-const BROWSER_EFFECT_CONTEXT =
-  /(?:页面|网页|按钮|链接|输入框|文本框|下拉|表单|标签页|tab|抽屉|弹窗|对话框|路由|浏览器|请求|接口|network|dom|selector|button|input|select|form|dialog|drawer|route|browser|request|api)/i;
+const BROWSER_UI_EFFECT_CONTEXT =
+  /(?:页面|网页|按钮|链接|输入框|文本框|下拉|表单|标签页|上一页|前一页|原页面|tab|抽屉|弹窗|对话框|路由|浏览器|dom|selector|button|input|select|form|dialog|drawer|route|browser|url)/i;
+
+const BROWSER_NETWORK_EFFECT_INTENT =
+  /(?:mock|拦截|代理|改写|重写|固定\s*header|固定请求头|intercept|proxy|rewrite|override)/i;
+
+const BROWSER_NETWORK_EFFECT_CONTEXT =
+  /(?:请求|接口|请求头|响应|network|request|api|header|response)/i;
+
+const BROWSER_EFFECT_NEGATION =
+  /(?:不要|禁止|不得|无需|无须|不需要|避免|仅(?:查询|读取|分析|检查)|只(?:查询|读取|分析|检查)|do\s+not|don't|must\s+not|never|without(?:\s+using)?|read[-\s]?only)/i;
 
 const COMPLETION_CLAIM =
   /(?:已(?:经)?(?:完成|点击|填写|输入|选择|勾选|取消|拖拽|滚动|提交|保存|更新|删除|移除|关闭|打开|跳转|导航|返回|刷新|上传|修改|设置|启用|停用)|(?:操作|任务|处理|修改|设置|保存|提交)(?:已)?完成|(?:成功|已经生效)|(?:clicked|filled|selected|submitted|saved|updated|deleted|removed|opened|closed|navigated|completed|done|succeeded|successful))/i;
@@ -45,12 +54,29 @@ export function createAgentResultEvidenceState(
   return {
     requestedBrowserEffect:
       !isIncrementalActivitySummaryRequest(input) &&
-      BROWSER_EFFECT_INTENT.test(input) &&
-      BROWSER_EFFECT_CONTEXT.test(input),
+      containsRequestedBrowserEffect(input),
     successfulMutationCount: 0,
     mutationAttemptCount: 0,
     independentlyVerified: false,
   };
+}
+
+function containsRequestedBrowserEffect(input: string): boolean {
+  return input
+    .split(/[\n。！？!?；;，,]+/u)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+    .some((clause) => {
+      if (BROWSER_EFFECT_NEGATION.test(clause)) {
+        return false;
+      }
+      return (
+        (BROWSER_UI_EFFECT_INTENT.test(clause) &&
+          BROWSER_UI_EFFECT_CONTEXT.test(clause)) ||
+        (BROWSER_NETWORK_EFFECT_INTENT.test(clause) &&
+          BROWSER_NETWORK_EFFECT_CONTEXT.test(clause))
+      );
+    });
 }
 
 export function recordAgentResultEvidence(

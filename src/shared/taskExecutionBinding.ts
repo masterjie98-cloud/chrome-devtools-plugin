@@ -45,3 +45,13 @@ export function getTaskExecutionBindingMismatch(
   }
   return null;
 }
+
+export function getTaskTargetSelectionMismatch(
+  taskContext: McpToolCallPayload["taskContext"],
+  requestedTabId: number,
+): "tabId" | null {
+  return taskContext?.target &&
+    taskContext.target.tabId !== requestedTabId
+    ? "tabId"
+    : null;
+}

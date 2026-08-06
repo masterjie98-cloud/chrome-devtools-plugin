@@ -18,6 +18,7 @@ import {
   normalizeExternalMcpServers,
   type ExternalMcpServerConfig,
   type ExternalMcpServerSummary,
+  type ExternalMcpToolSummary,
 } from "../shared/externalMcp";
 import type {
   AdditionalMcpToolBackend,
@@ -37,6 +38,13 @@ interface RuntimeServer {
   status: ExternalMcpServerSummary["status"];
   tools: McpAvailableTool[];
   instructions?: string;
+  resourceCount: number;
+  promptCount: number;
+  capabilities: ExternalMcpServerSummary["capabilities"];
+  lastConnectedAt?: string;
+  lastErrorAt?: string;
+  reconnectCount: number;
+  discoveryErrors?: string[];
   error?: string;
   connectPromise?: Promise<void>;
 }
@@ -196,7 +204,12 @@ export class ExternalMcpRegistry
     const tool = this.runtimes
       .get(route.serverId)
       ?.tools.find((item) => item.name === toolName);
-    if (server.autoApproveTools === true) {
+    const remoteToolName = route.remoteToolName;
+    const perToolPolicy = server.toolApprovalPolicies?.[remoteToolName];
+    if (perToolPolicy === "ask") {
+      return undefined;
+    }
+    if (perToolPolicy === "auto" || server.autoApproveTools === true) {
       return createTrustedExternalAutoRunPolicy(
         toolName,
         tool?.annotations,
@@ -250,6 +263,18 @@ export class ExternalMcpRegistry
           : {}),
         status: server.enabled ? runtime.status : "disabled",
         toolCount: runtime.tools.length,
+        resourceCount: runtime.resourceCount,
+        promptCount: runtime.promptCount,
+        capabilities: runtime.capabilities,
+        tools: summarizeRuntimeTools(server, runtime),
+        reconnectCount: runtime.reconnectCount,
+        ...(runtime.lastConnectedAt
+          ? { lastConnectedAt: runtime.lastConnectedAt }
+          : {}),
+        ...(runtime.lastErrorAt ? { lastErrorAt: runtime.lastErrorAt } : {}),
+        ...(runtime.discoveryErrors?.length
+          ? { discoveryErrors: runtime.discoveryErrors }
+          : {}),
         ...(runtime.error ? { error: runtime.error } : {}),
       };
     });
@@ -359,6 +384,42 @@ export class ExternalMcpRegistry
     return this.listServers();
   }
 
+  async setToolPolicy(
+    serverId: string,
+    toolName: string,
+    patch: { enabled?: boolean; approval?: "inherit" | "ask" | "auto" },
+  ): Promise<ExternalMcpServerSummary[]> {
+    const index = this.servers.findIndex((server) => server.id === serverId);
+    if (index < 0) throw new Error(`MCP server 不存在：${serverId}`);
+    const normalizedToolName = toolName.trim();
+    if (!normalizedToolName || normalizedToolName.length > 200) {
+      throw new Error("MCP toolName 无效。");
+    }
+    const current = this.servers[index]!;
+    const disabled = new Set(current.disabledTools ?? []);
+    if (patch.enabled === true) disabled.delete(normalizedToolName);
+    if (patch.enabled === false) disabled.add(normalizedToolName);
+    const policies = { ...(current.toolApprovalPolicies ?? {}) };
+    if (patch.approval === "inherit") delete policies[normalizedToolName];
+    if (patch.approval === "ask" || patch.approval === "auto") {
+      policies[normalizedToolName] = patch.approval;
+    }
+    const next = [...this.servers];
+    next[index] = normalizeExternalMcpServerConfig({
+      ...current,
+      disabledTools: Array.from(disabled),
+      toolApprovalPolicies: policies,
+    });
+    await this.options.saveServers(next);
+    this.servers = next;
+    if (patch.enabled !== undefined && current.enabled) {
+      await this.disconnect(serverId);
+      this.runtimes.set(serverId, createRuntime(true));
+      await this.ensureConnected(serverId).catch(() => undefined);
+    }
+    return this.listServers();
+  }
+
   async testServer(serverId: string): Promise<ExternalMcpServerSummary[]> {
     const server = this.servers.find((item) => item.id === serverId);
     if (!server) {
@@ -450,6 +511,12 @@ export class ExternalMcpRegistry
       runtime.instructions = normalizeServerInstructions(
         client.getInstructions(),
       );
+      const serverCapabilities = client.getServerCapabilities();
+      runtime.capabilities = {
+        tools: Boolean(serverCapabilities?.tools),
+        resources: Boolean(serverCapabilities?.resources),
+        prompts: Boolean(serverCapabilities?.prompts),
+      };
       const listed = await withDeadline(
         client.listTools(),
         connectTimeoutMs,
@@ -458,7 +525,6 @@ export class ExternalMcpRegistry
       );
       const disabledTools = new Set(server.disabledTools ?? []);
       const mappedTools = listed.tools
-        .filter((tool) => !disabledTools.has(tool.name))
         .slice(0, 200)
         .map((tool) => {
           const publicName = createExternalMcpToolName(server.id, tool.name);
@@ -497,17 +563,54 @@ export class ExternalMcpRegistry
       // "tool is unavailable" window.
       this.removeToolRoutes(server.id);
       for (const item of mappedTools) {
+        if (disabledTools.has(item.route.remoteToolName)) {
+          continue;
+        }
         this.toolRoutes.set(item.route.publicName, {
           serverId: server.id,
           remoteToolName: item.route.remoteToolName,
         });
       }
       runtime.tools = mappedTools.map((item) => item.tool);
+      const discoveryErrors: string[] = [];
+      runtime.resourceCount = 0;
+      runtime.promptCount = 0;
+      if (runtime.capabilities.resources) {
+        try {
+          runtime.resourceCount = (
+            await withDeadline(
+              client.listResources(),
+              connectTimeoutMs,
+              undefined,
+              `MCP server 资源列表超时：${server.name}`,
+            )
+          ).resources.length;
+        } catch (error) {
+          discoveryErrors.push(`resources/list: ${errorMessage(error)}`);
+        }
+      }
+      if (runtime.capabilities.prompts) {
+        try {
+          runtime.promptCount = (
+            await withDeadline(
+              client.listPrompts(),
+              connectTimeoutMs,
+              undefined,
+              `MCP server提示词列表超时：${server.name}`,
+            )
+          ).prompts.length;
+        } catch (error) {
+          discoveryErrors.push(`prompts/list: ${errorMessage(error)}`);
+        }
+      }
+      runtime.discoveryErrors = discoveryErrors;
       runtime.status = "connected";
+      runtime.lastConnectedAt = new Date().toISOString();
       runtime.error = undefined;
     } catch (error) {
       runtime.status = "error";
       runtime.error = errorMessage(error);
+      runtime.lastErrorAt = new Date().toISOString();
       await client.close().catch(() => undefined);
       runtime.client = undefined;
       runtime.transport = undefined;
@@ -553,6 +656,7 @@ export class ExternalMcpRegistry
       console.warn(
         `[external-mcp] transient failure in ${toolName}; reconnecting before retry: ${errorMessage(error)}`,
       );
+      currentRuntime.reconnectCount += 1;
       await this.disconnect(serverId, { preserveRoutes: true });
       await this.ensureConnected(serverId);
     })();
@@ -631,7 +735,31 @@ function createRuntime(enabled: boolean): RuntimeServer {
   return {
     status: enabled ? "idle" : "disabled",
     tools: [],
+    resourceCount: 0,
+    promptCount: 0,
+    capabilities: { tools: false, resources: false, prompts: false },
+    reconnectCount: 0,
   };
+}
+
+function summarizeRuntimeTools(
+  server: ExternalMcpServerConfig,
+  runtime: RuntimeServer,
+): ExternalMcpToolSummary[] {
+  const disabled = new Set(server.disabledTools ?? []);
+  return runtime.tools.map((tool) => {
+    const remoteName = tool.externalMcpToolName ?? tool.name;
+    const approval = server.toolApprovalPolicies?.[remoteName] ?? "inherit";
+    return {
+      name: remoteName,
+      title: tool.title ?? remoteName,
+      ...(tool.description ? { description: tool.description } : {}),
+      enabled: !disabled.has(remoteName),
+      approval,
+      readOnly: tool.annotations?.readOnlyHint === true,
+      destructive: tool.annotations?.destructiveHint === true,
+    };
+  });
 }
 
 function createTransport(

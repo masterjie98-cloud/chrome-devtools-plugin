@@ -183,7 +183,7 @@ async function copyReleaseSupportFiles(stagingRoot) {
     join(projectRoot, "scripts", "install-local-macos.mjs"),
     join(runtimeRoot, "install-local-macos.mjs"),
   );
-  await cp(
+  await writeWindowsBatch(
     join(projectRoot, "packaging", "setup.cmd"),
     join(stagingRoot, "安装 AI DevTools Assistant.cmd"),
   );
@@ -191,9 +191,22 @@ async function copyReleaseSupportFiles(stagingRoot) {
     join(projectRoot, "packaging", "setup.command"),
     join(stagingRoot, "安装 AI DevTools Assistant.command"),
   );
+  await cp(
+    join(projectRoot, "packaging", "让 AI 自动接入 MCP.md"),
+    join(stagingRoot, "让 AI 自动接入 MCP.md"),
+  );
   await writeShareGuide(join(stagingRoot, "安装说明.md"));
   await writeExtensionUpdateNotice(join(stagingRoot, "extension"));
   await chmod(join(stagingRoot, "安装 AI DevTools Assistant.command"), 0o755);
+}
+
+async function writeWindowsBatch(sourcePath, destinationPath) {
+  const source = (await readFile(sourcePath, "utf8")).replace(/^\uFEFF/, "");
+  if (/[^\x00-\x7f]/.test(source)) {
+    throw new Error(`Windows batch installer must be ASCII-only: ${sourcePath}`);
+  }
+  const windowsText = source.replace(/\r?\n/g, "\r\n");
+  await writeFile(destinationPath, windowsText, "ascii");
 }
 
 async function writeExtensionUpdateNotice(extensionRoot) {
@@ -258,15 +271,41 @@ GitHub Release 下载版本匹配的 zip 和 SHA-256，完成校验、覆盖并�
 如果本机尚未安装 daemon，仍需先手动下载并运行最新 zip。包含自动更新能力之前的
 旧版 zip 也需要人工覆盖安装一次；之后即可使用 daemon 自动更新。
 
+## 让宿主 AI 自动接入 MCP
+
+如果使用的不是 Cursor 或 Codex，或者不想手工复制配置，请把
+\`让 AI 自动接入 MCP.md\` 交给宿主应用里的 AI。具备终端和配置文件权限的 AI
+会读取本机生成的 stdio 配置、合并到当前宿主并验证连接；宿主必须重启时，它会明确提示。
+
 ## MCP（Cursor / Codex）
 
-安装完成后，在安装目录的 runtime 下可运行：
+### Windows
 
-\`\`\`bash
-runtime/node/<当前平台>/node runtime/print-client-config.mjs --server-path runtime/mcp/server.js
+安装脚本检测到 \`codex\` 命令后，会直接询问是否注册 AI DevTools MCP。选择
+\`Y\` 即可，不需要手写路径。
+
+如果安装 Codex CLI 晚于本插件，请在 Windows CMD 中运行下面的命令来打印
+Codex 命令和 Cursor / Claude Desktop JSON 配置：
+
+\`\`\`cmd
+cd /d "%LOCALAPPDATA%\\AI DevTools Assistant"
+runtime\\node\\win32-x64\\node.exe runtime\\print-client-config.mjs --server-path runtime\\mcp\\server.js
 \`\`\`
 
-按输出配置客户端。不要把 Bridge Token 写进 MCP 配置。
+这条命令由用户在 CMD 中运行，不是发给 Codex 对话框。它只输出客户端配置，
+不会启动第二个 daemon。复制输出里的 \`codex.command\` 到 CMD 即可注册 Codex；
+Cursor 使用输出里的 \`cursor.mcpServers\`。
+
+### macOS
+
+在“终端”中运行：
+
+\`\`\`bash
+cd "$HOME/Library/Application Support/AI DevTools Assistant"
+runtime/node/\$(uname -m | sed 's/arm64/darwin-arm64/;s/x86_64/darwin-x64/')/node runtime/print-client-config.mjs --server-path runtime/mcp/server.js
+\`\`\`
+
+不要把 Bridge Token 写进 MCP 配置。
 `;
   await writeFile(destinationPath, guide, "utf8");
 }
@@ -353,6 +392,7 @@ async function validateRelease(stagingRoot, runtimeBuild) {
     "runtime/node/win32-x64/node.exe",
     "安装 AI DevTools Assistant.cmd",
     "安装 AI DevTools Assistant.command",
+    "让 AI 自动接入 MCP.md",
     "安装说明.md",
     "release-manifest.json",
     "package.json",

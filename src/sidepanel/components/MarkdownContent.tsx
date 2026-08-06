@@ -49,7 +49,7 @@ export function repairFlattenedAssistantMarkdown(content: string): string {
 
 function repairFlattenedProseBlocks(content: string): string {
   let repaired = content.replace(
-    /([^\n])[\t ]+(#{2,6})[\t ]+(?=\S)/g,
+    /([^\n])[\t ]+(#{1,6})[\t ]+(?=\S)/g,
     "$1\n\n$2 ",
   );
   repaired = repaired.replace(

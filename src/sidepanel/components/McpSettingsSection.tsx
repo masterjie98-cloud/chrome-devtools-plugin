@@ -5,6 +5,7 @@ import Empty from "antd/es/empty";
 import Input from "antd/es/input";
 import Popconfirm from "antd/es/popconfirm";
 import Space from "antd/es/space";
+import Select from "antd/es/select";
 import Switch from "antd/es/switch";
 import Tag from "antd/es/tag";
 import Typography from "antd/es/typography";
@@ -199,6 +200,12 @@ export function McpSettingsSection({
                   <Tag color="gold">配置请求启用 · 请手动确认</Tag>
                 ) : null}
                 {server.toolCount > 0 ? <Tag>{server.toolCount} 个工具</Tag> : null}
+                {server.resourceCount > 0 ? (
+                  <Tag>{server.resourceCount} 个资源</Tag>
+                ) : null}
+                {server.promptCount > 0 ? (
+                  <Tag>{server.promptCount} 个提示词</Tag>
+                ) : null}
                 {server.trustReadOnlyTools ? (
                   <Tag color="blue">已信任只读声明</Tag>
                 ) : null}
@@ -327,6 +334,73 @@ export function McpSettingsSection({
                   </Button>
                 </Popconfirm>
               </Space>
+              {server.tools.length ? (
+                <div className="settings-mcp-tools" aria-label={`${server.name} 工具策略`}>
+                  {server.tools.map((tool) => (
+                    <div className="settings-mcp-tool-row" key={tool.name}>
+                      <div className="settings-mcp-tool-copy">
+                        <Typography.Text ellipsis={{ tooltip: tool.description }}>
+                          {tool.title}
+                        </Typography.Text>
+                        <Typography.Text type="secondary" code>
+                          {tool.name}
+                        </Typography.Text>
+                      </div>
+                      <Switch
+                        size="small"
+                        checked={tool.enabled}
+                        disabled={actionId === server.id}
+                        onChange={(enabled) =>
+                          void runServerAction(
+                            server.id,
+                            () =>
+                              mcpBridge.setExternalMcpToolPolicy(
+                                server.id,
+                                tool.name,
+                                { enabled },
+                              ),
+                            enabled ? "工具已启用。" : "工具已停用。",
+                          )
+                        }
+                      />
+                      <Select
+                        size="small"
+                        value={tool.approval}
+                        disabled={!tool.enabled || actionId === server.id}
+                        aria-label={`${tool.title} 审批策略`}
+                        options={[
+                          { value: "inherit", label: "继承 Server" },
+                          { value: "ask", label: "每次询问" },
+                          { value: "auto", label: "自动运行" },
+                        ]}
+                        onChange={(approval) =>
+                          void runServerAction(
+                            server.id,
+                            () =>
+                              mcpBridge.setExternalMcpToolPolicy(
+                                server.id,
+                                tool.name,
+                                { approval },
+                              ),
+                            "工具审批策略已更新。",
+                          )
+                        }
+                      />
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {server.discoveryErrors?.length ? (
+                <Typography.Paragraph type="warning" className="settings-mcp-card__error">
+                  能力发现部分失败：{server.discoveryErrors.join("；")}
+                </Typography.Paragraph>
+              ) : null}
+              {server.lastConnectedAt ? (
+                <Typography.Text type="secondary" className="settings-mcp-runtime-meta">
+                  最近连接 {formatRuntimeTime(server.lastConnectedAt)}
+                  {server.reconnectCount ? ` · 自动重连 ${server.reconnectCount} 次` : ""}
+                </Typography.Text>
+              ) : null}
             </div>
           ))}
         </div>
@@ -381,4 +455,9 @@ function createServerId(name: string): string {
     .slice(0, 24) || "server";
   const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
   return `mcp_${slug}_${suffix}`;
+}
+
+function formatRuntimeTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }

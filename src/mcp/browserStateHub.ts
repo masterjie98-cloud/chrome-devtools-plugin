@@ -16,8 +16,13 @@ import {
   type CollaborationWorkspaceSnapshot,
 } from "../shared/collaborationWorkspace";
 import {
+  AGENT_RUN_PHASES,
+  AGENT_RUN_SCHEMA_VERSION,
   sanitizeAgentToolCallForPersistence,
   sanitizeAgentToolResultForPersistence,
+  type AgentRunDiagnosticsSnapshot,
+  type AgentRuntimeEnvironmentSnapshot,
+  type AgentTurnSnapshot,
   type AgentSessionSnapshot,
   type AgentSessionStatus,
   type AgentSessionToolCallSnapshot,
@@ -1269,6 +1274,21 @@ function isPersistedAgentSession(
       ["sidepanel", "extension_background", "daemon"].includes(
         String(value.executionOwner),
       )) &&
+    (value.schemaVersion === undefined ||
+      value.schemaVersion === AGENT_RUN_SCHEMA_VERSION) &&
+    (value.phase === undefined ||
+      AGENT_RUN_PHASES.includes(value.phase as (typeof AGENT_RUN_PHASES)[number])) &&
+    (value.heartbeatAt === undefined ||
+      (typeof value.heartbeatAt === "string" &&
+        Number.isFinite(Date.parse(value.heartbeatAt)))) &&
+    (value.diagnostics === undefined ||
+      isPersistedAgentDiagnostics(value.diagnostics)) &&
+    (value.runtimeEnvironment === undefined ||
+      isPersistedRuntimeEnvironment(value.runtimeEnvironment)) &&
+    (value.turns === undefined ||
+      (Array.isArray(value.turns) &&
+        value.turns.length <= 40 &&
+        value.turns.every(isPersistedAgentTurn))) &&
     isRecord(value.taskState) &&
     Array.isArray(value.events) &&
     value.events.length <= 80 &&
@@ -1303,6 +1323,10 @@ function isPersistedAgentSessionEvent(value: unknown): boolean {
     ![
       "started",
       "context",
+      "phase",
+      "heartbeat",
+      "diagnostic",
+      "compaction",
       "tool_calls",
       "tool_results",
       "completed",
@@ -1323,6 +1347,21 @@ function isPersistedAgentSessionEvent(value: unknown): boolean {
     return false;
   }
   return (
+    (value.data.turnId === undefined || typeof value.data.turnId === "string") &&
+    (value.data.phase === undefined ||
+      AGENT_RUN_PHASES.includes(value.data.phase as (typeof AGENT_RUN_PHASES)[number])) &&
+    (value.data.status === undefined || typeof value.data.status === "string") &&
+    (value.data.providerStreamBytes === undefined ||
+      (Number.isSafeInteger(value.data.providerStreamBytes) &&
+        (value.data.providerStreamBytes as number) >= 0)) &&
+    (value.data.errorCode === undefined || typeof value.data.errorCode === "string") &&
+    (value.data.beforeTokens === undefined ||
+      (Number.isSafeInteger(value.data.beforeTokens) &&
+        (value.data.beforeTokens as number) >= 0)) &&
+    (value.data.afterTokens === undefined ||
+      (Number.isSafeInteger(value.data.afterTokens) &&
+        (value.data.afterTokens as number) >= 0)) &&
+    (value.data.reason === undefined || typeof value.data.reason === "string") &&
     (value.data.contextReadError === undefined ||
       typeof value.data.contextReadError === "string") &&
     (value.data.toolCalls === undefined ||
@@ -1343,6 +1382,65 @@ function isPersistedAgentSessionEvent(value: unknown): boolean {
             typeof toolResult.name === "string" &&
             typeof toolResult.content === "string",
         )))
+  );
+}
+
+function isPersistedAgentDiagnostics(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    AGENT_RUN_PHASES.includes(value.phase as (typeof AGENT_RUN_PHASES)[number]) &&
+    ["phaseStartedAt", "lastHeartbeatAt", "lastProgressAt"].every(
+      (key) => typeof value[key] === "string" && Number.isFinite(Date.parse(value[key] as string)),
+    ) &&
+    ["modelRequestCount", "toolCallCount", "completedToolCallCount"].every(
+      (key) => Number.isSafeInteger(value[key]) && (value[key] as number) >= 0,
+    )
+  );
+}
+
+function isPersistedAgentTurn(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    Number.isSafeInteger(value.index) &&
+    (value.index as number) >= 1 &&
+    AGENT_RUN_PHASES.includes(value.phase as (typeof AGENT_RUN_PHASES)[number]) &&
+    ["running", "completed", "failed", "cancelled"].includes(String(value.status)) &&
+    typeof value.startedAt === "string" &&
+    Number.isFinite(Date.parse(value.startedAt)) &&
+    typeof value.updatedAt === "string" &&
+    Number.isFinite(Date.parse(value.updatedAt)) &&
+    Array.isArray(value.toolCalls) &&
+    value.toolCalls.length <= 16 &&
+    value.toolCalls.every(
+      (toolCall) =>
+        isRecord(toolCall) &&
+        typeof toolCall.id === "string" &&
+        typeof toolCall.name === "string" &&
+        isRecord(toolCall.arguments) &&
+        ["requested", "running", "returned", "failed", "cancelled"].includes(
+          String(toolCall.status),
+        ),
+    )
+  );
+}
+
+function isPersistedRuntimeEnvironment(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.capturedAt === "string" &&
+    Number.isFinite(Date.parse(value.capturedAt)) &&
+    typeof value.runtimeBuildId === "string" &&
+    typeof value.model === "string" &&
+    typeof value.providerOrigin === "string" &&
+    Number.isSafeInteger(value.contextWindowTokens) &&
+    Number.isSafeInteger(value.maxOutputTokens) &&
+    ["browser", "mixed", "external_only"].includes(String(value.toolScope)) &&
+    Array.isArray(value.enabledToolNames) &&
+    value.enabledToolNames.every((item) => typeof item === "string") &&
+    Array.isArray(value.externalMcpServerIds) &&
+    value.externalMcpServerIds.every((item) => typeof item === "string") &&
+    ["approval_required", "tools_disabled"].includes(String(value.permissionMode))
   );
 }
 
@@ -1538,6 +1636,7 @@ function sanitizeAgentSession(
 ): AgentSessionSnapshot {
   return {
     ...session,
+    schemaVersion: AGENT_RUN_SCHEMA_VERSION,
     id: sanitizeText(session.id, 200),
     assistantMessageId: session.assistantMessageId
       ? sanitizeText(session.assistantMessageId, 200)
@@ -1571,13 +1670,55 @@ function sanitizeAgentSession(
           },
         }
       : undefined,
+    phase:
+      session.phase && AGENT_RUN_PHASES.includes(session.phase)
+        ? session.phase
+        : session.status === "running"
+          ? "starting"
+          : session.status,
+    heartbeatAt: sanitizeAgentTimestamp(
+      session.heartbeatAt,
+      session.updatedAt,
+    ),
+    diagnostics: session.diagnostics
+      ? sanitizeAgentDiagnostics(session.diagnostics, session.updatedAt)
+      : undefined,
+    runtimeEnvironment: session.runtimeEnvironment
+      ? sanitizeRuntimeEnvironment(session.runtimeEnvironment)
+      : undefined,
+    turns: session.turns?.slice(-40).map(sanitizeAgentTurn),
     taskState: sanitizeAgentTaskState(session.taskState),
     events: session.events.slice(-80).map((event) => ({
       ...event,
       id: sanitizeText(event.id, 200),
+      sequence:
+        Number.isSafeInteger(event.sequence) && (event.sequence ?? 0) >= 0
+          ? event.sequence
+          : undefined,
       summary: sanitizeText(event.summary, 1200),
       data: event.data
         ? {
+            turnId: event.data.turnId
+              ? sanitizeText(event.data.turnId, 200)
+              : undefined,
+            phase:
+              event.data.phase && AGENT_RUN_PHASES.includes(event.data.phase)
+                ? event.data.phase
+                : undefined,
+            status: event.data.status
+              ? sanitizeText(event.data.status, 800)
+              : undefined,
+            providerStreamBytes: sanitizeNonNegativeInteger(
+              event.data.providerStreamBytes,
+            ),
+            errorCode: event.data.errorCode
+              ? sanitizeText(event.data.errorCode, 120)
+              : undefined,
+            beforeTokens: sanitizeNonNegativeInteger(event.data.beforeTokens),
+            afterTokens: sanitizeNonNegativeInteger(event.data.afterTokens),
+            reason: event.data.reason
+              ? sanitizeText(event.data.reason, 800)
+              : undefined,
             contextReadError: event.data.contextReadError
               ? sanitizeText(event.data.contextReadError, 800)
               : undefined,
@@ -1587,6 +1728,129 @@ function sanitizeAgentSession(
         : undefined,
     })),
   };
+}
+
+function sanitizeAgentDiagnostics(
+  diagnostics: AgentRunDiagnosticsSnapshot,
+  fallbackTimestamp: string,
+): AgentRunDiagnosticsSnapshot {
+  return {
+    phase: AGENT_RUN_PHASES.includes(diagnostics.phase)
+      ? diagnostics.phase
+      : "starting",
+    phaseStartedAt: sanitizeAgentTimestamp(
+      diagnostics.phaseStartedAt,
+      fallbackTimestamp,
+    ),
+    lastHeartbeatAt: sanitizeAgentTimestamp(
+      diagnostics.lastHeartbeatAt,
+      fallbackTimestamp,
+    ),
+    lastProgressAt: sanitizeAgentTimestamp(
+      diagnostics.lastProgressAt,
+      fallbackTimestamp,
+    ),
+    lastStatus: diagnostics.lastStatus
+      ? sanitizeText(diagnostics.lastStatus, 800)
+      : undefined,
+    modelRequestCount: sanitizeNonNegativeInteger(diagnostics.modelRequestCount) ?? 0,
+    toolCallCount: sanitizeNonNegativeInteger(diagnostics.toolCallCount) ?? 0,
+    completedToolCallCount:
+      sanitizeNonNegativeInteger(diagnostics.completedToolCallCount) ?? 0,
+    providerStreamBytes: sanitizeNonNegativeInteger(
+      diagnostics.providerStreamBytes,
+    ),
+    stalledSince: diagnostics.stalledSince
+      ? sanitizeAgentTimestamp(diagnostics.stalledSince, fallbackTimestamp)
+      : undefined,
+    lastErrorCode: diagnostics.lastErrorCode
+      ? sanitizeText(diagnostics.lastErrorCode, 120)
+      : undefined,
+    lastErrorSummary: diagnostics.lastErrorSummary
+      ? sanitizeText(diagnostics.lastErrorSummary, 1200)
+      : undefined,
+  };
+}
+
+function sanitizeRuntimeEnvironment(
+  environment: AgentRuntimeEnvironmentSnapshot,
+): AgentRuntimeEnvironmentSnapshot {
+  return {
+    capturedAt: sanitizeAgentTimestamp(
+      environment.capturedAt,
+      new Date(0).toISOString(),
+    ),
+    runtimeBuildId: sanitizeText(environment.runtimeBuildId, 160),
+    model: sanitizeText(environment.model, 300),
+    providerOrigin: sanitizeUrl(environment.providerOrigin),
+    contextWindowTokens:
+      sanitizeNonNegativeInteger(environment.contextWindowTokens) ?? 0,
+    maxOutputTokens:
+      sanitizeNonNegativeInteger(environment.maxOutputTokens) ?? 0,
+    toolScope: ["browser", "mixed", "external_only"].includes(
+      environment.toolScope,
+    )
+      ? environment.toolScope
+      : "mixed",
+    enabledToolNames: environment.enabledToolNames
+      .slice(0, 200)
+      .map((name) => sanitizeText(name, 200)),
+    externalMcpServerIds: environment.externalMcpServerIds
+      .slice(0, 40)
+      .map((id) => sanitizeText(id, 80)),
+    targetTabId: sanitizeNonNegativeInteger(environment.targetTabId),
+    targetId: environment.targetId
+      ? sanitizeText(environment.targetId, 200)
+      : undefined,
+    permissionMode:
+      environment.permissionMode === "tools_disabled"
+        ? "tools_disabled"
+        : "approval_required",
+  };
+}
+
+function sanitizeAgentTurn(turn: AgentTurnSnapshot): AgentTurnSnapshot {
+  return {
+    id: sanitizeText(turn.id, 200),
+    index: Math.max(1, Math.floor(turn.index)),
+    phase: AGENT_RUN_PHASES.includes(turn.phase) ? turn.phase : "starting",
+    status: ["running", "completed", "failed", "cancelled"].includes(turn.status)
+      ? turn.status
+      : "failed",
+    startedAt: sanitizeAgentTimestamp(turn.startedAt, new Date(0).toISOString()),
+    updatedAt: sanitizeAgentTimestamp(turn.updatedAt, turn.startedAt),
+    completedAt: turn.completedAt
+      ? sanitizeAgentTimestamp(turn.completedAt, turn.updatedAt)
+      : undefined,
+    toolCalls: turn.toolCalls.slice(0, 16).map((toolCall) => ({
+      ...sanitizeAgentToolCallForPersistence(toolCall),
+      status: ["requested", "running", "returned", "failed", "cancelled"].includes(
+        toolCall.status,
+      )
+        ? toolCall.status
+        : "failed",
+      requestedAt: sanitizeAgentTimestamp(toolCall.requestedAt, turn.startedAt),
+      updatedAt: sanitizeAgentTimestamp(toolCall.updatedAt, turn.updatedAt),
+      completedAt: toolCall.completedAt
+        ? sanitizeAgentTimestamp(toolCall.completedAt, turn.updatedAt)
+        : undefined,
+      resultCharCount: sanitizeNonNegativeInteger(toolCall.resultCharCount),
+      errorCode: toolCall.errorCode
+        ? sanitizeText(toolCall.errorCode, 120)
+        : undefined,
+    })),
+  };
+}
+
+function sanitizeAgentTimestamp(
+  value: string | undefined,
+  fallback: string,
+): string {
+  return value && Number.isFinite(Date.parse(value)) ? value : fallback;
+}
+
+function sanitizeNonNegativeInteger(value: number | undefined): number | undefined {
+  return Number.isSafeInteger(value) && (value ?? -1) >= 0 ? value : undefined;
 }
 
 function sanitizeAgentToolCalls(
@@ -1612,6 +1876,8 @@ function recoverPersistedAgentSession(
   return sanitizeAgentSession({
     ...sanitized,
     status: "blocked",
+    phase: "blocked",
+    heartbeatAt: recoveredAt,
     updatedAt: recoveredAt,
     completedAt: recoveredAt,
     finalContent: recoveryMessage,
@@ -1623,6 +1889,17 @@ function recoverPersistedAgentSession(
       blockers: [...sanitized.taskState.blockers, recoveryMessage].slice(-20),
       updatedAt: recoveredAt,
     },
+    diagnostics: sanitized.diagnostics
+      ? {
+          ...sanitized.diagnostics,
+          phase: "blocked",
+          phaseStartedAt: recoveredAt,
+          lastHeartbeatAt: recoveredAt,
+          stalledSince: undefined,
+          lastErrorCode: "DAEMON_RESTART_RECOVERY",
+          lastErrorSummary: recoveryMessage,
+        }
+      : undefined,
     events: [
       ...sanitized.events,
       {

@@ -82,6 +82,7 @@ export const WS_COMMANDS = {
   EXTERNAL_MCP_SET_ENABLED: "EXTERNAL_MCP_SET_ENABLED",
   EXTERNAL_MCP_SET_READ_ONLY_TRUST: "EXTERNAL_MCP_SET_READ_ONLY_TRUST",
   EXTERNAL_MCP_SET_AUTO_APPROVE: "EXTERNAL_MCP_SET_AUTO_APPROVE",
+  EXTERNAL_MCP_SET_TOOL_POLICY: "EXTERNAL_MCP_SET_TOOL_POLICY",
   EXTERNAL_MCP_TEST: "EXTERNAL_MCP_TEST",
   EXTERNAL_MCP_RESULT: "EXTERNAL_MCP_RESULT",
   STATE_GET: "STATE_GET",
@@ -599,6 +600,17 @@ export type PluginToMcpMessage =
       command: typeof WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE;
       sentAt: string;
       payload: { serverId: string; enabled: boolean };
+    }
+  | {
+      requestId: string;
+      command: typeof WS_COMMANDS.EXTERNAL_MCP_SET_TOOL_POLICY;
+      sentAt: string;
+      payload: {
+        serverId: string;
+        toolName: string;
+        enabled?: boolean;
+        approval?: "inherit" | "ask" | "auto";
+      };
     }
   | {
       requestId: string;

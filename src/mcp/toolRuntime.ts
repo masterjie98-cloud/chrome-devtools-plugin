@@ -2185,6 +2185,21 @@ function readBrowserStatus(sessionId?: string): Record<string, unknown> {
     },
     activeTab: state.activeTab ?? null,
     currentConversationId: state.currentConversationId,
+    activeAgent: state.activeAgentSession
+      ? {
+          runId: state.activeAgentSession.id,
+          conversationId:
+            state.activeAgentSession.executionBinding?.conversationId ?? "",
+          status: state.activeAgentSession.status,
+          phase: state.activeAgentSession.phase ?? "starting",
+          startedAt: state.activeAgentSession.startedAt,
+          updatedAt: state.activeAgentSession.updatedAt,
+          heartbeatAt:
+            state.activeAgentSession.heartbeatAt ??
+            state.activeAgentSession.updatedAt,
+          diagnostics: state.activeAgentSession.diagnostics ?? null,
+        }
+      : null,
     revision: state.revision,
     lastSeenAt: state.lastSeenAt,
     stateUpdatedAt: state.stateUpdatedAt,

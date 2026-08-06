@@ -66,6 +66,7 @@ import type {
   ExternalMcpServerConfig,
   ExternalMcpServerSummary,
 } from "../shared/externalMcp";
+import { isExternalMcpToolName } from "../shared/externalMcp";
 import {
   RUNTIME_BUILD_ID,
   RUNTIME_SCHEMA_HASH,
@@ -158,6 +159,7 @@ import {
 } from "../shared/taskCapabilityGrant";
 import {
   getTaskExecutionBindingMismatch,
+  getTaskTargetSelectionMismatch,
   resolveTaskBindingConversationId,
 } from "../shared/taskExecutionBinding";
 
@@ -238,6 +240,7 @@ export interface AdditionalMcpToolBackend {
   setServerEnabled?: ExternalMcpManagementBackend["setServerEnabled"];
   setServerReadOnlyTrust?: ExternalMcpManagementBackend["setServerReadOnlyTrust"];
   setServerAutoApprove?: ExternalMcpManagementBackend["setServerAutoApprove"];
+  setToolPolicy?: ExternalMcpManagementBackend["setToolPolicy"];
   testServer?: ExternalMcpManagementBackend["testServer"];
 }
 
@@ -258,6 +261,11 @@ export interface ExternalMcpManagementBackend {
   setServerAutoApprove: (
     serverId: string,
     enabled: boolean,
+  ) => Promise<ExternalMcpServerSummary[]>;
+  setToolPolicy: (
+    serverId: string,
+    toolName: string,
+    patch: { enabled?: boolean; approval?: "inherit" | "ask" | "auto" },
   ) => Promise<ExternalMcpServerSummary[]>;
   testServer: (serverId: string) => Promise<ExternalMcpServerSummary[]>;
 }
@@ -832,18 +840,23 @@ export function startPluginWebSocketServer(
       toolName,
       args,
     );
+    const externalMcpOrigin = additionalMcpBackend?.getToolOrigin?.(toolName);
+    const requiresBrowserTarget =
+      !externalMcpOrigin && !isExternalMcpToolName(toolName);
     const requesterSessionId =
       clientSessionIds.get(requester) ?? browserStateHub.getActiveSession().sessionId;
-    // A restarted daemon can restore an old target before the browser worker
-    // publishes its live tab. Give the already-triggered reconnect update a
-    // short chance to land before approval is bound to stale persisted state.
-    await browserStateHub.waitForCurrentTabAfterBrowserConnect(
-      requesterSessionId,
-      {
-        timeoutMs: 350,
-        signal: authorizationOptions.signal,
-      },
-    );
+    if (requiresBrowserTarget) {
+      // A restarted daemon can restore an old target before the browser worker
+      // publishes its live tab. Give the already-triggered reconnect update a
+      // short chance to land before approval is bound to stale persisted state.
+      await browserStateHub.waitForCurrentTabAfterBrowserConnect(
+        requesterSessionId,
+        {
+          timeoutMs: 350,
+          signal: authorizationOptions.signal,
+        },
+      );
+    }
     const requestedSnapshot = browserStateHub.snapshot(requesterSessionId);
     const requestedRevision = requestedSnapshot.revision;
     const requesterConnectionId =
@@ -855,22 +868,44 @@ export function startPluginWebSocketServer(
       taskId: requestedSnapshot.currentConversationId,
       egressDestinations: defaultTaskEgressDestinations(role, clientName),
     };
-    const requestedTarget = taskContext.target
-      ? browserStateHub.targetSnapshot(
-          requesterSessionId,
-          taskContext.target.tabId,
-        ) ??
-        (requestedSnapshot.currentTab?.tabId === taskContext.target.tabId
-          ? requestedSnapshot.currentTab
-          : undefined)
-      : requestedSnapshot.currentTab;
+    const targetSelectionMismatch =
+      normalizeMcpToolName(toolName) ===
+        MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB &&
+      typeof args.tabId === "number"
+        ? getTaskTargetSelectionMismatch(taskContext, args.tabId)
+        : null;
+    if (targetSelectionMismatch) {
+      throw new ExecutionBrokerError(
+        "STALE_CONTEXT",
+        `Tool task binding cannot select a different browser tab (field=${targetSelectionMismatch}). Ask the user to rebind the conversation or create a new conversation first.`,
+      );
+    }
+    const requestedTarget = requiresBrowserTarget
+      ? taskContext.target
+        ? browserStateHub.targetSnapshot(
+            requesterSessionId,
+            taskContext.target.tabId,
+          ) ??
+          (requestedSnapshot.currentTab?.tabId === taskContext.target.tabId
+            ? requestedSnapshot.currentTab
+            : undefined)
+        : requestedSnapshot.currentTab
+      : undefined;
     const taskBindingConversationId = resolveTaskBindingConversationId(
       role,
       clientConversationIds.get(requester),
       requestedSnapshot.currentConversationId,
     );
     const taskBindingMismatch = getTaskExecutionBindingMismatch(
-      taskContext,
+      requiresBrowserTarget
+        ? taskContext
+        : {
+            taskId: taskContext.taskId,
+            ...(taskContext.conversationId
+              ? { conversationId: taskContext.conversationId }
+              : {}),
+            egressDestinations: taskContext.egressDestinations,
+          },
       taskBindingConversationId,
       requestedTarget,
     );
@@ -908,7 +943,7 @@ export function startPluginWebSocketServer(
         timing: { transportMs: 0 },
       };
     }
-    if (!requestedTarget) {
+    if (requiresBrowserTarget && !requestedTarget) {
       throw new ExecutionBrokerError(
         "STALE_CONTEXT",
         `Tool approval required for ${toolName}, but no browser target is selected.`,
@@ -938,7 +973,6 @@ export function startPluginWebSocketServer(
       );
     }
     const requestedAt = nowDate();
-    const externalMcpOrigin = additionalMcpBackend?.getToolOrigin?.(toolName);
     const message: McpToPluginMessage = {
       requestId: approvalId,
       command: WS_COMMANDS.APPROVAL_REQUEST,
@@ -965,7 +999,7 @@ export function startPluginWebSocketServer(
             ? { conversationId: taskContext.conversationId }
             : {}),
         },
-        target: requestedTarget,
+        ...(requestedTarget ? { target: requestedTarget } : {}),
         preview: buildApprovalPreview(toolName, args, policy),
         ...(externalMcpOrigin
           ? {
@@ -1044,26 +1078,30 @@ export function startPluginWebSocketServer(
     }
 
     throwIfExecutionAborted(authorizationOptions.signal);
-    const approvedTarget = requestedTarget.tabId !== undefined
-      ? browserStateHub.targetSnapshot(
-          requesterSessionId,
-          requestedTarget.tabId,
-        ) ?? requestedTarget
-      : browserStateHub.snapshot(requesterSessionId).currentTab;
-    const targetMismatchFields = authorizationTargetMismatchFields(
-      requestedTarget,
-      approvedTarget,
-    );
-    if (targetMismatchFields.length > 0) {
-      throw new ExecutionBrokerError(
-        "STALE_CONTEXT",
-        `browser target changed while approval was pending (fields=${targetMismatchFields.join(",")}).`,
+    let approvedTarget = requestedTarget;
+    if (requiresBrowserTarget && requestedTarget) {
+      approvedTarget = requestedTarget.tabId !== undefined
+        ? browserStateHub.targetSnapshot(
+            requesterSessionId,
+            requestedTarget.tabId,
+          ) ?? requestedTarget
+        : browserStateHub.snapshot(requesterSessionId).currentTab;
+      const targetMismatchFields = authorizationTargetMismatchFields(
+        requestedTarget,
+        approvedTarget,
       );
+      if (targetMismatchFields.length > 0) {
+        throw new ExecutionBrokerError(
+          "STALE_CONTEXT",
+          `browser target changed while approval was pending (fields=${targetMismatchFields.join(",")}).`,
+        );
+      }
     }
 
     if (
       approvalResponse.rememberForTask &&
-      isTaskGrantEligiblePolicy(policy)
+      isTaskGrantEligiblePolicy(policy) &&
+      requestedTarget
     ) {
       const origin = normalizeHttpOrigin(requestedTarget.url);
       const remembered = approvalResponse.rememberForTask;
@@ -2406,6 +2444,7 @@ async function handleUiMessage(
     case WS_COMMANDS.EXTERNAL_MCP_SET_ENABLED:
     case WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST:
     case WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE:
+    case WS_COMMANDS.EXTERNAL_MCP_SET_TOOL_POLICY:
     case WS_COMMANDS.EXTERNAL_MCP_TEST:
       await handleExternalMcpManagement(
         socket,
@@ -3171,6 +3210,23 @@ async function handleExternalMcpManagement(
         servers = await backend.setServerAutoApprove(
           message.payload.serverId,
           message.payload.enabled,
+        );
+        break;
+      case WS_COMMANDS.EXTERNAL_MCP_SET_TOOL_POLICY:
+        if (!backend.setToolPolicy) {
+          throw new Error("MCP 工具策略设置不可用。");
+        }
+        servers = await backend.setToolPolicy(
+          message.payload.serverId,
+          message.payload.toolName,
+          {
+            ...(message.payload.enabled !== undefined
+              ? { enabled: message.payload.enabled }
+              : {}),
+            ...(message.payload.approval
+              ? { approval: message.payload.approval }
+              : {}),
+          },
         );
         break;
       case WS_COMMANDS.EXTERNAL_MCP_TEST:

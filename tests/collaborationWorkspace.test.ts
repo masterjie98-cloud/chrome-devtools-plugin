@@ -99,6 +99,41 @@ test("collaboration workspace publishes only the selected bounded context", () =
   assert.match(JSON.stringify(first.item), /redacted/i);
 });
 
+test("collaboration task result content preserves Markdown block boundaries", () => {
+  const markdown = [
+    "## Pod 复测报告",
+    "",
+    "| 项目 | 状态 |",
+    "| --- | --- |",
+    "| user-container | CrashLoopBackOff |",
+    "",
+    "- 重启次数：1676",
+  ].join("\n");
+  const result = upsertCollaborationItem(
+    createEmptyCollaborationWorkspace(),
+    {
+      id: "ctx_markdown_result",
+      kind: "task.result",
+      title: "Result: Pod analysis",
+      summary: "Pod report generated.",
+      content: {
+        version: "delegated-task-v1",
+        type: "result",
+        taskId: "task_markdown_result",
+        status: "failed",
+        summary: markdown,
+        resultFingerprint: "fingerprint-markdown-result",
+      },
+      tags: ["delegated-task", "result", "failed"],
+    },
+    { actor: "extension_agent" },
+    NOW,
+  );
+
+  const content = result.item.content as Record<string, unknown>;
+  assert.equal(content.summary, markdown);
+});
+
 test("MCP workspace omits private items and sensitive item content", () => {
   const shared = upsertCollaborationItem(
     createEmptyCollaborationWorkspace(),

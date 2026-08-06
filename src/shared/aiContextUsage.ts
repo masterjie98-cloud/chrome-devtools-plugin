@@ -12,6 +12,21 @@ export type AiContextUsageCategory =
 
 export type AiContextUsageBreakdown = Record<AiContextUsageCategory, number>;
 
+export interface AiContextCompactionStep {
+  kind: "omit_messages" | "truncate_message";
+  reason: string;
+  beforeTokens: number;
+  afterTokens: number;
+  affectedMessages: number;
+}
+
+export interface AiProviderTokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedPromptTokens?: number;
+}
+
 export interface AiContextBudgetReport {
   contextWindowTokens: number;
   outputReserveTokens: number;
@@ -20,12 +35,15 @@ export interface AiContextBudgetReport {
   estimatedInputTokens: number;
   omittedMessageCount: number;
   compactedMessageCount: number;
+  compactionSteps: AiContextCompactionStep[];
   breakdown: AiContextUsageBreakdown;
 }
 
 export interface AiContextUsageSnapshot extends AiContextBudgetReport {
   model: string;
   measuredAt: string;
+  source: "estimated" | "provider";
+  providerUsage?: AiProviderTokenUsage;
 }
 
 export function contextUsagePercent(

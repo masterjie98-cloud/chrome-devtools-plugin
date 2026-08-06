@@ -9,6 +9,7 @@ import {
   finalizeAgentSession,
   sanitizeAgentToolCallForPersistence,
   sanitizeAgentToolResultForPersistence,
+  updateAgentSessionRuntime,
   updateAgentSessionTaskState,
   type AgentSessionExecutionBinding,
   type AgentSessionSnapshot,
@@ -103,6 +104,10 @@ const INCREMENTAL_ACTIVITY_REPEAT_NOTICE =
   "本轮已经读取过一次增量页面活动。请完整总结第一次返回的事件窗口，并把 activity.nextCursor 留给用户下一次询问；不要在同一轮继续轮询。";
 const UNRELATED_EXTERNAL_MCP_BROWSER_VERIFY_NOTICE =
   "browser_verify 仅用于验证本轮对当前浏览器页面或浏览器状态产生的修改。当前只有外部 MCP 查询，没有待验证的页面修改；请基于外部 MCP 证据继续查询或直接生成报告。";
+const BROWSER_VERIFICATION_NOT_REQUIRED_NOTICE =
+  "browser_verify 仅用于验证本轮已经执行的页面或浏览器状态修改。当前没有待验证的修改；请继续原任务，不要把普通只读调查当成操作后验收。";
+const TARGET_SWITCH_REQUIRES_USER_NOTICE =
+  "当前 Agent 任务已固定到原 Tab，不能在运行中自行改绑到其他 Tab。请停止工具调用，并让用户在侧边栏选择“改绑当前 Tab”或“新建对话并发送”。";
 const CROSS_ROUND_NO_PROGRESS_THRESHOLD = 3;
 
 interface RepeatedReadOnlyObservation {
@@ -235,7 +240,7 @@ export async function runAutonomousAgentSession(
     const toolExecutionEnabled =
       params.config.enableTools && params.config.maxToolRounds > 0;
     let streamedContent = "";
-    let initialDeltaReceived = false;
+    let initialProgressReceived = false;
     await reserveBudget(() => runBudget.consumeModelRequest());
     let aiResult = await withStatusTicks(
       () =>
@@ -249,7 +254,7 @@ export async function runAutonomousAgentSession(
           abortSignal: params.abortSignal,
           onContextUsage: params.onContextUsage,
           onDelta: (delta) => {
-            initialDeltaReceived = true;
+            initialProgressReceived = true;
             streamedContent += delta;
             if (!toolExecutionEnabled) {
               params.onVisibleContent(
@@ -263,18 +268,17 @@ export async function runAutonomousAgentSession(
             onVisibleContent: params.onVisibleContent,
             onStatusUpdate: params.onStatusUpdate,
             markProgressReceived: () => {
-              initialDeltaReceived = true;
+              initialProgressReceived = true;
             },
             phase: "planning",
           }),
         }),
       (elapsedSeconds) => {
-        if (initialDeltaReceived) {
-          return;
-        }
         emitStatus(
           params,
-          `正在请求 AI 规划下一步…（已等待 ${elapsedSeconds}s）`,
+          initialProgressReceived
+            ? `AI 正在规划下一步…（已等待 ${elapsedSeconds}s）`
+            : `正在请求 AI 规划下一步…（已等待 ${elapsedSeconds}s）`,
         );
       },
     );
@@ -293,6 +297,9 @@ export async function runAutonomousAgentSession(
     let currentAssistantContent = initialAssistantContent;
     const maxToolRounds = params.config.maxToolRounds;
     const seenToolSignatures = new Map<string, number>();
+    const successfulReadOnlyToolSignatures = new Set<string>();
+    const repeatedReadOnlySamplingRequested =
+      requestsRepeatedReadOnlySampling(params.input);
     const toolNameCounts = new Map<string, number>();
     const toolClientMetadataByName = new Map(
       (params.tools ?? []).map((tool) => [
@@ -417,21 +424,48 @@ export async function runAutonomousAgentSession(
       let preBlockedReadOnlyObservation:
         | RepeatedReadOnlyObservation
         | undefined;
+      const scheduledReadOnlyToolSignatures = new Set<string>();
       const executableToolCalls = requestedToolCalls.filter((toolCall) => {
         if (
-          isBrowserVerifyToolCall(toolCall) &&
-          !postMutationVerificationRequired &&
-          (externalMcpToolAttempted || requestedExternalMcpTool)
+          isCrossTabTargetSwitch(toolCall, params.executionBinding)
         ) {
+          blockedReason = TARGET_SWITCH_REQUIRES_USER_NOTICE;
           blockedRepeatResults.push({
             toolCallId: toolCall.id,
             name: toolCall.name,
             content: JSON.stringify(
               {
                 blocked: true,
-                errorCode: "UNRELATED_BROWSER_VERIFICATION",
+                errorCode: "TARGET_SWITCH_REQUIRES_USER",
                 retryable: false,
-                reason: UNRELATED_EXTERNAL_MCP_BROWSER_VERIFY_NOTICE,
+                reason: TARGET_SWITCH_REQUIRES_USER_NOTICE,
+              },
+              null,
+              2,
+            ),
+          });
+          return false;
+        }
+
+        if (
+          isBrowserVerifyToolCall(toolCall) &&
+          !postMutationVerificationRequired
+        ) {
+          const externalOnlyVerification =
+            externalMcpToolAttempted || requestedExternalMcpTool;
+          blockedRepeatResults.push({
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            content: JSON.stringify(
+              {
+                blocked: true,
+                errorCode: externalOnlyVerification
+                  ? "UNRELATED_BROWSER_VERIFICATION"
+                  : "BROWSER_VERIFICATION_NOT_REQUIRED",
+                retryable: false,
+                reason: externalOnlyVerification
+                  ? UNRELATED_EXTERNAL_MCP_BROWSER_VERIFY_NOTICE
+                  : BROWSER_VERIFICATION_NOT_REQUIRED_NOTICE,
               },
               null,
               2,
@@ -495,6 +529,46 @@ export async function runAutonomousAgentSession(
           incrementalActivityReadCount += 1;
         }
 
+        const signature = getToolCallSignature(toolCall);
+        const externalMcpCall =
+          isExternalMcpToolName(toolCall.name) &&
+          !isTimingOnlyWaitCall(toolCall);
+        const duplicateGuardedReadCall =
+          externalMcpCall ||
+          isBrowserObserveToolCall(toolCall);
+        const repeatedSamplingAllowed =
+          repeatedReadOnlySamplingRequested &&
+          isRuntimeReadOnlyToolCall(toolCall);
+        const duplicateInBatch =
+          duplicateGuardedReadCall &&
+          scheduledReadOnlyToolSignatures.has(signature);
+        const duplicateSuccessfulRead =
+          duplicateGuardedReadCall &&
+          successfulReadOnlyToolSignatures.has(signature) &&
+          !repeatedSamplingAllowed;
+        if (duplicateInBatch || duplicateSuccessfulRead) {
+          blockedRepeatResults.push({
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            content: JSON.stringify(
+              {
+                blocked: true,
+                alreadySatisfied: true,
+                errorCode: "DUPLICATE_READ_ONLY_CALL",
+                retryable: false,
+                reason:
+                  "同一 Agent 任务中，这个只读工具及完全相同的参数已经成功返回。此前结果仍在工具上下文中，本次未重新执行；请直接基于已有证据完成回答。只有用户明确要求连续采样或轮询时，才应再次发起同参数读取。",
+              },
+              null,
+              2,
+            ),
+          });
+          return false;
+        }
+        if (duplicateGuardedReadCall) {
+          scheduledReadOnlyToolSignatures.add(signature);
+        }
+
         const priorRepeatCount = getReadOnlyObservationRepeatCount(
           toolCall,
           readOnlyObservationCounts,
@@ -522,7 +596,6 @@ export async function runAutonomousAgentSession(
         }
 
         const toolNameCount = toolNameCounts.get(toolCall.name) ?? 0;
-        const signature = getToolCallSignature(toolCall);
         const priorFailure = findFailedPreExecutionToolCall(
           toolCall,
           failedPreExecutionToolCalls,
@@ -738,6 +811,33 @@ export async function runAutonomousAgentSession(
           !isAgentToolResultDefinitelyNotExecuted(result.content),
         );
       });
+      const explicitTimeBarrierCompleted = executableToolCalls.some(
+        (toolCall) => {
+          const result = executedResultsById.get(toolCall.id);
+          return Boolean(
+            result &&
+            isTimingOnlyWaitCall(toolCall) &&
+            isTimingOnlyWaitResult(toolCall, result),
+          );
+        },
+      );
+      if (mutationMayHaveExecuted || explicitTimeBarrierCompleted) {
+        successfulReadOnlyToolSignatures.clear();
+      }
+      for (const toolCall of executableToolCalls) {
+        const result = executedResultsById.get(toolCall.id);
+        if (
+          result &&
+          isSuccessfulToolResult(result) &&
+          (isExternalMcpToolName(toolCall.name) ||
+            isBrowserObserveToolCall(toolCall)) &&
+          !isTimingOnlyWaitCall(toolCall)
+        ) {
+          successfulReadOnlyToolSignatures.add(
+            getToolCallSignature(toolCall),
+          );
+        }
+      }
       const repeatedReadOnlyObservation = recordReadOnlyToolObservations(
         executableToolCalls,
         executedToolResults,
@@ -986,13 +1086,6 @@ export async function runAutonomousAgentSession(
 
       if (blockNoProgressReadOnlyBatch) {
         blockedReason = READ_ONLY_NO_PROGRESS_NOTICE;
-        visibleContent = appendParagraph(
-          visibleContent,
-          READ_ONLY_NO_PROGRESS_NOTICE,
-        );
-        params.onVisibleContent(
-          sanitizeAssistantVisibleContent(visibleContent),
-        );
         session = publishEvent(
           session,
           params.onSessionUpdate,
@@ -1138,7 +1231,7 @@ export async function runAutonomousAgentSession(
       // ── Ask model what to do next (tools still enabled) ──────────────────
       // Standard ReAct loop: tool results → model decides next action or done.
       let firstChunk = "";
-      let firstDeltaReceived = false;
+      let firstProgressReceived = false;
       await reserveBudget(() => runBudget.consumeModelRequest());
       const firstResult = await withStatusTicks(
         () =>
@@ -1161,7 +1254,7 @@ export async function runAutonomousAgentSession(
             abortSignal: params.abortSignal,
             onContextUsage: params.onContextUsage,
             onDelta: (delta) => {
-              firstDeltaReceived = true;
+              firstProgressReceived = true;
               firstChunk += delta;
             },
             onStreamEvent: createModelProgressHandler({
@@ -1169,19 +1262,18 @@ export async function runAutonomousAgentSession(
               onVisibleContent: params.onVisibleContent,
               onStatusUpdate: params.onStatusUpdate,
               markProgressReceived: () => {
-                firstDeltaReceived = true;
+                firstProgressReceived = true;
               },
               phase: "after_tools",
               round: round + 1,
             }),
           }),
         (elapsedSeconds) => {
-          if (firstDeltaReceived) {
-            return;
-          }
           emitStatus(
             params,
-            `工具结果已返回，正在等待 AI 分析…（已等待 ${elapsedSeconds}s）`,
+            firstProgressReceived
+              ? `AI 正在分析工具结果…（已等待 ${elapsedSeconds}s）`
+              : `工具结果已返回，正在等待 AI 分析…（已等待 ${elapsedSeconds}s）`,
           );
         },
       );
@@ -1336,7 +1428,7 @@ export async function runAutonomousAgentSession(
             "context",
             "模型没有输出承诺的报告正文；Agent 正在基于已有工具证据重新生成自包含报告。",
           );
-          const reportContent = await requestSelfContainedReportRewrite({
+          const reportContent = await requestFinalAnswerRewrite({
             config: params.config,
             messages: params.messages,
             input: params.input,
@@ -1352,6 +1444,7 @@ export async function runAutonomousAgentSession(
             onContextUsage: params.onContextUsage,
             runBudget,
             reserveBudget,
+            rewriteKind: "missing_report",
           });
           const completedReport = reportContent || firstContent;
           visibleContent = appendParagraph(visibleContent, completedReport);
@@ -1456,7 +1549,7 @@ export async function runAutonomousAgentSession(
 
       // Completely empty response — nudge the model once with an explicit prompt.
       let nudgeChunk = "";
-      let nudgeDeltaReceived = false;
+      let nudgeProgressReceived = false;
       await reserveBudget(() => runBudget.consumeModelRequest());
       const nudgeResult = await withStatusTicks(
         () =>
@@ -1474,7 +1567,7 @@ export async function runAutonomousAgentSession(
             abortSignal: params.abortSignal,
             onContextUsage: params.onContextUsage,
             onDelta: (delta) => {
-              nudgeDeltaReceived = true;
+              nudgeProgressReceived = true;
               nudgeChunk += delta;
             },
             onStreamEvent: createModelProgressHandler({
@@ -1482,19 +1575,18 @@ export async function runAutonomousAgentSession(
               onVisibleContent: params.onVisibleContent,
               onStatusUpdate: params.onStatusUpdate,
               markProgressReceived: () => {
-                nudgeDeltaReceived = true;
+                nudgeProgressReceived = true;
               },
               phase: "continuation",
               round: round + 1,
             }),
           }),
         (elapsedSeconds) => {
-          if (nudgeDeltaReceived) {
-            return;
-          }
           emitStatus(
             params,
-            `AI 暂时没有返回文本，正在请求它继续…（已等待 ${elapsedSeconds}s）`,
+            nudgeProgressReceived
+              ? `AI 正在继续生成下一步…（已等待 ${elapsedSeconds}s）`
+              : `AI 暂时没有返回文本，正在请求它继续…（已等待 ${elapsedSeconds}s）`,
           );
         },
       );
@@ -1523,6 +1615,86 @@ export async function runAutonomousAgentSession(
       visibleContent,
       toolExecutionEnabled,
     );
+    if (
+      needsCrossTurnReplayRewrite(
+        params.messages,
+        params.input,
+        sanitizedFinalContent,
+      )
+    ) {
+      session = publishEvent(
+        session,
+        params.onSessionUpdate,
+        "context",
+        "模型忽略了本轮新问题并逐字重复上一轮报告；Agent 正在保留本轮证据并重新生成针对当前请求的答案。",
+      );
+      params.onVisibleContent("");
+      const rewrittenContent = await requestFinalAnswerRewrite({
+        config: params.config,
+        messages: params.messages,
+        input: params.input,
+        attachments: activeAttachments,
+        context,
+        toolExchanges,
+        visualCheckpoint: latestVisualCheckpoint,
+        tools: params.tools,
+        abortSignal: params.abortSignal,
+        visibleContent: "",
+        onVisibleContent: params.onVisibleContent,
+        onStatusUpdate: params.onStatusUpdate,
+        onContextUsage: params.onContextUsage,
+        runBudget,
+        reserveBudget,
+        rewriteKind: "cross_turn_replay",
+      });
+      if (
+        rewrittenContent &&
+        !needsCrossTurnReplayRewrite(
+          params.messages,
+          params.input,
+          rewrittenContent,
+        )
+      ) {
+        visibleContent = rewrittenContent;
+        sanitizedFinalContent = rewrittenContent;
+      } else {
+        blockedReason =
+          "模型连续忽略本轮新问题并重复上一轮已完成报告，Agent 已停止重放。";
+        visibleContent = blockedReason;
+        sanitizedFinalContent = blockedReason;
+      }
+    }
+    if (needsSimplifiedChineseRewrite(params.input, sanitizedFinalContent)) {
+      session = publishEvent(
+        session,
+        params.onSessionUpdate,
+        "context",
+        "模型最终草稿未遵循本轮中文回复语言；Agent 正在保留原证据并重新生成中文答案。",
+      );
+      params.onVisibleContent("");
+      const rewrittenContent = await requestFinalAnswerRewrite({
+        config: params.config,
+        messages: params.messages,
+        input: params.input,
+        attachments: activeAttachments,
+        context,
+        toolExchanges,
+        visualCheckpoint: latestVisualCheckpoint,
+        tools: params.tools,
+        abortSignal: params.abortSignal,
+        visibleContent: "",
+        onVisibleContent: params.onVisibleContent,
+        onStatusUpdate: params.onStatusUpdate,
+        onContextUsage: params.onContextUsage,
+        runBudget,
+        reserveBudget,
+        rewriteKind: "language",
+      });
+      if (rewrittenContent) {
+        visibleContent = rewrittenContent;
+        sanitizedFinalContent = rewrittenContent;
+      }
+    }
     const finalDecision = arbitrateAgentFinalResult(
       resultEvidence,
       sanitizedFinalContent,
@@ -1677,6 +1849,20 @@ export async function runAutonomousAgentSession(
 
     const detail =
       error instanceof Error ? error.message : "AI request failed.";
+    const errorCode = extractAgentRuntimeErrorCode(detail);
+    session = updateAgentSessionRuntime(session, {
+      phase: "failed",
+      progress: true,
+      errorCode,
+      errorSummary: detail,
+    });
+    session = publishEvent(
+      session,
+      params.onSessionUpdate,
+      "diagnostic",
+      "Agent 已记录本轮失败诊断。",
+      { errorCode, phase: "failed" },
+    );
     const finalContent = `AI 请求失败：${detail}`;
     params.onVisibleContent(finalContent);
     session = finalizeWithEvent(
@@ -1693,6 +1879,10 @@ export async function runAutonomousAgentSession(
       errorDetail: detail,
     };
   }
+}
+
+function extractAgentRuntimeErrorCode(detail: string): string {
+  return detail.match(/^([A-Z][A-Z0-9_]{2,80}):/)?.[1] ?? "AI_REQUEST_FAILED";
 }
 
 function appendParagraph(base: string, next: string): string {
@@ -2059,7 +2249,7 @@ async function requestToolContinuationAfterPlanningText(params: {
   }
 }
 
-async function requestSelfContainedReportRewrite(params: {
+async function requestFinalAnswerRewrite(params: {
   config: AiConfig;
   messages: ChatMessage[];
   input: string;
@@ -2075,9 +2265,10 @@ async function requestSelfContainedReportRewrite(params: {
   onContextUsage?: (report: AiContextUsageSnapshot) => void;
   runBudget: AgentRunBudget;
   reserveBudget: ReserveAgentRunBudget;
+  rewriteKind: "missing_report" | "language" | "cross_turn_replay";
 }): Promise<string> {
   let chunk = "";
-  let deltaReceived = false;
+  let progressReceived = false;
   await params.reserveBudget(() => params.runBudget.consumeModelRequest());
   const result = await withStatusTicks(
     () =>
@@ -2095,9 +2286,13 @@ async function requestSelfContainedReportRewrite(params: {
         enableTools: false,
         requireContinuation: true,
         continuationInstruction:
-          "Your previous draft referred to a report as already shown, but the visible final answer did not contain the report body. Using only the existing tool results, write the complete self-contained report now in the user's language. Include the verified scope, sources, important counts, abnormal resources, coverage limits, and concise next checks supported by evidence. Use Markdown headings and tables where they improve repeated-field comparisons. Do not call another tool, mention this correction, or refer to content above or in tool cards.",
+          params.rewriteKind === "language"
+            ? "The user's latest message is in Chinese, but the previous draft was predominantly English. Rewrite the same answer in Simplified Chinese using only the existing evidence. Preserve code, API paths, tool names, identifiers, and quoted source text exactly where needed. Do not call another tool, add new claims, mention this correction, or include the discarded English draft."
+            : params.rewriteKind === "cross_turn_replay"
+              ? "Your previous draft duplicated the previous completed turn and did not answer CURRENT_USER_REQUEST. Discard that draft. Answer only the latest CURRENT_USER_REQUEST in the user's language. Use this turn's tool evidence only when it is relevant to that request. Do not continue or summarize the earlier workflow, call another tool, mention this correction, or repeat the previous report."
+            : "Your previous draft referred to a report as already shown, but the visible final answer did not contain the report body. Using only the existing tool results, write the complete self-contained report now in the user's language. Include the verified scope, sources, important counts, abnormal resources, coverage limits, and concise next checks supported by evidence. Use Markdown headings and tables where they improve repeated-field comparisons. Do not call another tool, mention this correction, or refer to content above or in tool cards.",
         onDelta: (delta) => {
-          deltaReceived = true;
+          progressReceived = true;
           chunk += delta;
         },
         onStreamEvent: createModelProgressHandler({
@@ -2105,22 +2300,111 @@ async function requestSelfContainedReportRewrite(params: {
           onVisibleContent: params.onVisibleContent,
           onStatusUpdate: params.onStatusUpdate,
           markProgressReceived: () => {
-            deltaReceived = true;
+            progressReceived = true;
           },
           phase: "summary",
         }),
       }),
     (elapsedSeconds) => {
-      if (deltaReceived) {
-        return;
-      }
       emitStatus(
         params,
-        `工具查询已完成，正在重新生成报告正文…（已等待 ${elapsedSeconds}s）`,
+        progressReceived
+          ? params.rewriteKind === "language"
+            ? `AI 正在重新生成中文答案…（已等待 ${elapsedSeconds}s）`
+            : params.rewriteKind === "cross_turn_replay"
+              ? `AI 正在针对本轮新问题重新生成答案…（已等待 ${elapsedSeconds}s）`
+            : `AI 正在生成完整报告正文…（已等待 ${elapsedSeconds}s）`
+          : params.rewriteKind === "language"
+            ? `正在将最终答案重新生成为中文…（已等待 ${elapsedSeconds}s）`
+            : params.rewriteKind === "cross_turn_replay"
+              ? `检测到上一轮报告被重放，正在纠正…（已等待 ${elapsedSeconds}s）`
+            : `工具查询已完成，正在重新生成报告正文…（已等待 ${elapsedSeconds}s）`,
       );
     },
   );
   return sanitizeAssistantVisibleContent(result.content || chunk);
+}
+
+function needsCrossTurnReplayRewrite(
+  messages: ChatMessage[],
+  currentInput: string,
+  finalContent: string,
+): boolean {
+  const normalizedFinal = normalizeReplayComparableText(finalContent);
+  if (normalizedFinal.length < 160) {
+    return false;
+  }
+
+  let assistantIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (
+      message.role === "assistant" &&
+      normalizeReplayComparableText(message.content).length >= 160
+    ) {
+      assistantIndex = index;
+      break;
+    }
+  }
+  if (assistantIndex < 0) {
+    return false;
+  }
+
+  let userIndex = -1;
+  for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      userIndex = index;
+      break;
+    }
+  }
+  if (userIndex < 0) {
+    return false;
+  }
+
+  const completedTurnHasToolEvidence = messages
+    .slice(userIndex + 1, assistantIndex)
+    .some((message) => message.role === "tool");
+  if (!completedTurnHasToolEvidence) {
+    return false;
+  }
+
+  const previousInput = normalizeReplayComparableText(
+    messages[userIndex]?.content ?? "",
+  );
+  const nextInput = normalizeReplayComparableText(currentInput);
+  const previousAnswer = normalizeReplayComparableText(
+    messages[assistantIndex]?.content ?? "",
+  );
+  return (
+    Boolean(previousInput) &&
+    Boolean(nextInput) &&
+    previousInput !== nextInput &&
+    previousAnswer === normalizedFinal
+  );
+}
+
+function normalizeReplayComparableText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function needsSimplifiedChineseRewrite(
+  userInput: string,
+  content: string,
+): boolean {
+  if (
+    !/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u.test(userInput) ||
+    /[\u3040-\u30ff]/u.test(userInput)
+  ) {
+    return false;
+  }
+  const prose = content
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/`[^`]*`/g, "")
+    .replace(/https?:\/\/\S+/gi, "");
+  const hanCount =
+    prose.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/gu)?.length ?? 0;
+  const latinCount = prose.match(/[A-Za-z]/g)?.length ?? 0;
+  return latinCount >= 80 && latinCount > Math.max(20, hanCount * 3);
 }
 
 async function streamToolContinuation(
@@ -2145,7 +2429,7 @@ async function streamToolContinuation(
   forceToolChoice: boolean,
 ): Promise<{ result: AiChatStreamResult; chunk: string }> {
   let chunk = "";
-  let deltaReceived = false;
+  let progressReceived = false;
   await params.reserveBudget(() => params.runBudget.consumeModelRequest());
   const result = await withStatusTicks(
     () =>
@@ -2165,7 +2449,7 @@ async function streamToolContinuation(
         continuationInstruction: params.continuationInstruction,
         forceToolChoice,
         onDelta: (delta) => {
-          deltaReceived = true;
+          progressReceived = true;
           chunk += delta;
         },
         onStreamEvent: createModelProgressHandler({
@@ -2173,18 +2457,17 @@ async function streamToolContinuation(
           onVisibleContent: params.onVisibleContent,
           onStatusUpdate: params.onStatusUpdate,
           markProgressReceived: () => {
-            deltaReceived = true;
+            progressReceived = true;
           },
           phase: "continuation",
         }),
       }),
     (elapsedSeconds) => {
-      if (deltaReceived) {
-        return;
-      }
       emitStatus(
         params,
-        `正在要求 AI 直接调用下一步工具…（已等待 ${elapsedSeconds}s）`,
+        progressReceived
+          ? `AI 正在生成下一步工具调用…（已等待 ${elapsedSeconds}s）`
+          : `正在要求 AI 直接调用下一步工具…（已等待 ${elapsedSeconds}s）`,
       );
     },
   );
@@ -2229,6 +2512,20 @@ function isActivityMonitorStart(toolCall: AiRequestedToolCall): boolean {
   return (
     normalizeMcpToolName(toolCall.name) ===
     MCP_TOOL_NAMES.BROWSER_ACTIVITY_START
+  );
+}
+
+function isCrossTabTargetSwitch(
+  toolCall: AiRequestedToolCall,
+  executionBinding: AgentSessionExecutionBinding | undefined,
+): boolean {
+  return (
+    executionBinding !== undefined &&
+    normalizeMcpToolName(toolCall.name) ===
+      MCP_TOOL_NAMES.BROWSER_SET_TARGET_TAB &&
+    typeof toolCall.arguments.tabId === "number" &&
+    Number.isSafeInteger(toolCall.arguments.tabId) &&
+    toolCall.arguments.tabId !== executionBinding.target.tabId
   );
 }
 
@@ -2311,11 +2608,20 @@ function shouldContinueAfterPlanningText(content: string): boolean {
     return false;
   }
 
+  const asksUserToChooseOptionalFollowUp =
+    /[?？]\s*$/.test(normalized) &&
+    /(?:你|您).*(?:希望|想|要|需要|选择)|哪一(?:项|个)|是否需要|which one|would you like|do you want/.test(
+      normalized,
+    );
+  if (asksUserToChooseOptionalFollowUp) {
+    return false;
+  }
+
   const saysNextAction =
-    /(我|agent|模型)?(需要|应该|准备|会|将|先|再|继续|重新|下一步|接下来).*(检查|查看|查询|读取|获取|调用|使用|执行|注入|应用|截图|分析|确认|定位|选择|点击|输入|滚动|导航|打开|刷新)/i.test(
+    /(我|agent|模型)?(现在|需要|应该|准备|会|将|先|再|继续|重新|下一步|接下来).*(检查|查看|查询|读取|获取|调用|使用|执行|注入|应用|截图|分析|确认|定位|选择|点击|输入|滚动|导航|打开|刷新)/i.test(
       normalized,
     ) ||
-    /(i need to|i should|i will|i'll|let me|next i|now i need to).*(inspect|check|query|read|get|call|use|run|apply|inject|take|analyze|click|type|scroll|navigate|reload)/i.test(
+    /(i need to|i should|i will|i'll|let me|next i|now i need to|now|next).*(inspect|check|query|read|get|call|use|run|apply|inject|take|analyze|click|type|scroll|navigate|reload)/i.test(
       normalized,
     );
 
@@ -2323,7 +2629,7 @@ function shouldContinueAfterPlanningText(content: string): boolean {
     return false;
   }
 
-  return /工具|tool|dom|selector|选择器|样式|style|css|patch|截图|screenshot|页面|元素|element|network|console|请求|日志|注入|evaluate|浏览器|browser/.test(
+  return /工具|tool|mcp|dom|selector|选择器|样式|style|css|patch|截图|screenshot|页面|元素|element|network|console|请求|日志|注入|evaluate|浏览器|browser|pod|容器|节点|集群|namespace|deployment|daemonset|service|事件|状态|详情|指标|metric|resource|资源/.test(
     normalized,
   );
 }
@@ -2434,6 +2740,21 @@ function isNoProgressObservationBatch(
   );
 }
 
+function requestsRepeatedReadOnlySampling(input: string): boolean {
+  const normalized = input.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return (
+    /(连续采样|持续采样|连续查询|持续查询|定时查询|定时检查|反复检查|轮询|直到.{0,24}(变化|改变|恢复|出现|消失))/.test(
+      normalized,
+    ) ||
+    /(poll(?:ing)?|sample repeatedly|continuous(?:ly)? (?:sample|query|check)|repeat(?:edly)? (?:sample|query|check)|until.{0,40}(?:change|recover|appear|disappear))/.test(
+      normalized,
+    )
+  );
+}
+
 function isReadOnlyToolCall(
   toolCall: AiRequestedToolCall,
   toolMetadataByName?: ToolClientMetadataByName,
@@ -2482,6 +2803,10 @@ function toolCallMayMutateCurrentBrowser(
 
 function isBrowserVerifyToolCall(toolCall: AiRequestedToolCall): boolean {
   return normalizeMcpToolName(toolCall.name) === MCP_TOOL_NAMES.BROWSER_VERIFY;
+}
+
+function isBrowserObserveToolCall(toolCall: AiRequestedToolCall): boolean {
+  return normalizeMcpToolName(toolCall.name) === MCP_TOOL_NAMES.BROWSER_OBSERVE;
 }
 
 function recordReadOnlyToolObservations(

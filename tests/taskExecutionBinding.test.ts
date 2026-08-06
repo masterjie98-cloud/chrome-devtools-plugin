@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   getTaskExecutionBindingMismatch,
+  getTaskTargetSelectionMismatch,
   resolveTaskBindingConversationId,
 } from "../src/shared/taskExecutionBinding";
 
@@ -67,5 +68,20 @@ test("UI task binding uses the conversation owned by its sidepanel connection", 
       "conversation-session-a",
     ),
     "conversation-session-a",
+  );
+});
+
+test("a bound task may reselect its own tab but cannot select another tab", () => {
+  assert.equal(getTaskTargetSelectionMismatch(taskContext, 10), null);
+  assert.equal(getTaskTargetSelectionMismatch(taskContext, 11), "tabId");
+  assert.equal(
+    getTaskTargetSelectionMismatch(
+      {
+        taskId: "unbound-task",
+        egressDestinations: [],
+      },
+      11,
+    ),
+    null,
   );
 });

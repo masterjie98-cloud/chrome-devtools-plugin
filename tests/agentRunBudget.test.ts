@@ -1020,7 +1020,7 @@ test("Agent blocks a third identical read-only batch after two identical semanti
     ]);
     assert.equal(requestCount, 4);
     assert.equal(result.status, "blocked");
-    assert.match(result.finalContent, /为避免无进展循环/);
+    assert.doesNotMatch(result.finalContent, /为避免无进展循环/);
     assert.match(result.finalContent, /停止重复读取并完成总结/);
     assert.ok(
       result.session.events.some((event) =>
@@ -1868,8 +1868,8 @@ test("context digest heartbeat timestamps do not hide a repeated unsynced-state 
     ]);
     assert.equal(requestCount, 4);
     assert.equal(result.status, "blocked");
-    assert.match(result.finalContent, /相同只读工具/);
-    assert.match(result.finalContent, /无进展循环/);
+    assert.doesNotMatch(result.finalContent, /相同只读工具|无进展循环/);
+    assert.match(result.finalContent, /页面上下文尚未同步/);
   } finally {
     restore();
   }
@@ -2561,11 +2561,248 @@ test("external MCP results do not trigger current-page browser verification", as
   }
 });
 
-test("external MCP volatile observation metadata cannot hide an identical-result loop", async () => {
+test("Agent continues when an external MCP diagnosis ends with a promised next inspection", async () => {
+  const podToolName = "extmcp__k8s_dev__pods_get_a1b2c3";
+  const logToolName = "extmcp__k8s_dev__pods_log_d4e5f6";
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-pod-detail",
+                type: "function",
+                function: {
+                  name: podToolName,
+                  arguments:
+                    '{"namespace":"ob","name":"fluent-bit-jmz5k"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "已定位异常 Pod：fluent-bit-jmz5k，事件显示 readiness probe failed。现在查看该 Pod 的详细状态和容器日志：",
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-pod-log",
+                type: "function",
+                function: {
+                  name: logToolName,
+                  arguments:
+                    '{"namespace":"ob","name":"fluent-bit-jmz5k","tail":200}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "根因已确认：fluent-bit 容器无法连接上游服务，导致健康检查持续失败并触发重启退避。",
+          },
+        },
+      ],
+    },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+    (body) => requestBodies.push(body),
+  );
+  const executedTools: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 6 },
+      messages: [],
+      input: "定位这个异常 Pod 的具体原因。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-external-promised-inspection",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: podToolName,
+            description: "Read one Kubernetes Pod.",
+            parameters: {
+              type: "object",
+              properties: {
+                namespace: { type: "string" },
+                name: { type: "string" },
+              },
+              required: ["namespace", "name"],
+              additionalProperties: false,
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: logToolName,
+            description: "Read Kubernetes Pod logs.",
+            parameters: {
+              type: "object",
+              properties: {
+                namespace: { type: "string" },
+                name: { type: "string" },
+                tail: { type: "number" },
+              },
+              required: ["namespace", "name"],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedTools.push(...calls.map((call) => call.name));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content:
+            call.name === podToolName
+              ? '{"phase":"Running","ready":false}'
+              : '{"logs":"connect upstream: connection refused"}',
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.deepEqual(executedTools, [podToolName, logToolName]);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /根因已确认/);
+    assert.match(JSON.stringify(requestBodies[2]), /"tool_choice":"required"/);
+  } finally {
+    restore();
+  }
+});
+
+test("built-in browser_observe duplicate read is blocked before a second execution", async () => {
+  const responses = [
+    ...Array.from({ length: 2 }, (_, index) => ({
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: `call-browser-observe-${index + 1}`,
+                type: "function",
+                function: {
+                  name: "browser_observe",
+                  arguments: '{"mode":"interactive","limit":40}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    })),
+    {
+      choices: [
+        {
+          message: {
+            content: "已基于第一次页面快照完成总结。",
+          },
+        },
+      ],
+    },
+  ];
+  let requestCount = 0;
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => {
+      requestCount += 1;
+    },
+  );
+  const executedCallIds: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: {
+        ...DEFAULT_AI_CONFIG,
+        maxToolRounds: 1,
+        autoContinueAfterToolRoundLimit: true,
+      },
+      messages: [],
+      input: "读取当前页面并总结。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-browser-observe-repeat",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_observe",
+            description: "Observe the current page.",
+            parameters: {
+              type: "object",
+              properties: {
+                mode: { type: "string" },
+                limit: { type: "number" },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedCallIds.push(...calls.map((call) => call.id));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            page: { url: "https://example.test/" },
+            freshness: { revision: 7 },
+            snapshot: {
+              fingerprint: "f50667fb",
+              nodes: [{ role: "button", name: "Submit" }],
+            },
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedCallIds, ["call-browser-observe-1"]);
+    assert.equal(requestCount, 3);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /第一次页面快照/);
+    assert.doesNotMatch(result.finalContent, /DUPLICATE_READ_ONLY_CALL/);
+  } finally {
+    restore();
+  }
+});
+
+test("external MCP duplicate read is blocked before a second execution", async () => {
   const externalToolName =
     "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
   const responses = [
-    ...Array.from({ length: 3 }, (_, index) => ({
+    ...Array.from({ length: 2 }, (_, index) => ({
       choices: [
         {
           message: {
@@ -2669,15 +2906,12 @@ test("external MCP volatile observation metadata cannot hide an identical-result
       onVisibleContent: () => undefined,
     });
 
-    assert.deepEqual(executedCallIds, [
-      "call-external-repeat-1",
-      "call-external-repeat-2",
-    ]);
+    assert.deepEqual(executedCallIds, ["call-external-repeat-1"]);
     assert.equal(budgetExtensionRequests, 0);
-    assert.equal(requestCount, 4);
-    assert.equal(result.status, "blocked");
-    assert.match(result.finalContent, /无进展循环/);
+    assert.equal(requestCount, 3);
+    assert.equal(result.status, "completed");
     assert.match(result.finalContent, /停止重复查询/);
+    assert.doesNotMatch(result.finalContent, /DUPLICATE_READ_ONLY_CALL/);
   } finally {
     restore();
   }
@@ -2991,6 +3225,371 @@ test("automatic MCP mode blocks browser_verify after an external-only query", as
     assert.match(
       JSON.stringify(requestBodies.at(-1)),
       /UNRELATED_BROWSER_VERIFICATION/,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("Agent blocks browser_verify when no browser mutation requires verification", async () => {
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-read-only-snapshot",
+                type: "function",
+                function: {
+                  name: "browser_snapshot",
+                  arguments: "{}",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-unneeded-browser-verify",
+                type: "function",
+                function: {
+                  name: "browser_verify",
+                  arguments:
+                    '{"checks":[{"id":"usage","type":"text_contains","value":"用量"}]}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content: "页面只读检查已完成，没有执行任何页面修改。",
+          },
+        },
+      ],
+    },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+    (body) => requestBodies.push(body),
+  );
+  const executedTools: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 4 },
+      messages: [],
+      input: "检查当前页面为什么没有用量数据，不要修改页面。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-read-only-browser-investigation",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_snapshot",
+            description: "Read the current page.",
+            parameters: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "browser_verify",
+            description: "Verify a current-page mutation.",
+            parameters: {
+              type: "object",
+              properties: {
+                checks: {
+                  type: "array",
+                  items: { type: "object" },
+                },
+              },
+              required: ["checks"],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedTools.push(...calls.map((call) => call.name));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({
+            page: { title: "DeepSeek 开放平台" },
+            snapshot: { nodes: [{ role: "heading", name: "用量" }] },
+          }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.deepEqual(executedTools, ["browser_snapshot"]);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /没有执行任何页面修改/);
+    assert.match(
+      JSON.stringify(requestBodies.at(-1)),
+      /BROWSER_VERIFICATION_NOT_REQUIRED/,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("Agent cannot switch a bound task to another browser tab", async () => {
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-cross-tab-switch",
+                type: "function",
+                function: {
+                  name: "browser_set_target_tab",
+                  arguments: '{"tabId":22}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "当前任务固定在原 Tab。请先由用户选择改绑当前 Tab 或创建新对话。",
+          },
+        },
+      ],
+    },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+    (body) => requestBodies.push(body),
+  );
+  const executedTools: string[] = [];
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 4 },
+      messages: [],
+      input: "切换到我当前正在看的 Tab 并监听路由变化。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-cross-tab-switch",
+      executionBinding: {
+        taskId: "task-bound-tab-11",
+        conversationId: "conversation-bound-tab-11",
+        target: {
+          tabId: 11,
+          targetId: "11",
+          title: "原页面",
+          url: "https://old.example.test/",
+        },
+      },
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_set_target_tab",
+            description: "Select a browser tab.",
+            parameters: {
+              type: "object",
+              properties: {
+                tabId: { type: "number" },
+              },
+              required: ["tabId"],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedTools.push(...calls.map((call) => call.name));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({ selectedTabId: call.arguments.tabId }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.deepEqual(executedTools, []);
+    assert.equal(result.status, "blocked");
+    assert.match(result.finalContent, /用户选择|改绑当前 Tab|创建新对话/);
+    assert.match(
+      JSON.stringify(requestBodies.at(-1)),
+      /TARGET_SWITCH_REQUIRES_USER/,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("Agent rewrites an English final draft for a Chinese user turn", async () => {
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "browser_verify checks the observable result of a browser mutation. It should not be used as a general read tool.",
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "browser_verify 用于检查浏览器修改后的可观察结果，不应当作为普通读取工具使用。",
+          },
+        },
+      ],
+    },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  let requestCount = 0;
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => {
+      requestCount += 1;
+    },
+    (body) => requestBodies.push(body),
+  );
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 4 },
+      messages: [],
+      input: "解释一下 browser_verify 是做什么的。",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-chinese-language-rewrite",
+      tools: [],
+      executeToolCalls: async () => [],
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.equal(requestCount, 2);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /用于检查浏览器修改后的可观察结果/);
+    assert.doesNotMatch(result.finalContent, /checks the observable result/);
+    assert.match(
+      JSON.stringify(requestBodies.at(-1)),
+      /Rewrite the same answer in Simplified Chinese/,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("Agent repairs an exact completed-report replay for a different user turn", async () => {
+  const repeatedReport =
+    "## fluent-bit DaemonSet 所有节点状态\n\n" +
+    "fluent-bit 作为 DaemonSet 部署在 ob 命名空间，当前 7 个节点中 6 个节点运行正常，1 个节点存在异常。" +
+    "\n\n| 指标 | 值 | 状态 |\n| --- | --- | --- |\n" +
+    "| desiredNumberScheduled | 7 | - |\n| numberAvailable | 6 | 警告 |\n" +
+    "| numberUnavailable | 1 | 异常 |\n\n" +
+    "需要进一步查询完整节点列表以及对应 Pod 状态。";
+  const responses = [
+    {
+      choices: [{ message: { content: repeatedReport } }],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content:
+              "JavaScript 事件循环会依次执行同步任务，并在调用栈清空后处理微任务和后续宏任务。",
+          },
+        },
+      ],
+    },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  let requestCount = 0;
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => {
+      requestCount += 1;
+    },
+    (body) => requestBodies.push(body),
+  );
+
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 4 },
+      messages: [
+        {
+          id: "old-user",
+          role: "user",
+          content: "查询 fluent-bit DaemonSet 的所有节点状态。",
+          createdAt: "2026-08-06T10:01:00.000Z",
+        },
+        {
+          id: "old-tool",
+          role: "tool",
+          toolName: "pods_list_in_namespace",
+          content: '{"items":[{"name":"fluent-bit-a"}]}',
+          createdAt: "2026-08-06T10:01:01.000Z",
+        },
+        {
+          id: "old-assistant",
+          role: "assistant",
+          content: repeatedReport,
+          createdAt: "2026-08-06T10:02:00.000Z",
+        },
+      ],
+      input: "JavaScript 的事件循环是什么？",
+      attachments: [],
+      context: {},
+      assistantMessageId: "assistant-cross-turn-replay-repair",
+      tools: [],
+      executeToolCalls: async () => [],
+      onVisibleContent: () => undefined,
+      onStatusUpdate: () => undefined,
+    });
+
+    assert.equal(requestCount, 2);
+    assert.equal(result.status, "completed");
+    assert.match(result.finalContent, /JavaScript 事件循环/);
+    assert.doesNotMatch(result.finalContent, /fluent-bit DaemonSet 所有节点状态/);
+    assert.match(
+      JSON.stringify(requestBodies.at(-1)),
+      /duplicated the previous completed turn/i,
     );
   } finally {
     restore();

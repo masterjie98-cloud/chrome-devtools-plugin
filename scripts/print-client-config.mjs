@@ -25,12 +25,15 @@ if (!supportedProfiles.has(requestedProfile)) {
     env,
   };
   const shellQuote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+  const cmdQuote = (value) => `"${value}"`;
+  const commandQuote =
+    process.platform === "win32" ? cmdQuote : shellQuote;
   const codexCommand = [
     "codex mcp add",
     `--env AI_DEVTOOLS_MCP_TOOL_PROFILE=${requestedProfile}`,
     "ai-devtools --",
-    shellQuote(nodePath),
-    shellQuote(serverPath),
+    commandQuote(nodePath),
+    commandQuote(serverPath),
   ].join(" ");
 
   process.stdout.write(
@@ -40,6 +43,13 @@ if (!supportedProfiles.has(requestedProfile)) {
         prerequisites: {
           builtServerExists: "Run npm run build before registering a client.",
           daemon: "Run npm run daemon:start or install the local service.",
+        },
+        genericMcp: {
+          serverName: "ai-devtools",
+          transport: "stdio",
+          command: serverConfig.command,
+          args: serverConfig.args,
+          env: serverConfig.env,
         },
         codex: {
           command: codexCommand,

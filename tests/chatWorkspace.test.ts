@@ -54,6 +54,7 @@ test("stored conversations retain bounded tool audit details but omit secrets, a
       id: "assistant-1",
       role: "assistant",
       content: "Done",
+      model: "deepseek-v3.1",
       createdAt: "2026-07-14T00:00:02.000Z",
     },
   ];
@@ -93,6 +94,7 @@ test("stored conversations retain bounded tool audit details but omit secrets, a
       id: "assistant-1",
       role: "assistant",
       content: "Done",
+      model: "deepseek-v3.1",
       createdAt: "2026-07-14T00:00:02.000Z",
     },
   ]);

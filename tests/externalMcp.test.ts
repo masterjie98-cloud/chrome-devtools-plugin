@@ -170,7 +170,52 @@ test("daemon registry launches an enabled stdio MCP and routes its tool", async 
     const summary = registry.listServers()[0];
     assert.equal(summary?.status, "connected");
     assert.equal(summary?.toolCount, 1);
+    assert.equal(summary?.resourceCount, 0);
+    assert.equal(summary?.promptCount, 0);
+    assert.equal(summary?.tools[0]?.name, "echo");
+    assert.equal(summary?.tools[0]?.approval, "inherit");
     assert.equal(saved.length, 0);
+  } finally {
+    await registry.close();
+  }
+});
+
+test("external MCP tools can be disabled and assigned an explicit approval policy", async () => {
+  const fixture = join(projectRoot, "tests", "fixtures", "externalMcpEchoServer.mjs");
+  const registry = new ExternalMcpRegistry(
+    [
+      {
+        id: "mcp_tool_policy_fixture",
+        name: "Tool policy fixture",
+        enabled: true,
+        transport: { type: "stdio", command: process.execPath, args: [fixture] },
+      },
+    ],
+    { saveServers: async () => undefined },
+  );
+  try {
+    const [publicTool] = await registry.listTools();
+    assert.ok(publicTool);
+    await registry.setToolPolicy("mcp_tool_policy_fixture", "echo", {
+      approval: "auto",
+    });
+    assert.equal(registry.getToolPolicy(publicTool.name)?.approvalMode, "none");
+    assert.equal(registry.listServers()[0]?.tools[0]?.approval, "auto");
+
+    await registry.setToolPolicy("mcp_tool_policy_fixture", "echo", {
+      enabled: false,
+    });
+    assert.deepEqual(await registry.listTools(), []);
+    assert.equal(registry.listServers()[0]?.tools[0]?.enabled, false);
+
+    await registry.setToolPolicy("mcp_tool_policy_fixture", "echo", {
+      enabled: true,
+      approval: "ask",
+    });
+    const [restoredTool] = await registry.listTools();
+    assert.ok(restoredTool);
+    assert.equal(registry.getToolPolicy(restoredTool.name), undefined);
+    assert.equal(registry.listServers()[0]?.tools[0]?.approval, "ask");
   } finally {
     await registry.close();
   }

@@ -21,9 +21,15 @@ let workspaceSaveQueue: Promise<void> = Promise.resolve();
 
 export interface StoredChatMessage {
   id: string;
+  runId?: string;
+  turnId?: string;
+  toolCallId?: string;
+  assistantMessageId?: string;
+  conversationId?: string;
   role: "user" | "assistant" | "tool";
   content: string;
   createdAt: string;
+  model?: string;
   source?: "user" | "extension_ai" | "mcp_ai" | "system";
   toolName?: string;
   toolSource?: "builtin" | "external_mcp";
@@ -471,9 +477,27 @@ function sanitizeMessages(values: unknown[]): StoredChatMessage[] {
     acceptedChars += messageChars;
     accepted.push({
       id,
+      ...(sanitizeOptionalIdentifier(value.runId)
+        ? { runId: sanitizeIdentifier(value.runId) }
+        : {}),
+      ...(sanitizeOptionalIdentifier(value.turnId)
+        ? { turnId: sanitizeIdentifier(value.turnId) }
+        : {}),
+      ...(sanitizeOptionalIdentifier(value.toolCallId)
+        ? { toolCallId: sanitizeIdentifier(value.toolCallId) }
+        : {}),
+      ...(sanitizeOptionalIdentifier(value.assistantMessageId)
+        ? { assistantMessageId: sanitizeIdentifier(value.assistantMessageId) }
+        : {}),
+      ...(sanitizeOptionalIdentifier(value.conversationId)
+        ? { conversationId: sanitizeIdentifier(value.conversationId) }
+        : {}),
       role: value.role,
       content,
       createdAt: sanitizeTimestamp(value.createdAt),
+      ...(value.role === "assistant" && sanitizeText(value.model, 200).trim()
+        ? { model: sanitizeText(value.model, 200).trim() }
+        : {}),
       ...(value.source === "user" ||
       value.source === "extension_ai" ||
       value.source === "mcp_ai" ||

@@ -1,6 +1,11 @@
 import { createMessageId } from "../shared/messaging";
 import type { AgentSessionSnapshot } from "../shared/agentSession";
-import { finalizeAgentSession } from "../shared/agentSession";
+import {
+  appendAgentSessionEvent,
+  finalizeAgentSession,
+  updateAgentSessionRuntime,
+  type AgentRunPhase,
+} from "../shared/agentSession";
 import { toAgentPageSnapshot } from "../shared/agentPageContext";
 import type {
   DaemonAgentBudgetDecisionPayload,
@@ -31,10 +36,13 @@ import {
 } from "../sidepanel/toolResultPresentation";
 import type { ToolResultPresentationMeta } from "../sidepanel/toolResultPresentation";
 import type { ChatImageAttachment } from "../sidepanel/types";
+import { RUNTIME_BUILD_ID } from "../shared/runtimeIdentity";
+import type { AgentRuntimeEnvironmentSnapshot } from "../shared/agentSession";
 
 export interface DaemonAgentToolRequest {
   sessionId: string;
   runId: string;
+  turnId?: string;
   toolCallId: string;
   toolName: string;
   args: Record<string, unknown>;
@@ -191,6 +199,7 @@ export class DaemonAgentRunner {
   ): Promise<void> {
     let latestVisibleContent = "";
     let latestSession: AgentSessionSnapshot | undefined;
+    const runtimeEnvironment = buildAgentRuntimeEnvironment(payload);
     try {
       const result = await this.runSession({
         config: payload.config,
@@ -208,6 +217,15 @@ export class DaemonAgentRunner {
         prepareContext: async (context) => {
           if (!payload.config.includePageContext) {
             return context;
+          }
+          if (!payload.executionBinding) {
+            const {
+              pageSnapshot: _pageSnapshot,
+              selectedElement: _selectedElement,
+              contextReadError: _contextReadError,
+              ...contextWithoutPage
+            } = context;
+            return contextWithoutPage;
           }
           try {
             const value = await callbacks.executeTool({
@@ -304,9 +322,15 @@ export class DaemonAgentRunner {
             assistantMessageId,
             controller.signal,
             callbacks,
+            latestSession?.turns?.at(-1)?.id,
           ),
         onVisibleContent: (content) => {
           latestVisibleContent = content.slice(0, 12_000);
+          if (latestSession) {
+            latestSession = updateAgentSessionRuntime(latestSession, {
+              progress: true,
+            });
+          }
           callbacks.emit({
             runId: payload.runId,
             conversationId: payload.conversationId,
@@ -315,6 +339,21 @@ export class DaemonAgentRunner {
           });
         },
         onStatusUpdate: (status) => {
+          if (latestSession) {
+            latestSession = updateAgentSessionRuntime(latestSession, {
+              phase: inferAgentRunPhase(status, latestSession.phase),
+              status,
+              progress: isProgressStatus(status),
+            });
+            const heartbeatEvent = {
+              runId: payload.runId,
+              conversationId: payload.conversationId,
+              kind: "session" as const,
+              session: latestSession,
+            };
+            callbacks.persistSession(heartbeatEvent);
+            callbacks.emit(heartbeatEvent);
+          }
           callbacks.emit({
             runId: payload.runId,
             conversationId: payload.conversationId,
@@ -323,6 +362,34 @@ export class DaemonAgentRunner {
           });
         },
         onContextUsage: (report) => {
+          if (latestSession) {
+            latestSession = updateAgentSessionRuntime(latestSession, {
+              modelRequestDelta: report.source === "estimated" ? 1 : 0,
+              progress: report.source === "provider",
+            });
+            const latestCompaction = report.compactionSteps.at(-1);
+            if (latestCompaction && report.source === "estimated") {
+              latestSession = appendAgentSessionEvent(latestSession, {
+                id: createMessageId(),
+                type: "compaction",
+                createdAt: report.measuredAt,
+                summary: `${report.omittedMessageCount} 条消息被省略，${report.compactedMessageCount} 条消息被压缩。`,
+                data: {
+                  beforeTokens: latestCompaction.beforeTokens,
+                  afterTokens: latestCompaction.afterTokens,
+                  reason: latestCompaction.reason,
+                },
+              });
+            }
+            const usageSessionEvent = {
+              runId: payload.runId,
+              conversationId: payload.conversationId,
+              kind: "session" as const,
+              session: latestSession,
+            };
+            callbacks.persistSession(usageSessionEvent);
+            callbacks.emit(usageSessionEvent);
+          }
           callbacks.emit({
             runId: payload.runId,
             conversationId: payload.conversationId,
@@ -331,13 +398,14 @@ export class DaemonAgentRunner {
           });
         },
         onSessionUpdate: (session) => {
-          const durableSession = {
+          const durableSession = mergeAgentRuntimeCheckpoint({
             ...session,
             id: payload.runId,
             assistantMessageId: payload.assistantMessageId,
             executionOwner: "daemon" as const,
+            runtimeEnvironment,
             ...(latestVisibleContent ? { visibleContent: latestVisibleContent } : {}),
-          };
+          }, latestSession);
           latestSession = durableSession;
           const event = {
             runId: payload.runId,
@@ -354,6 +422,7 @@ export class DaemonAgentRunner {
         id: payload.runId,
         assistantMessageId: payload.assistantMessageId,
         executionOwner: "daemon" as const,
+        runtimeEnvironment,
         ...(latestVisibleContent ? { visibleContent: latestVisibleContent } : {}),
       };
       latestSession = durableResultSession;
@@ -380,6 +449,12 @@ export class DaemonAgentRunner {
       if (latestSession) {
         const status = controller.signal.aborted ? "cancelled" : "failed";
         const finalContent = latestVisibleContent || detail;
+        latestSession = updateAgentSessionRuntime(latestSession, {
+          phase: status,
+          progress: true,
+          errorCode: status === "failed" ? extractAgentErrorCode(detail) : undefined,
+          errorSummary: status === "failed" ? detail : undefined,
+        });
         const terminalSession = finalizeAgentSession(
           latestSession,
           status,
@@ -424,6 +499,7 @@ export class DaemonAgentRunner {
     assistantMessageId: string,
     signal: AbortSignal,
     callbacks: DaemonAgentRunnerCallbacks,
+    turnId?: string,
   ): Promise<AiToolResultMessage[]> {
     type Prepared = { result: AiToolResultMessage; success: boolean };
     const modelResultCharLimit = toolResultModelCharLimit(
@@ -458,6 +534,7 @@ export class DaemonAgentRunner {
             sessionId,
             runId: payload.runId,
             toolCallId: call.id,
+            turnId,
             toolName: call.name,
             args: call.arguments,
             executionBinding: payload.executionBinding,
@@ -610,6 +687,101 @@ export class DaemonAgentRunner {
   private key(sessionId: string, conversationId: string): string {
     return `${sessionId}:${conversationId}`;
   }
+}
+
+function mergeAgentRuntimeCheckpoint(
+  session: AgentSessionSnapshot,
+  current: AgentSessionSnapshot | undefined,
+): AgentSessionSnapshot {
+  if (!current?.diagnostics || !session.diagnostics) {
+    return session;
+  }
+  if (Date.parse(current.diagnostics.lastHeartbeatAt) <= Date.parse(session.diagnostics.lastHeartbeatAt)) {
+    return session;
+  }
+  return {
+    ...session,
+    phase: current.phase,
+    heartbeatAt: current.heartbeatAt,
+    updatedAt: current.updatedAt,
+    diagnostics: {
+      ...session.diagnostics,
+      ...current.diagnostics,
+      modelRequestCount: Math.max(
+        session.diagnostics.modelRequestCount,
+        current.diagnostics.modelRequestCount,
+      ),
+      toolCallCount: Math.max(
+        session.diagnostics.toolCallCount,
+        current.diagnostics.toolCallCount,
+      ),
+      completedToolCallCount: Math.max(
+        session.diagnostics.completedToolCallCount,
+        current.diagnostics.completedToolCallCount,
+      ),
+    },
+  };
+}
+
+function buildAgentRuntimeEnvironment(
+  payload: DaemonAgentStartPayload,
+): AgentRuntimeEnvironmentSnapshot {
+  const externalMcpServerIds = Array.from(
+    new Set(
+      (payload.tools ?? []).flatMap((tool) =>
+        tool.clientMetadata?.externalMcpServerId
+          ? [tool.clientMetadata.externalMcpServerId]
+          : [],
+      ),
+    ),
+  ).sort();
+  return {
+    capturedAt: new Date().toISOString(),
+    runtimeBuildId: RUNTIME_BUILD_ID,
+    model: payload.config.model,
+    providerOrigin: safeProviderOrigin(payload.config.apiUrl),
+    contextWindowTokens: payload.config.contextWindowTokens,
+    maxOutputTokens: Math.max(128, payload.config.maxOutputTokens ?? 8_192),
+    toolScope: payload.context.toolScope ?? "mixed",
+    enabledToolNames: (payload.tools ?? []).map((tool) => tool.function.name).sort(),
+    externalMcpServerIds,
+    targetTabId: payload.executionBinding?.target.tabId,
+    targetId: payload.executionBinding?.target.targetId,
+    permissionMode: payload.config.enableTools
+      ? "approval_required"
+      : "tools_disabled",
+  };
+}
+
+function safeProviderOrigin(apiUrl: string): string {
+  try {
+    return new URL(apiUrl).origin;
+  } catch {
+    return "invalid-provider-url";
+  }
+}
+
+function inferAgentRunPhase(
+  status: string,
+  fallback: AgentRunPhase | undefined,
+): AgentRunPhase {
+  if (/审批|授权/.test(status)) return "waiting_approval";
+  if (/执行.*工具|工具调用/.test(status)) return "tool_execution";
+  if (/总结|报告正文/.test(status)) return "summarizing";
+  if (/分析工具结果|等待 AI 分析|继续生成/.test(status)) return "model_analysis";
+  if (/规划|请求 AI/.test(status)) return "model_planning";
+  if (/读取|上下文|截图|观察/.test(status)) return "reading_context";
+  if (/取消/.test(status)) return "cancelling";
+  return fallback ?? "starting";
+}
+
+function isProgressStatus(status: string): boolean {
+  return !/正在等待|等待你|等待 AI/.test(status);
+}
+
+function extractAgentErrorCode(detail: string): string {
+  const match = detail.match(/^([A-Z][A-Z0-9_]{2,80}):/);
+  return match?.[1] ?? "AGENT_RUN_FAILED";
 }
 
 function isScreenshot(value: unknown): value is ScreenshotCaptureResult {

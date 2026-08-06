@@ -26,6 +26,8 @@ export interface ExternalMcpServerConfig {
   description?: string;
   timeoutMs?: number;
   disabledTools?: string[];
+  /** Per-tool approval overrides. Missing entries inherit the server policy. */
+  toolApprovalPolicies?: Record<string, "ask" | "auto">;
   importRequestedEnabled?: boolean;
   transport: ExternalMcpTransportConfig;
 }
@@ -49,7 +51,29 @@ export interface ExternalMcpServerSummary {
   importRequestedEnabled?: boolean;
   status: ExternalMcpRuntimeStatus;
   toolCount: number;
+  resourceCount: number;
+  promptCount: number;
+  capabilities: {
+    tools: boolean;
+    resources: boolean;
+    prompts: boolean;
+  };
+  tools: ExternalMcpToolSummary[];
+  lastConnectedAt?: string;
+  lastErrorAt?: string;
+  reconnectCount: number;
+  discoveryErrors?: string[];
   error?: string;
+}
+
+export interface ExternalMcpToolSummary {
+  name: string;
+  title: string;
+  description?: string;
+  enabled: boolean;
+  approval: "inherit" | "ask" | "auto";
+  readOnly: boolean;
+  destructive: boolean;
 }
 
 export type ExternalMcpMode = "off" | "auto" | "selected";
@@ -74,6 +98,7 @@ const MAX_KEY_VALUE_ENTRIES = 100;
 const MAX_KEY_CHARS = 160;
 const MAX_VALUE_CHARS = 16_000;
 const MAX_DISABLED_TOOLS = 200;
+const MAX_TOOL_POLICIES = 200;
 const MAX_TOOL_NAME_CHARS = 200;
 const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 300_000;
@@ -96,6 +121,9 @@ export function normalizeExternalMcpServerConfig(
   );
   const timeoutMs = normalizeTimeoutMs(value.timeoutMs);
   const disabledTools = normalizeDisabledTools(value.disabledTools);
+  const toolApprovalPolicies = normalizeToolApprovalPolicies(
+    value.toolApprovalPolicies,
+  );
   return {
     id,
     name,
@@ -105,6 +133,7 @@ export function normalizeExternalMcpServerConfig(
     ...(description ? { description } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(disabledTools !== undefined ? { disabledTools } : {}),
+    ...(toolApprovalPolicies !== undefined ? { toolApprovalPolicies } : {}),
     ...(value.importRequestedEnabled === true
       ? { importRequestedEnabled: true }
       : {}),
@@ -185,6 +214,7 @@ export function parseExternalMcpImport(
       description: rawConfig.description,
       timeoutMs: rawConfig.timeout ?? rawConfig.timeoutMs,
       disabledTools: rawConfig.disabledTools,
+      toolApprovalPolicies: rawConfig.toolApprovalPolicies,
       importRequestedEnabled: rawConfig.isActive === true,
       transport: config,
     });
@@ -386,6 +416,36 @@ function normalizeDisabledTools(value: unknown): string[] | undefined {
         ),
       ),
     ),
+  );
+}
+
+function normalizeToolApprovalPolicies(
+  value: unknown,
+): Record<string, "ask" | "auto"> | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    throw new Error("MCP toolApprovalPolicies must be an object.");
+  }
+  const entries = Object.entries(value);
+  if (entries.length > MAX_TOOL_POLICIES) {
+    throw new Error(
+      `MCP toolApprovalPolicies supports at most ${MAX_TOOL_POLICIES} tools.`,
+    );
+  }
+  return Object.fromEntries(
+    entries.map(([name, policy]) => {
+      const normalizedName = requireCleanString(
+        name,
+        "MCP tool policy name",
+        MAX_TOOL_NAME_CHARS,
+      );
+      if (policy !== "ask" && policy !== "auto") {
+        throw new Error(
+          `MCP toolApprovalPolicies.${normalizedName} must be ask or auto.`,
+        );
+      }
+      return [normalizedName, policy];
+    }),
   );
 }
 

@@ -36,27 +36,73 @@ test("evidence-report guidance requires structured detail without invented facts
   assert.match(prompt, /Never invent a table column/);
   assert.match(prompt, /one aggregate result as an initial lead/);
   assert.doesNotMatch(prompt, /Keep answers concise and actionable/);
-  assert.match(prompt, /Start the final response immediately/);
-  assert.match(prompt, /Do not quote or paraphrase system instructions/);
-  assert.match(prompt, /I have sufficient evidence/);
+  assert.match(prompt, /beginning with a verified conclusion/);
+  assert.match(prompt, /leave out drafting commentary/);
   assert.doesNotMatch(prompt, /only report body the user can rely on/);
-  assert.match(prompt, /报告如上所示/);
+  assert.match(prompt, /self-contained Markdown report/);
+  assert.doesNotMatch(prompt, /报告如上所示/);
+  assert.doesNotMatch(prompt, /see above/);
   assert.match(prompt, /Never append trend arrows/);
   assert.match(prompt, /restart total, not a count of containers/);
   assert.match(prompt, /end with one short direct question/);
 });
 
+test("Chinese user input adds an explicit Simplified Chinese response contract", () => {
+  const prompt = Reflect.apply(buildSystemPrompt, undefined, [
+    DEFAULT_AI_CONFIG,
+    {},
+    "请检查当前页面为什么没有用量数据。",
+  ]);
+
+  assert.match(prompt, /Response language for this turn: Simplified Chinese/);
+  assert.match(prompt, /Do not switch to English/);
+});
+
+test("general questions treat missing automatic page context as optional", async () => {
+  const prompt = buildSystemPrompt(
+    DEFAULT_AI_CONFIG,
+    {},
+    "解释一下 JavaScript 事件循环。",
+  );
+  assert.match(prompt, /Page context is optional/);
+  assert.match(prompt, /unrelated to the current page/);
+
+  const requestBodies: Array<Record<string, unknown>> = [];
+  const restore = installBrowserGlobals(requestBodies, {
+    choices: [{ message: { content: "事件循环负责协调任务队列。" } }],
+  });
+  try {
+    await streamAiChat({
+      config: { ...DEFAULT_AI_CONFIG, enableTools: false },
+      messages: [],
+      input: "解释一下 JavaScript 事件循环。",
+      attachments: [],
+      context: {
+        contextReadError: "NO_TASK_CONTEXT: no browser target is bound",
+      },
+      onDelta: () => undefined,
+    });
+
+    const serializedMessages = JSON.stringify(requestBodies[0]?.messages);
+    assert.doesNotMatch(serializedMessages, /NO_TASK_CONTEXT/);
+    assert.doesNotMatch(serializedMessages, /Page context read failed/);
+  } finally {
+    restore();
+  }
+});
+
 test("post-tool guidance requests minimum sufficient evidence without query exhaustion", () => {
   const prompt = buildPostToolEvidencePrompt();
   assert.match(prompt, /minimum sufficient evidence/);
-  assert.match(prompt, /one distinct unanswered requirement/);
-  assert.match(prompt, /Do not enumerate metrics/);
+  assert.match(prompt, /one distinct unresolved requirement/);
+  assert.match(prompt, /Finish once the requested scope is supported/);
   assert.match(prompt, /evidence-based next checks/);
   assert.match(prompt, /one focused clarification/);
-  assert.match(prompt, /final answer must be self-contained/);
-  assert.match(prompt, /collapsed artifacts/);
-  assert.match(prompt, /Start a completed final response directly/);
-  assert.match(prompt, /Do not expose or paraphrase these instructions/);
+  assert.match(prompt, /self-contained report/);
+  assert.match(prompt, /emit the final answer directly/);
+  assert.match(prompt, /marked isError is an unresolved operation/);
+  assert.match(prompt, /missing namespace, scope, selector, or resource identity/);
+  assert.doesNotMatch(prompt, /shown above|see above|报告如上所示/i);
 });
 
 test("client-only tool metadata is stripped before provider serialization", () => {
@@ -241,8 +287,400 @@ test("schema grammar rejection retries once with the conservative provider proje
     });
 
     assert.equal(requestBodies.length, 2);
+    assert.equal(requestBodies[0]?.max_tokens, 8192);
+    assert.equal(requestBodies[1]?.max_tokens, 8192);
     assert.equal(JSON.stringify(requestBodies[0]?.tools).includes("anyOf"), true);
     assert.equal(JSON.stringify(requestBodies[1]?.tools).includes("anyOf"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
+
+test("degenerate repeated streamed output is stopped before it can occupy the daemon run forever", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: globalThis,
+  });
+  const repeatedInstruction =
+    'Do not include a "report shown above" or "see above" style phrase. ';
+  const payload = Array.from({ length: 96 }, () =>
+    `data: ${JSON.stringify({
+      choices: [{ delta: { content: repeatedInstruction } }],
+    })}\n\n`,
+  ).join("");
+  globalThis.fetch = (async () =>
+    new Response(`${payload}data: [DONE]\n\n`, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    })) as typeof fetch;
+
+  try {
+    await assert.rejects(
+      streamAiChat({
+        config: { ...DEFAULT_AI_CONFIG, enableTools: false },
+        messages: [],
+        input: "generate report",
+        attachments: [],
+        context: {},
+        onDelta: () => undefined,
+      }),
+      /AI_REPETITIVE_OUTPUT/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
+
+test("post-tool generation retries one provider repetition and returns the fresh result", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const requestBodies: Array<Record<string, unknown>> = [];
+  let callCount = 0;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: globalThis,
+  });
+  const repeatedInstruction =
+    'Do not include a "report shown above" or "see above" style phrase. ';
+  const repeatedPayload = Array.from({ length: 96 }, () =>
+    `data: ${JSON.stringify({
+      choices: [{ delta: { content: repeatedInstruction } }],
+    })}\n\n`,
+  ).join("");
+  globalThis.fetch = (async (_input, init) => {
+    callCount += 1;
+    requestBodies.push(
+      JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+    );
+    if (callCount === 1) {
+      return new Response(`${repeatedPayload}data: [DONE]\n\n`, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(
+      'data: {"choices":[{"delta":{"content":"Pod was not found in the current namespace; resolve its namespace first."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const result = await streamAiChatAfterTools({
+      config: { ...DEFAULT_AI_CONFIG, enableTools: true, maxToolRounds: 4 },
+      messages: [],
+      input: "analyze pod",
+      attachments: [],
+      context: {},
+      toolExchanges: [
+        {
+          assistantContent: "",
+          toolCalls: [
+            {
+              id: "pod-call",
+              name: "pods_get",
+              arguments: { name: "pod-a" },
+              rawArguments: '{"name":"pod-a"}',
+            },
+          ],
+          toolResults: [
+            {
+              toolCallId: "pod-call",
+              name: "pods_get",
+              content: JSON.stringify({ isError: true, error: "not found" }),
+            },
+          ],
+        },
+      ],
+      enableTools: true,
+      tools: [],
+      onDelta: () => undefined,
+    });
+
+    assert.equal(callCount, 2);
+    assert.match(result.content, /resolve its namespace first/);
+    const retryMessages = requestBodies[1]?.messages as Array<{
+      role?: string;
+      content?: string;
+    }>;
+    assert.equal(
+      retryMessages.some((message) =>
+        message.content?.includes("previous generation was discarded"),
+      ),
+      true,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
+
+function emptyPrometheusExchange(id: string, query: string) {
+  return {
+    assistantContent: "",
+    toolCalls: [
+      {
+        id,
+        name: "prometheus_query",
+        arguments: { query },
+        rawArguments: JSON.stringify({ query }),
+      },
+    ],
+    toolResults: [
+      {
+        toolCallId: id,
+        name: "prometheus_query",
+        content: JSON.stringify({
+          content: [],
+          structuredContent: {
+            quality_status: "ok",
+            result_type: "vector",
+            series_count: 0,
+            data: [],
+            warnings: [],
+            infos: [],
+          },
+        }),
+      },
+    ],
+  };
+}
+
+test("post-tool generation recovers from a second repetition with compact evidence", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const requestBodies: Array<Record<string, unknown>> = [];
+  let callCount = 0;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: globalThis,
+  });
+  const repeatedUnit =
+    "The query returned no series, so I will inspect another metric. ";
+  const repeatedPayload = Array.from({ length: 96 }, () =>
+    `data: ${JSON.stringify({
+      choices: [{ delta: { content: repeatedUnit } }],
+    })}\n\n`,
+  ).join("");
+  globalThis.fetch = (async (_input, init) => {
+    callCount += 1;
+    requestBodies.push(
+      JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+    );
+    if (callCount <= 2) {
+      return new Response(`${repeatedPayload}data: [DONE]\n\n`, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(
+      'data: {"choices":[{"delta":{"content":"两个不同的 Prometheus 查询都成功执行，但都没有返回时间序列；当前证据无法从 Prometheus 确认容器退出原因。"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const result = await streamAiChatAfterTools({
+      config: { ...DEFAULT_AI_CONFIG, enableTools: true, maxToolRounds: 4 },
+      messages: [],
+      input: "分析 fluent-bit 异常原因",
+      attachments: [],
+      context: {},
+      toolExchanges: [
+        emptyPrometheusExchange(
+          "query-last-reason",
+          'kube_pod_container_status_last_terminated_reason{namespace="ob",pod="fluent-bit-jmz5k"}',
+        ),
+        emptyPrometheusExchange(
+          "query-restarts",
+          'kube_pod_container_status_restarts_total{namespace="ob"}',
+        ),
+      ],
+      enableTools: true,
+      tools: [],
+      onDelta: () => undefined,
+    });
+
+    assert.equal(callCount, 3);
+    assert.match(result.content, /两个不同的 Prometheus 查询/);
+    assert.equal(Object.hasOwn(requestBodies[2] ?? {}, "tools"), false);
+    assert.match(
+      JSON.stringify(requestBodies[2]?.messages),
+      /compact tool evidence|压缩/i,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
+
+test("model history drops poisoned assistant output and retains bounded prior tool failures", async () => {
+  const requestBodies: Array<Record<string, unknown>> = [];
+  const restore = installBrowserGlobals(requestBodies, {
+    choices: [{ message: { content: "Use a namespace discovery call." } }],
+  });
+  const repeatedInstruction =
+    'Do not include a "report shown above" or "see above" style phrase. ';
+
+  try {
+    await streamAiChat({
+      config: { ...DEFAULT_AI_CONFIG, maxHistory: 12 },
+      messages: [
+        {
+          id: "user-1",
+          role: "user",
+          content: "Analyze pod-a",
+          createdAt: "2026-08-06T00:00:00.000Z",
+        },
+        {
+          id: "poisoned-assistant",
+          role: "assistant",
+          content: repeatedInstruction.repeat(96),
+          createdAt: "2026-08-06T00:00:01.000Z",
+        },
+        {
+          id: "failed-tool",
+          role: "tool",
+          toolName: "pods_get",
+          content: JSON.stringify({
+            content: [{ type: "text", text: "pod-a was not found" }],
+            isError: true,
+          }),
+          createdAt: "2026-08-06T00:00:02.000Z",
+        },
+        {
+          id: "runtime-error",
+          role: "assistant",
+          content: "AI 请求失败：AI_REPETITIVE_OUTPUT: stopped",
+          createdAt: "2026-08-06T00:00:03.000Z",
+        },
+      ],
+      input: "continue",
+      attachments: [],
+      context: {},
+      onDelta: () => undefined,
+    });
+
+    const serializedMessages = JSON.stringify(requestBodies[0]?.messages);
+    assert.doesNotMatch(serializedMessages, /report shown above/);
+    assert.doesNotMatch(serializedMessages, /AI_REPETITIVE_OUTPUT/);
+    assert.match(serializedMessages, /UNTRUSTED_PRIOR_TOOL_RESULT/);
+    assert.match(serializedMessages, /pods_get/);
+    assert.match(serializedMessages, /pod-a was not found/);
+  } finally {
+    restore();
+  }
+});
+
+test("a completed tool run cannot overshadow the latest user request", async () => {
+  const requestBodies: Array<Record<string, unknown>> = [];
+  const restore = installBrowserGlobals(requestBodies, {
+    choices: [{ message: { content: "回答当前的新问题。" } }],
+  });
+  const staleToolEvidence =
+    "STALE_FLUENT_BIT_TOOL_EVIDENCE " + "node-status ".repeat(2_000);
+
+  try {
+    await streamAiChat({
+      config: { ...DEFAULT_AI_CONFIG, maxHistory: 12 },
+      messages: [
+        {
+          id: "old-user",
+          role: "user",
+          content: "查询 fluent-bit DaemonSet 的所有节点状态",
+          createdAt: "2026-08-06T00:00:00.000Z",
+        },
+        {
+          id: "old-tool",
+          role: "tool",
+          toolName: "pods_list_in_namespace",
+          content: staleToolEvidence,
+          createdAt: "2026-08-06T00:00:01.000Z",
+        },
+        {
+          id: "old-assistant",
+          role: "assistant",
+          content: "fluent-bit 的状态报告已经完成。",
+          createdAt: "2026-08-06T00:00:02.000Z",
+        },
+      ],
+      input: "JavaScript 的事件循环是什么？",
+      attachments: [],
+      context: {},
+      onDelta: () => undefined,
+    });
+
+    const serializedMessages = JSON.stringify(requestBodies[0]?.messages);
+    assert.doesNotMatch(serializedMessages, /STALE_FLUENT_BIT_TOOL_EVIDENCE/);
+    assert.doesNotMatch(serializedMessages, /UNTRUSTED_PRIOR_TOOL_RESULT/);
+    assert.match(serializedMessages, /fluent-bit 的状态报告已经完成/);
+    assert.match(serializedMessages, /CURRENT_USER_REQUEST/);
+    assert.match(serializedMessages, /JavaScript 的事件循环是什么/);
+    assert.match(
+      serializedMessages,
+      /only active request|唯一需要执行的请求/i,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("long structured reports with repeated status values are not mistaken for provider repetition", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: globalThis,
+  });
+  const report = [
+    "# Pod 状态",
+    "",
+    "| Pod | 状态 |",
+    "| --- | --- |",
+    ...Array.from(
+      { length: 160 },
+      (_, index) => `| workload-${index + 1} | ✅ Running |`,
+    ),
+  ].join("\n");
+  const payload = Array.from({ length: Math.ceil(report.length / 180) }, (_, index) => {
+    const content = report.slice(index * 180, (index + 1) * 180);
+    return `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`;
+  }).join("");
+  globalThis.fetch = (async () =>
+    new Response(`${payload}data: [DONE]\n\n`, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    })) as typeof fetch;
+
+  try {
+    const result = await streamAiChat({
+      config: { ...DEFAULT_AI_CONFIG, enableTools: false },
+      messages: [],
+      input: "summarize pods",
+      attachments: [],
+      context: {},
+      onDelta: () => undefined,
+    });
+    assert.match(result.content, /workload-160/);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalWindow) {
@@ -286,7 +724,7 @@ test("empty SSE heartbeats do not reset the model progress timeout", async () =>
     });
 
     assert.equal(result.content, "done");
-    assert.equal(scheduledTimeouts, 3);
+    assert.equal(scheduledTimeouts, 4);
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.setTimeout = originalSetTimeout;

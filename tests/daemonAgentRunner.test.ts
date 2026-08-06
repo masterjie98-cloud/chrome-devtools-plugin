@@ -67,6 +67,42 @@ test("daemon Agent runs are isolated per conversation and survive requester life
   assert.equal(JSON.stringify(persisted).includes("secret-only-in-memory"), false);
 });
 
+test("daemon Agent skips automatic page reads when a chat has no browser binding", async () => {
+  let preparedContext: unknown;
+  let executeToolCount = 0;
+  const runner = new DaemonAgentRunner(async (params) => {
+    preparedContext = await params.prepareContext?.(params.context);
+    const session = finalizeAgentSession(
+      createAgentSessionSnapshot("internal", params.input),
+      "completed",
+      "answered without page context",
+    );
+    return {
+      finalContent: "answered without page context",
+      session,
+      status: "completed",
+    };
+  });
+  const events: DaemonAgentEventPayload[] = [];
+  const unboundPayload = payload("run-unbound", "conversation-unbound");
+  unboundPayload.executionBinding = undefined;
+  unboundPayload.config.autoReadPage = true;
+  unboundPayload.config.includePageContext = true;
+
+  runner.start("profile-a", unboundPayload, {
+    executeTool: async () => {
+      executeToolCount += 1;
+      return {};
+    },
+    emit: (event) => events.push(event),
+    persistSession: () => undefined,
+  });
+
+  await waitFor(() => events.some((event) => event.kind === "completed"));
+  assert.equal(executeToolCount, 0);
+  assert.deepEqual(preparedContext, {});
+});
+
 test("daemon Agent cancellation is scoped to one run", async () => {
   let observedAbort = false;
   const runner = new DaemonAgentRunner(async (params: RunAutonomousAgentSessionParams) => {
@@ -246,11 +282,11 @@ test("cancelling a pending budget decision releases the conversation for the nex
   );
 });
 
-test("daemon Agent stops a volatile external MCP duplicate loop after two executions", async () => {
+test("daemon Agent stops a volatile external MCP duplicate loop before a second execution", async () => {
   const externalToolName =
     "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
   const responses = [
-    ...Array.from({ length: 3 }, (_, index) => ({
+    ...Array.from({ length: 2 }, (_, index) => ({
       choices: [
         {
           message: {
@@ -363,14 +399,14 @@ test("daemon Agent stops a volatile external MCP duplicate loop after two execut
         event.kind === "completed" &&
         event.runId === "run-external-repeat",
     );
-    assert.equal(executionCount, 2);
-    assert.equal(toolMessages.length, 2);
+    assert.equal(executionCount, 1);
+    assert.equal(toolMessages.length, 1);
     assert.equal(completed?.kind, "completed");
     if (completed?.kind === "completed") {
-      assert.equal(completed.result.status, "blocked");
-      assert.match(completed.result.finalContent, /无进展循环/);
+      assert.equal(completed.result.status, "completed");
+      assert.match(completed.result.finalContent, /停止重复查询/);
     }
-    assert.equal(requestBodies.length, 4);
+    assert.equal(requestBodies.length, 3);
     assert.equal(
       Object.hasOwn(requestBodies.at(-1) ?? {}, "tools"),
       false,

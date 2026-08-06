@@ -105,6 +105,38 @@ test("result arbiter does not turn ordinary factual answers into browser tasks",
   );
 });
 
+test("result arbiter does not combine MCP return wording with a negated browser clause", () => {
+  const state = createAgentResultEvidenceState(
+    "只使用已启用的 k8s-dev MCP 查询 Pod。如果首次查询返回 isError，修正 namespace 后重试。禁止调用任何浏览器页面工具。",
+  );
+
+  assert.equal(state.requestedBrowserEffect, false);
+  assert.deepEqual(
+    arbitrateAgentFinalResult(
+      state,
+      "## Pod 报告\n\nMCP 查询已经完成，并保留了错误与限制说明。",
+    ),
+    { accepted: true },
+  );
+});
+
+test("result arbiter still recognizes explicit browser and network mutations", () => {
+  assert.equal(
+    createAgentResultEvidenceState("在页面上点击保存按钮").requestedBrowserEffect,
+    true,
+  );
+  assert.equal(
+    createAgentResultEvidenceState("拦截 Network 请求并 mock 接口响应")
+      .requestedBrowserEffect,
+    true,
+  );
+  assert.equal(
+    createAgentResultEvidenceState("不要点击页面按钮，只查询 MCP")
+      .requestedBrowserEffect,
+    false,
+  );
+});
+
 test("result arbiter treats a saved-cursor activity summary as read-only evidence", () => {
   const state = createAgentResultEvidenceState(
     "刚才页面发生了什么变化？只读取监听开始后保存游标之后的增量摘要，不要全量读取 Network。",

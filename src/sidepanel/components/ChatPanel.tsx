@@ -53,8 +53,8 @@ import {
   isDelegatedTaskOrphaned,
   type DelegatedTaskSnapshot,
 } from "../../shared/collaborationTasks";
-import type { ActiveTabSnapshot } from "../../shared/wsProtocol";
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
+import type { AgentSessionSnapshot } from "../../shared/agentSession";
 import {
   contextUsagePercent,
   type AiContextUsageCategory,
@@ -86,6 +86,7 @@ import type {
   ChatConversationSummary,
   ChatMessage,
   ChatSendMode,
+  ChatSendTargetChoice,
   ExecutionTaskBinding,
   PendingToolApproval,
   PendingAgentBudgetRequest,
@@ -93,6 +94,7 @@ import type {
 } from "../types";
 import { LocalUpdateAlert, useLocalUpdateStatus } from "./LocalUpdateBanner";
 import { MarkdownContent } from "./MarkdownContent";
+import { getDelegatedTaskPhasePresentation } from "../services/delegatedTaskPresentation";
 
 interface ChatPanelProps {
   messages: ChatMessage[];
@@ -113,6 +115,7 @@ interface ChatPanelProps {
   externalMcpServers: ExternalMcpServerSummary[];
   contextLabel: string;
   contextUsage?: AiContextUsageSnapshot;
+  activeAgentSession?: AgentSessionSnapshot;
   streamingMessageId?: string;
   pendingToolApprovals: PendingToolApproval[];
   pendingAgentBudgetRequest?: PendingAgentBudgetRequest;
@@ -121,7 +124,7 @@ interface ChatPanelProps {
   activeExecutionBinding?: ExecutionTaskBinding;
   unavailableTargetTabIds: ReadonlySet<number>;
   backgroundConversationWork: BackgroundConversationWork[];
-  selectedToolTarget?: ActiveTabSnapshot;
+  conversationTarget?: ExecutionTaskBinding["target"];
   foregroundTab?: BrowserTargetTab;
   activityMonitor?: {
     cursor: BrowserActivityCursor;
@@ -148,6 +151,7 @@ interface ChatPanelProps {
     value: string,
     attachments: ChatImageAttachment[],
     mode: ChatSendMode,
+    targetChoice: ChatSendTargetChoice,
   ) => boolean;
   onStop: () => void;
   onChangeModelProfile: (profileId: string) => void;
@@ -208,6 +212,7 @@ export function ChatPanel({
   externalMcpServers,
   contextLabel,
   contextUsage,
+  activeAgentSession,
   streamingMessageId,
   pendingToolApprovals,
   pendingAgentBudgetRequest,
@@ -216,7 +221,7 @@ export function ChatPanel({
   activeExecutionBinding,
   unavailableTargetTabIds,
   backgroundConversationWork,
-  selectedToolTarget,
+  conversationTarget,
   foregroundTab,
   activityMonitor,
   queuedMessages,
@@ -264,6 +269,12 @@ export function ChatPanel({
   const [expandedToolMessages, setExpandedToolMessages] = useState<Set<string>>(() => new Set());
   const [composerFocused, setComposerFocused] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string>();
+  const [pendingTargetSubmission, setPendingTargetSubmission] = useState<{
+    input: string;
+    attachments: ChatImageAttachment[];
+    mode: ChatSendMode;
+    wasAtBottom: boolean;
+  }>();
   const [historyOpen, setHistoryOpen] = useState(false);
   const activityMonitorAnchorMessageId = useMemo(
     () =>
@@ -316,6 +327,7 @@ export function ChatPanel({
     setHistoryOpen(false);
     setDelegatedInboxOpen(false);
     setBackgroundWorkOpen(false);
+    setPendingTargetSubmission(undefined);
     draftBeforeEditRef.current = "";
   }, [activeConversationId]);
 
@@ -411,9 +423,14 @@ export function ChatPanel({
     }
   };
 
-  const composerBlocked = busy && !agentBusy;
+  const composerBlocked =
+    (busy && !agentBusy) || Boolean(pendingTargetSubmission);
   const hasDraft = Boolean(draftValue.trim() || attachments.length);
   const shortcutState = getChatShortcutState(agentBusy, runningTool);
+  const conversationTargetMismatch =
+    conversationTarget?.tabId !== undefined &&
+    foregroundTab?.id !== undefined &&
+    conversationTarget.tabId !== foregroundTab.id;
   const filteredConversations = useMemo(() => {
     const query = historyQuery.trim().toLocaleLowerCase();
     if (!query) return conversations;
@@ -461,12 +478,47 @@ export function ChatPanel({
     }
 
     const effectiveMode = mode ?? (agentBusy ? "queue" : "normal");
-    if (!onSend(next, attachments, effectiveMode)) {
+    if (conversationTargetMismatch) {
+      setPendingTargetSubmission({
+        input: next,
+        attachments: [...attachments],
+        mode: effectiveMode,
+        wasAtBottom,
+      });
+      return;
+    }
+    if (!onSend(next, attachments, effectiveMode, "conversation")) {
       return;
     }
     onDraftChange("");
     setAttachments([]);
     if (wasAtBottom) {
+      setAutoScroll(true);
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(scrollToBottom);
+      });
+    }
+  };
+
+  const sendPendingTargetSubmission = (
+    targetChoice: ChatSendTargetChoice,
+  ) => {
+    const pending = pendingTargetSubmission;
+    if (
+      !pending ||
+      !onSend(
+        pending.input,
+        pending.attachments,
+        pending.mode,
+        targetChoice,
+      )
+    ) {
+      return;
+    }
+    setPendingTargetSubmission(undefined);
+    onDraftChange("");
+    setAttachments([]);
+    if (pending.wasAtBottom) {
       setAutoScroll(true);
       window.requestAnimationFrame(() => {
         window.requestAnimationFrame(scrollToBottom);
@@ -599,6 +651,7 @@ export function ChatPanel({
     const expanded = expandedToolMessages.has(message.id);
     const toolDisplayName = getToolDisplayName(message);
     const externalMcp = message.toolSource === "external_mcp";
+    const failed = isFailedToolMessage(message);
 
     return (
       <div className="tool-message-body">
@@ -628,7 +681,13 @@ export function ChatPanel({
             ) : null}
           </span>
           <span className="tool-message-summary">
-            {getToolMessageSummary(message)}
+            <span>{getToolMessageSizeSummary(message)}</span>
+            <span aria-hidden="true">·</span>
+            <span
+              className={`tool-message-status is-${failed ? "failed" : "success"}`}
+            >
+              {failed ? "失败" : "完成"}
+            </span>
             <RightOutlined
               className={`disclosure-chevron${expanded ? " is-expanded" : ""}`}
               aria-hidden="true"
@@ -848,21 +907,15 @@ export function ChatPanel({
             )}
             onFocus={onFocusExecutionTarget}
           />
-        ) : selectedToolTarget?.tabId !== undefined &&
-          selectedToolTarget.tabId !== foregroundTab?.id ? (
+        ) : conversationTarget?.tabId !== undefined &&
+          conversationTarget.tabId !== foregroundTab?.id ? (
           <ExecutionTargetBar
-            target={{
-              tabId: selectedToolTarget.tabId,
-              windowId: selectedToolTarget.windowId,
-              targetId: selectedToolTarget.targetId,
-              title: selectedToolTarget.title,
-              url: selectedToolTarget.url,
-            }}
+            target={conversationTarget}
             mode="tool"
             foregroundTab={foregroundTab}
             queuedCount={0}
             unavailable={unavailableTargetTabIds.has(
-              selectedToolTarget.tabId,
+              conversationTarget.tabId,
             )}
             onFocus={onFocusExecutionTarget}
           />
@@ -883,7 +936,11 @@ export function ChatPanel({
             key={message.id}
           >
             <article
-              className={`chat-message chat-message-${message.role} chat-message-source-${message.source ?? "unknown"}`}
+              className={`chat-message chat-message-${message.role} chat-message-source-${message.source ?? "unknown"}${
+                message.role === "tool"
+                  ? ` tool-message-is-${isFailedToolMessage(message) ? "failed" : "success"}`
+                  : ""
+              }`}
               aria-label={
                 message.role === "user"
                   ? "你的消息"
@@ -909,13 +966,37 @@ export function ChatPanel({
                 />
               ) : (
                 <>
-                  {message.source === "extension_ai" ? (
-                    <div className="chat-meta">
+                  {message.role !== "tool" &&
+                  (message.source === "extension_ai" ||
+                    message.role === "user") ? (
+                    <div
+                      className={`chat-meta${
+                        message.role === "user" ? " is-user" : ""
+                      }`}
+                    >
                       <div className="chat-meta-labels">
-                        <Typography.Text type="secondary">
-                          插件 AI
-                        </Typography.Text>
+                        {message.source === "extension_ai" ? (
+                          <Typography.Text type="secondary">
+                            插件 AI
+                          </Typography.Text>
+                        ) : null}
+                        {message.role === "assistant" && message.model ? (
+                          <Typography.Text
+                            className="chat-message-model"
+                            type="secondary"
+                            title={message.model}
+                          >
+                            {message.model}
+                          </Typography.Text>
+                        ) : null}
                       </div>
+                      <time
+                        className="chat-message-time"
+                        dateTime={message.createdAt}
+                        title={formatChatMessageFullTime(message.createdAt)}
+                      >
+                        {formatChatMessageTime(message.createdAt)}
+                      </time>
                     </div>
                   ) : null}
                   {renderMessageContent(message)}
@@ -988,6 +1069,9 @@ export function ChatPanel({
           </div>
           );
         })}
+        {activeAgentSession?.status === "running" ? (
+          <AgentRuntimeBar session={activeAgentSession} />
+        ) : null}
         {!autoScroll ? (
           <Button
             className="chat-scroll-bottom"
@@ -1001,6 +1085,17 @@ export function ChatPanel({
       </div>
 
       <div className="chat-bottom-stack">
+        {pendingTargetSubmission &&
+        conversationTarget &&
+        foregroundTab ? (
+          <TargetBindingDecisionCard
+            conversationTarget={conversationTarget}
+            foregroundTab={foregroundTab}
+            activeTask={Boolean(activeExecutionBinding)}
+            onCancel={() => setPendingTargetSubmission(undefined)}
+            onResolve={sendPendingTargetSubmission}
+          />
+        ) : null}
         {pendingAgentBudgetRequest ? (
           <AgentBudgetDecisionCard
             pending={pendingAgentBudgetRequest}
@@ -1179,7 +1274,9 @@ export function ChatPanel({
           }}
           disabled={composerBlocked}
           placeholder={
-            editingMessageId
+            pendingTargetSubmission
+              ? "请先选择这条消息使用哪个 Tab"
+              : editingMessageId
               ? "编辑消息；发送后创建新分支"
               : agentBusy
               ? "继续输入；Enter 排队，⌘/Ctrl + Enter 强制发送"
@@ -1673,6 +1770,120 @@ export function ChatPanel({
   );
 }
 
+function TargetBindingDecisionCard({
+  conversationTarget,
+  foregroundTab,
+  activeTask,
+  onCancel,
+  onResolve,
+}: {
+  conversationTarget: ExecutionTaskBinding["target"];
+  foregroundTab: BrowserTargetTab;
+  activeTask: boolean;
+  onCancel: () => void;
+  onResolve: (choice: ChatSendTargetChoice) => void;
+}) {
+  const cardRef = useRef<HTMLElement>(null);
+  const [detailsExpanded, setDetailsExpanded] = useState(false);
+  const titleId = "target-binding-decision-title";
+  const descriptionId = "target-binding-decision-description";
+  const conversationLabel =
+    conversationTarget.title?.trim() ||
+    formatTaskTargetHost(conversationTarget.url) ||
+    `Tab ${conversationTarget.tabId}`;
+  const foregroundLabel =
+    foregroundTab.title?.trim() ||
+    formatTaskTargetHost(foregroundTab.url) ||
+    `Tab ${foregroundTab.id}`;
+
+  useEffect(() => {
+    cardRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  return (
+    <section
+      ref={cardRef}
+      className="tool-approval-card target-binding-decision-card"
+      role="alertdialog"
+      aria-live="assertive"
+      aria-labelledby={titleId}
+      aria-describedby={descriptionId}
+      tabIndex={-1}
+    >
+      <button
+        type="button"
+        className="tool-approval-summary-toggle"
+        onClick={() => setDetailsExpanded((current) => !current)}
+        aria-expanded={detailsExpanded}
+        aria-controls="target-binding-decision-details"
+      >
+        <span className="tool-approval-title">
+          <AimOutlined aria-hidden="true" />
+          <span id={titleId}>选择消息目标页</span>
+          <span className="tool-approval-risk">需确认</span>
+        </span>
+        <RightOutlined
+          className={`disclosure-chevron${detailsExpanded ? " is-expanded" : ""}`}
+          aria-hidden="true"
+        />
+      </button>
+      <div className="tool-approval-prompt-row">
+        <Typography.Text id={descriptionId} className="tool-approval-copy">
+          当前对话绑定页与正在浏览页不同，请选择这条消息使用哪个页面。
+        </Typography.Text>
+        <div className="tool-approval-actions">
+          <Button size="small" onClick={onCancel}>
+            取消
+          </Button>
+          <Button
+            size="small"
+            onClick={() => onResolve("conversation")}
+          >
+            继续原 Tab
+          </Button>
+          <Button
+            size="small"
+            onClick={() => onResolve("new_conversation")}
+          >
+            新建对话并发送
+          </Button>
+          <Button
+            size="small"
+            type="primary"
+            onClick={() => onResolve("foreground")}
+          >
+            改绑当前 Tab
+          </Button>
+        </div>
+      </div>
+      {detailsExpanded ? (
+        <div
+          id="target-binding-decision-details"
+          className="tool-approval-body"
+        >
+          <div className="tool-approval-detail-row" role="note">
+            <strong>原对话目标</strong>
+            <span>
+              {conversationLabel} · Tab {conversationTarget.tabId}
+            </span>
+          </div>
+          <div className="tool-approval-detail-row" role="note">
+            <strong>当前浏览页面</strong>
+            <span>
+              {foregroundLabel} · Tab {foregroundTab.id}
+            </span>
+          </div>
+          {activeTask ? (
+            <div className="tool-approval-run-scope" role="note">
+              当前运行中的任务仍固定在原 Tab，不会被这次选择迁移。
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function AgentBudgetDecisionCard({
   pending,
   onResolve,
@@ -2004,6 +2215,63 @@ function ToolApprovalCard({
   );
 }
 
+const AGENT_PHASE_LABELS: Record<
+  NonNullable<AgentSessionSnapshot["phase"]>,
+  string
+> = {
+  starting: "正在启动",
+  reading_context: "正在读取上下文",
+  model_planning: "AI 正在规划",
+  model_analysis: "AI 正在分析",
+  tool_execution: "正在执行工具",
+  waiting_approval: "等待审批",
+  summarizing: "正在整理结果",
+  cancelling: "正在停止",
+  completed: "已完成",
+  blocked: "已阻塞",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+function AgentRuntimeBar({
+  session,
+}: {
+  session: AgentSessionSnapshot;
+}): ReactNode {
+  const diagnostics = session.diagnostics;
+  const heartbeatAt = diagnostics?.lastHeartbeatAt ?? session.heartbeatAt;
+  const parsedHeartbeat = heartbeatAt ? Date.parse(heartbeatAt) : Number.NaN;
+  const elapsedSeconds = Number.isFinite(parsedHeartbeat)
+    ? Math.max(0, Math.round((Date.now() - parsedHeartbeat) / 1_000))
+    : 0;
+  const phase = session.phase ?? diagnostics?.phase ?? "starting";
+  const title = [
+    `阶段：${AGENT_PHASE_LABELS[phase]}`,
+    `最近心跳：${heartbeatAt ?? "未知"}`,
+    `模型请求：${diagnostics?.modelRequestCount ?? 0}`,
+    `工具完成：${diagnostics?.completedToolCallCount ?? 0}/${diagnostics?.toolCallCount ?? 0}`,
+    diagnostics?.lastStatus ? `最近状态：${diagnostics.lastStatus}` : undefined,
+    session.runtimeEnvironment
+      ? `运行环境：${session.runtimeEnvironment.model} · ${session.runtimeEnvironment.toolScope}`
+      : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return (
+    <div className="agent-runtime-bar" title={title} role="status">
+      <span className="agent-runtime-pulse" aria-hidden="true" />
+      <strong>{AGENT_PHASE_LABELS[phase]}</strong>
+      <span>心跳 {elapsedSeconds}s 前</span>
+      <span>
+        工具 {diagnostics?.completedToolCallCount ?? 0}/
+        {diagnostics?.toolCallCount ?? 0}
+      </span>
+      <span>模型请求 {diagnostics?.modelRequestCount ?? 0}</span>
+    </div>
+  );
+}
+
 function ExecutionTargetBar({
   target,
   mode,
@@ -2050,8 +2318,8 @@ function ExecutionTargetBar({
             ? `原目标：${taskTitle}；页面相关工具不会再发送到该 Tab`
             : viewingAnotherTab
             ? mode === "task"
-              ? `当前浏览：${foregroundTitle}；新消息将作为独立任务排队到此页`
-              : `当前浏览：${foregroundTitle}；后续工具调用仍发送到此页`
+              ? `当前浏览：${foregroundTitle}；当前任务仍固定在原页，发送前会让你选择目标`
+              : `当前浏览：${foregroundTitle}；当前对话仍绑定此页，发送前会让你选择目标`
             : `任务固定在 Tab ${target.tabId}${
                 queuedCount ? ` · 队列 ${queuedCount}` : ""
               }`}
@@ -2345,13 +2613,17 @@ function ContextUsageDetails({
   ).filter(([, tokens]) => tokens > 0);
 
   return (
-    <div className="context-usage-popover" aria-label="上下文占用明细">
+    <div className="context-usage-popover" aria-label="本次模型请求上下文明细">
       <div className="context-usage-heading">
-        <strong>上下文占用</strong>
+        <strong>本次模型请求上下文</strong>
         <span>{percentage}%</span>
       </div>
       <div className="context-usage-total">
-        约 {formatEstimatedTokenCount(report.estimatedInputTokens)} / {formatEstimatedTokenCount(report.contextWindowTokens)}
+        {report.source === "provider" ? "实际" : "约"}{" "}
+        {formatEstimatedTokenCount(report.estimatedInputTokens)} / {formatEstimatedTokenCount(report.contextWindowTokens)}
+      </div>
+      <div className="context-usage-compaction" role="note">
+        这里显示最近一次请求，不是聊天累计总量。完成轮次的原始工具结果会由最终回答中的结论替代，对话问题和结论仍会保留。
       </div>
       <div
         className="context-usage-meter"
@@ -2389,23 +2661,65 @@ function ContextUsageDetails({
       <div className="context-usage-reserve">
         输入预算 {formatEstimatedTokenCount(report.inputBudgetTokens)} · 输出预留 {formatEstimatedTokenCount(report.outputReserveTokens)}
       </div>
+      {report.providerUsage ? (
+        <div className="context-usage-provider" role="note">
+          Provider：输入 {formatEstimatedTokenCount(report.providerUsage.promptTokens)} · 输出 {formatEstimatedTokenCount(report.providerUsage.completionTokens)}
+          {report.providerUsage.cachedPromptTokens !== undefined
+            ? ` · 缓存 ${formatEstimatedTokenCount(report.providerUsage.cachedPromptTokens)}`
+            : ""}
+        </div>
+      ) : null}
       {report.omittedMessageCount > 0 || report.compactedMessageCount > 0 ? (
         <div className="context-usage-compaction" role="note">
           发送前已省略 {report.omittedMessageCount} 条消息、压缩 {report.compactedMessageCount} 条消息。
         </div>
       ) : null}
+      {report.compactionSteps?.length ? (
+        <div className="context-usage-steps">
+          {report.compactionSteps.map((step, index) => (
+            <div key={`${step.reason}-${index}`}>
+              {step.reason}：{formatEstimatedTokenCount(step.beforeTokens)} → {formatEstimatedTokenCount(step.afterTokens)}
+            </div>
+          ))}
+        </div>
+      ) : null}
       <div className="context-usage-note">
-        估算值；实际 token 数以当前模型的 tokenizer 为准。
+        {report.source === "provider"
+          ? "本次数字来自 Provider usage；分类占比按发送内容估算。"
+          : "估算值；Provider 未返回 usage 时以当前估算器为准。"}
       </div>
     </div>
   );
 }
 
-function getToolMessageSummary(message: ChatMessage): string {
+function getToolMessageSizeSummary(message: ChatMessage): string {
   const size = message.toolResultMeta?.truncated
     ? `${formatToolResultTokens(message, "displayed")}/${formatToolResultTokens(message, "original")} · 已截断`
     : formatToolResultTokens(message, "original");
-  return `${size} · ${isFailedToolMessage(message) ? "失败" : "完成"}`;
+  return size;
+}
+
+function formatChatMessageTime(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    return "";
+  }
+  const today = new Date();
+  const sameDay =
+    date.getFullYear() === today.getFullYear() &&
+    date.getMonth() === today.getMonth() &&
+    date.getDate() === today.getDate();
+  return new Intl.DateTimeFormat("zh-CN", {
+    ...(sameDay ? {} : { month: "2-digit", day: "2-digit" }),
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function formatChatMessageFullTime(value: string): string {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString("zh-CN") : "";
 }
 
 function getToolDisplayName(message: ChatMessage): string {
@@ -2633,14 +2947,10 @@ function DelegatedTaskCard({
   onRestore: (taskId: string) => void;
   onReject: (taskId: string) => void;
 }) {
-  const phaseLabels = {
-    pending: "待确认",
-    claimed: active ? "执行中" : queued ? "排队中" : "待恢复",
-    completed: "已完成",
-    failed: "未完成",
-    rejected: "已拒绝",
-    cancelled: "已取消",
-  } as const;
+  const phasePresentation = getDelegatedTaskPhasePresentation(task, {
+    active,
+    queued,
+  });
   const requestTypeLabel = task.request.requestType === "question" ? "问题" : "任务";
   const isInterrupted =
     task.phase === "claimed" && !active && !queued && !orphaned;
@@ -2657,8 +2967,8 @@ function DelegatedTaskCard({
             {task.requestItem.title}
           </Typography.Text>
         </div>
-        <Tag className={`delegated-task-phase is-${task.phase}`}>
-          {phaseLabels[task.phase]}
+        <Tag className={`delegated-task-phase is-${phasePresentation.tone}`}>
+          {phasePresentation.label}
         </Tag>
         <Tooltip title={copied ? "已复制" : "复制委托内容"}>
           <Button
@@ -2733,7 +3043,10 @@ function DelegatedTaskCard({
             {task.phase === "completed" ? (
               "插件 AI 已完成，结果已返回 Codex。"
             ) : (
-              <MarkdownContent content={task.result.summary} />
+              <MarkdownContent
+                content={task.result.summary}
+                repairFlattenedBlocks
+              />
             )}
           </div>
         ) : null}

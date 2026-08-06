@@ -84,6 +84,7 @@ import { getApprovalEgressDestinations } from "./services/approvalPresentation";
 import type {
   ChatConversationSummary,
   ChatSendMode,
+  ChatSendTargetChoice,
   ChatImageAttachment,
   ChatMessage,
   ExecutionTaskBinding,
@@ -1000,10 +1001,15 @@ export function App() {
           ...messages,
           {
             id: assistantMessageId,
+            runId: session.id,
+            conversationId,
             role: "assistant",
             source: "extension_ai",
             content,
             status,
+            ...(session.runtimeEnvironment?.model
+              ? { model: session.runtimeEnvironment.model }
+              : {}),
             createdAt: session.startedAt,
           },
         ];
@@ -1787,9 +1793,12 @@ export function App() {
     let deferredActivityCursor: BrowserActivityCursor | undefined;
     const assistantMessage = appendChat(
       {
+        runId: agentRunId,
+        conversationId: runConversationId,
         role: "assistant",
         source: "extension_ai",
         content: "",
+        model: runConfig.model,
         delegatedTaskId: delegatedTask?.taskId,
       },
       { syncToMcp: false, conversationId: runConversationId },
@@ -1921,6 +1930,11 @@ export function App() {
             }
             appendChat(
               {
+                runId: agentRunId,
+                conversationId: runConversationId,
+                turnId: message.turnId,
+                toolCallId: message.toolCallId,
+                assistantMessageId: message.assistantMessageId,
                 role: "tool",
                 content: message.content,
                 toolName: message.toolName,
@@ -2423,39 +2437,52 @@ export function App() {
     input: string,
     attachments: ChatImageAttachment[],
     mode: ChatSendMode,
+    targetChoice: ChatSendTargetChoice,
   ): boolean => {
     if (runningTool && activeAgentRuns.length === 0) {
       api.warning("当前页面工具仍在执行，请稍后发送。");
       return false;
     }
 
-    const selectedTarget =
-      conversationTargetRef.current ??
-      toStoredConversationTarget(
-        toActiveTabSnapshot(foregroundTab) ?? hubState.activeTab,
-      );
-    if (!selectedTarget) {
-      api.warning("请先打开一个可用页面，再发送这条消息。");
+    const foregroundTarget = toStoredConversationTarget(
+      toActiveTabSnapshot(foregroundTabRef.current ?? foregroundTab) ??
+        hubState.activeTab,
+    );
+    if (targetChoice !== "conversation" && !foregroundTarget) {
+      api.warning("当前浏览的页面已不可用，请重新选择一个可用 Tab。");
       return false;
     }
-    if (!conversationTargetRef.current) {
+    if (targetChoice === "new_conversation") {
+      clearChat();
+    }
+    const selectedTarget =
+      targetChoice === "conversation"
+        ? conversationTargetRef.current ?? foregroundTarget
+        : foregroundTarget;
+    if (
+      selectedTarget &&
+      (!conversationTargetRef.current ||
+        conversationTargetRef.current.tabId !== selectedTarget.tabId)
+    ) {
       replaceConversationTarget(selectedTarget);
+      replaceConversationActivityCursor(undefined);
       markTargetAvailable(selectedTarget.tabId);
     }
 
+    const submissionConversationId = conversationIdRef.current;
     const submission: QueuedChatSubmission = {
       id: createMessageId(),
-      conversationId: conversationIdRef.current,
+      conversationId: submissionConversationId,
       input,
       attachments: [...attachments],
       createdAt: new Date().toISOString(),
       executionBinding: createExecutionTaskBinding(
-        conversationIdRef.current,
+        submissionConversationId,
         selectedTarget,
       ),
     };
 
-    if (!agentRunRegistryRef.current.get(conversationIdRef.current)) {
+    if (!agentRunRegistryRef.current.get(submissionConversationId)) {
       void runChatSubmission(submission);
       return true;
     }
@@ -3177,12 +3204,17 @@ export function App() {
     const now = new Date().toISOString();
     const conversationId = createMessageId();
     const messages = createInitialChat();
+    const target = toStoredConversationTarget(
+      toActiveTabSnapshot(foregroundTabRef.current ?? foregroundTab) ??
+        hubState.activeTab,
+    );
     const nextConversation = createStoredConversation({
       id: conversationId,
       createdAt: now,
       updatedAt: now,
       messages,
       draft: "",
+      target,
       externalMcpSelection: DEFAULT_EXTERNAL_MCP_SELECTION,
     });
     const conversations = upsertPersistableConversation(
@@ -3527,6 +3559,15 @@ export function App() {
     currentContextUsage.contextWindowTokens === aiConfig.contextWindowTokens
       ? currentContextUsage
       : undefined;
+  const currentAgentSession = currentConversationRun
+    ? hubState.agentSessions.find(
+        (session) => session.id === currentConversationRun.runId,
+      )
+    : hubState.agentSessions.find(
+        (session) =>
+          session.status === "running" &&
+          session.executionBinding?.conversationId === activeConversationId,
+      );
 
   return (
     <ConfigProvider
@@ -3585,6 +3626,7 @@ export function App() {
                         Boolean(selectedElement),
                       )}
                       contextUsage={visibleContextUsage}
+                      activeAgentSession={currentAgentSession}
                       streamingMessageId={
                         currentConversationRun?.assistantMessageId
                       }
@@ -3607,9 +3649,7 @@ export function App() {
                       }
                       unavailableTargetTabIds={unavailableTargetTabIds}
                       backgroundConversationWork={backgroundConversationWork}
-                      selectedToolTarget={
-                        conversationTarget ? hubState.activeTab : undefined
-                      }
+                      conversationTarget={conversationTarget}
                       foregroundTab={foregroundTab}
                       activityMonitor={
                         conversationActivityCursor

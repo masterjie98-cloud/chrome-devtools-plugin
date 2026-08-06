@@ -41,6 +41,11 @@ export interface DaemonAgentConfig {
 
 export interface DaemonAgentMessage {
   id: string;
+  runId?: string;
+  turnId?: string;
+  toolCallId?: string;
+  assistantMessageId?: string;
+  conversationId?: string;
   role: "user" | "assistant" | "tool";
   content: string;
   createdAt: string;
@@ -125,6 +130,15 @@ export function toDaemonAgentMessages(
 ): DaemonAgentMessage[] {
   return messages.map((message) => ({
     id: message.id,
+    ...(message.runId ? { runId: message.runId } : {}),
+    ...(message.turnId ? { turnId: message.turnId } : {}),
+    ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+    ...(message.assistantMessageId
+      ? { assistantMessageId: message.assistantMessageId }
+      : {}),
+    ...(message.conversationId
+      ? { conversationId: message.conversationId }
+      : {}),
     role: message.role,
     content: message.content,
     createdAt: message.createdAt,
@@ -231,6 +245,7 @@ export interface DaemonAgentToolMessage {
   id: string;
   assistantMessageId: string;
   toolCallId: string;
+  turnId?: string;
   toolName: string;
   toolSource?: AgentToolClientMetadata["source"];
   toolDisplayName?: string;

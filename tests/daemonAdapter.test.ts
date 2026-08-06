@@ -441,6 +441,127 @@ test("MCP tool listing can exclude every local browser tool", async () => {
   }
 });
 
+test("external MCP approval survives page navigation because it is conversation-bound, not target-bound", async () => {
+  const sessionId = "external-approval-navigation";
+  const conversationId = "external-approval-conversation";
+  const externalToolName = "extmcp__fixture__query_1234567";
+  let callCount = 0;
+  const daemon = startPluginWebSocketServer(0, {
+    listTools: async () => [],
+    callTool: async (toolName, args) => {
+      callCount += 1;
+      return { toolName, args, ok: true };
+    },
+    getToolOrigin: (toolName) =>
+      toolName === externalToolName
+        ? {
+            externalMcpServerId: "fixture",
+            externalMcpServerName: "Fixture MCP",
+            externalMcpToolName: "query",
+          }
+        : undefined,
+  });
+  const address = await daemon.ready();
+  const ui = await connectRole(
+    `ws://${address.host}:${address.port}`,
+    "ui",
+    sessionId,
+  );
+
+  browserStateHub.startPluginConversation(conversationId, sessionId);
+  browserStateHub.setCurrentTab(
+    {
+      tabId: 101,
+      targetId: "target-before-approval",
+      url: "https://example.test/before",
+      title: "Before",
+      documentId: "document-before-approval",
+      navigationId: "navigation-before-approval",
+    },
+    sessionId,
+  );
+
+  try {
+    const approvalPromise = waitForCommand(ui, WS_COMMANDS.APPROVAL_REQUEST);
+    const resultPromise = callUiMcpTool(
+      ui,
+      "external-approval-call",
+      externalToolName,
+      { query: "up" },
+      {
+        taskId: conversationId,
+        conversationId,
+        target: {
+          tabId: 101,
+          targetId: "target-before-approval",
+        },
+        egressDestinations: ["fixture"],
+      },
+    );
+    const approval = await approvalPromise;
+    assert.equal(approval.payload.target, undefined);
+    assert.deepEqual(approval.payload.externalMcp, {
+      serverId: "fixture",
+      serverName: "Fixture MCP",
+      toolName: "query",
+    });
+
+    browserStateHub.setCurrentTab(
+      {
+        tabId: 202,
+        targetId: "target-after-approval",
+        url: "https://example.test/after",
+        title: "After",
+        documentId: "document-after-approval",
+        navigationId: "navigation-after-approval",
+      },
+      sessionId,
+    );
+    ui.send(
+      JSON.stringify({
+        requestId: approval.payload.approvalId,
+        command: WS_COMMANDS.APPROVAL_RESPONSE,
+        sentAt: new Date().toISOString(),
+        payload: {
+          approvalId: approval.payload.approvalId,
+          approved: true,
+          respondedAt: new Date().toISOString(),
+        },
+      }),
+    );
+
+    assert.deepEqual(await resultPromise, {
+      toolName: externalToolName,
+      args: { query: "up" },
+      ok: true,
+    });
+    assert.equal(callCount, 1);
+
+    await assert.rejects(
+      callUiMcpTool(
+        ui,
+        "external-stale-conversation-call",
+        externalToolName,
+        { query: "up" },
+        {
+          taskId: "stale-conversation",
+          conversationId: "stale-conversation",
+          target: {
+            tabId: 202,
+            targetId: "target-after-approval",
+          },
+          egressDestinations: ["fixture"],
+        },
+      ),
+      /STALE_CONTEXT.*conversationId/,
+    );
+    assert.equal(callCount, 1);
+  } finally {
+    ui.close();
+    await daemon.close();
+  }
+});
+
 test("daemon rejects a command above its message-specific byte budget", async () => {
   const daemon = startPluginWebSocketServer(0);
   const address = await daemon.ready();

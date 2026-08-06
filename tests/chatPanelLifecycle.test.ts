@@ -170,3 +170,51 @@ test("closed execution targets are shown as unavailable and cannot offer a stale
   assert.match(targetBar, /页面相关工具不会再发送到该 Tab/);
   assert.match(targetBar, /viewingAnotherTab && !unavailable/);
 });
+
+test("sending from a different foreground tab requires an explicit target choice", async () => {
+  const source = await readFile(
+    new URL("../src/sidepanel/components/ChatPanel.tsx", import.meta.url),
+    "utf8",
+  );
+  const bottomStack = source.slice(
+    source.indexOf('<div className="chat-bottom-stack">'),
+    source.indexOf(
+      '<div className={`chat-composer ${composerFocused ? "chat-composer-focused" : ""}`}>',
+    ),
+  );
+  const targetDecisionCard = source.slice(
+    source.indexOf("function TargetBindingDecisionCard("),
+    source.indexOf("function AgentBudgetDecisionCard("),
+  );
+
+  assert.match(source, /当前对话绑定页与正在浏览页不同/);
+  assert.match(source, /继续原 Tab/);
+  assert.match(source, /改绑当前 Tab/);
+  assert.match(source, /新建对话并发送/);
+  assert.match(bottomStack, /TargetBindingDecisionCard/);
+  assert.match(
+    targetDecisionCard,
+    /className="tool-approval-card target-binding-decision-card"/,
+  );
+  assert.doesNotMatch(source, /<Modal/);
+  assert.doesNotMatch(source, /新消息将作为独立任务排队到此页/);
+});
+
+test("a new chat binds the foreground tab without blocking general questions when no tab exists", async () => {
+  const source = await readFile(
+    new URL("../src/sidepanel/App.tsx", import.meta.url),
+    "utf8",
+  );
+  const clearChat = source.slice(
+    source.indexOf("const clearChat = () =>"),
+    source.indexOf("const startConversationBranch ="),
+  );
+  const handleSend = source.slice(
+    source.indexOf("const handleSendChat = ("),
+    source.indexOf("const processNextQueuedSubmission ="),
+  );
+
+  assert.match(clearChat, /const target = toStoredConversationTarget\(/);
+  assert.match(clearChat, /target,/);
+  assert.doesNotMatch(handleSend, /请先打开一个可用页面，再发送这条消息/);
+});

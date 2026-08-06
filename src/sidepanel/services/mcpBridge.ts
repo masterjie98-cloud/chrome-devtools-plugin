@@ -497,6 +497,19 @@ export class McpBridge {
     });
   }
 
+  async setExternalMcpToolPolicy(
+    serverId: string,
+    toolName: string,
+    patch: { enabled?: boolean; approval?: "inherit" | "ask" | "auto" },
+  ): Promise<ExternalMcpServerSummary[]> {
+    return this.requestExternalMcp({
+      requestId: createMessageId(),
+      command: WS_COMMANDS.EXTERNAL_MCP_SET_TOOL_POLICY,
+      sentAt: new Date().toISOString(),
+      payload: { serverId, toolName, ...patch },
+    });
+  }
+
   async testExternalMcpServer(
     serverId: string,
   ): Promise<ExternalMcpServerSummary[]> {
@@ -519,6 +532,7 @@ export class McpBridge {
           | typeof WS_COMMANDS.EXTERNAL_MCP_SET_ENABLED
           | typeof WS_COMMANDS.EXTERNAL_MCP_SET_READ_ONLY_TRUST
           | typeof WS_COMMANDS.EXTERNAL_MCP_SET_AUTO_APPROVE
+          | typeof WS_COMMANDS.EXTERNAL_MCP_SET_TOOL_POLICY
           | typeof WS_COMMANDS.EXTERNAL_MCP_TEST;
       }
     >,

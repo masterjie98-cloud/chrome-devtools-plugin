@@ -522,6 +522,7 @@ export const MCP_TOOL_OUTPUT_SCHEMAS = {
     compatibility: z.unknown(),
     activeTab: nullableUnknown,
     currentConversationId: outputString,
+    activeAgent: nullableUnknown,
     revision: z.number().int().nonnegative(),
   }),
   [MCP_TOOL_NAMES.BROWSER_ACTIVITY_START]: outputObject({

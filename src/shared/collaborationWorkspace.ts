@@ -1,5 +1,9 @@
 import { createMessageId } from "./messaging";
-import { sanitizeText, sanitizeUrl } from "./sanitize";
+import {
+  sanitizeMultilineText,
+  sanitizeText,
+  sanitizeUrl,
+} from "./sanitize";
 import { redactSensitiveData } from "./sensitiveData";
 
 export const COLLABORATION_WORKSPACE_VERSION = "collaboration-workspace-v1" as const;
@@ -412,7 +416,11 @@ function sanitizeJsonValue(value: unknown, depth: number): CollaborationJsonValu
     return value;
   }
   if (typeof value === "string") {
-    return sanitizeText(value, 4000);
+    // Collaboration content is payload data rather than compact metadata. It
+    // can contain a delegated Agent report, code, or other Markdown whose
+    // physical line breaks are semantically significant. Titles, tags, and
+    // top-level summaries still use sanitizeText and remain single-line.
+    return sanitizeMultilineText(value, 4000);
   }
   if (Array.isArray(value)) {
     if (value.length > MAX_ARRAY_ITEMS) {

@@ -79,6 +79,22 @@ test("assistant history repairs flattened headings, lists, and GFM table rows", 
   assert.match(html, /<td>monitor<\/td>/);
 });
 
+test("delegated task compatibility repair restores a flattened H1 report", () => {
+  const html = renderToStaticMarkup(
+    createElement(MarkdownContent, {
+      content:
+        "检测到重复读取并停止。 # Pod 复测报告 ## 结论 | 项目 | 状态 | | --- | --- | | user-container | CrashLoopBackOff |",
+      repairFlattenedBlocks: true,
+    }),
+  );
+
+  assert.match(html, /<h2[^>]*>Pod 复测报告<\/h2>/);
+  assert.match(html, /<h3[^>]*>结论<\/h3>/);
+  assert.match(html, /<table class="chat-markdown-table">/);
+  assert.match(html, /<td>user-container<\/td>/);
+  assert.doesNotMatch(html, /# Pod 复测报告/);
+});
+
 test("every Markdown surface repairs a GFM header split across physical lines", () => {
   const html = renderToStaticMarkup(
     createElement(MarkdownContent, {

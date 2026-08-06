@@ -447,9 +447,30 @@ export function AiSettingsDrawer({
 
         {/* ── 连接 ─────────────────────────────────────── */}
         <section hidden={settingsTab !== "local"} className="settings-tab-panel">
-        <Typography.Text className="settings-section-title">
-          连接
-        </Typography.Text>
+        <div className="settings-diagnostic-overview" aria-label="本机连接诊断摘要">
+          <div>
+            <Typography.Text strong>运行诊断</Typography.Text>
+            <Typography.Paragraph type="secondary">
+              先确认 daemon，再确认页面目标；版本、更新和本机凭据分别处理。
+            </Typography.Paragraph>
+          </div>
+          <div className="settings-diagnostic-grid">
+            <span>扩展</span>
+            <Typography.Text type="success">v{runningVersion} 已运行</Typography.Text>
+            <span>Daemon</span>
+            <Typography.Text type={daemonConnected ? "success" : "warning"}>
+              {daemonConnected ? "WebSocket 已连接" : "未连接，请先启动本机服务"}
+            </Typography.Text>
+            <span>页面目标</span>
+            <Typography.Text type={activeTargetLabel ? "success" : "secondary"}>
+              {activeTargetLabel || "尚未绑定可调试页面"}
+            </Typography.Text>
+            <span>页面上下文</span>
+            <Typography.Text type={pageContextSynced ? "success" : "secondary"}>
+              {pageContextSynced ? "已同步" : "等待首次观察"}
+            </Typography.Text>
+          </div>
+        </div>
 
         <div className="settings-connection-status" style={{ marginBottom: 12 }}>
           <div className="settings-connection-status__header">

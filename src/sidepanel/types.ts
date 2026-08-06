@@ -11,9 +11,17 @@ export type ChatMessageSource =
 
 export interface ChatMessage {
   id: string;
+  /** Stable projection keys. Chat bubbles can be rebuilt from the durable run. */
+  runId?: string;
+  turnId?: string;
+  toolCallId?: string;
+  assistantMessageId?: string;
+  conversationId?: string;
   role: ChatRole;
   content: string;
   createdAt: string;
+  /** Model that produced this assistant message, captured at run start. */
+  model?: string;
   source?: ChatMessageSource;
   delegatedTaskId?: string;
   toolName?: string;
@@ -81,6 +89,10 @@ export interface ExecutionTaskBinding {
 }
 
 export type ChatSendMode = "normal" | "queue" | "interrupt";
+export type ChatSendTargetChoice =
+  | "conversation"
+  | "foreground"
+  | "new_conversation";
 
 export interface ChatConversationSummary {
   id: string;

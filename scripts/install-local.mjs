@@ -57,6 +57,7 @@ const installRoot = resolveInstallRoot();
 const installedRuntimeRoot = join(installRoot, "runtime");
 const installedExtensionRoot = join(installRoot, "extension");
 const installedGuidePath = join(installRoot, "安装说明.md");
+const installedAiMcpGuidePath = join(installRoot, "让 AI 自动接入 MCP.md");
 const pidPath = join(installRoot, "daemon.pid");
 const manageServicePath = join(installedRuntimeRoot, "manage-local-service.mjs");
 const daemonServerPath = join(installedRuntimeRoot, "daemon", "server.js");
@@ -66,6 +67,7 @@ assertNodeVersion();
 await assertFile(join(sourceExtensionRoot, "manifest.json"));
 await assertFile(join(sourceRuntimeRoot, "daemon", "server.js"));
 await assertFile(join(sourceRuntimeRoot, "daemon", "printToken.js"));
+await assertFile(join(bundleRoot, "让 AI 自动接入 MCP.md"));
 
 if (dryRun) {
   process.stdout.write(
@@ -78,6 +80,7 @@ if (dryRun) {
         installRoot,
         extensionPath: installedExtensionRoot,
         daemonEntry: join(installedRuntimeRoot, "daemon", "server.js"),
+        aiMcpGuide: installedAiMcpGuidePath,
       },
       null,
       2,
@@ -98,6 +101,10 @@ await cp(join(bundleRoot, "安装说明.md"), installedGuidePath).catch(() =>
     "# AI DevTools Assistant\n\nLoad the extension folder in Chrome developer mode.\n",
     "utf8",
   ),
+);
+await cp(
+  join(bundleRoot, "让 AI 自动接入 MCP.md"),
+  installedAiMcpGuidePath,
 );
 await writeFile(
   join(installRoot, "安装版本.json"),
@@ -157,6 +164,7 @@ process.stdout.write(
     "",
     `安装目录：${installRoot}`,
     `完整说明：${installedGuidePath}`,
+    `交给宿主 AI 的 MCP 接入文件：${installedAiMcpGuidePath}`,
     "请勿把 Token 发到聊天、日志、截图或共享文档。",
     "",
     installedAutostart
