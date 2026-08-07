@@ -129,10 +129,14 @@ test("oversized JSON results become readable payload artifacts", async () => {
       artifact: { id: string; kind: string };
       externalized: boolean;
       originalByteLength: number;
+      retrieval: { tool: string; artifactId: string; instructions: string };
     };
     assert.equal(result.externalized, true);
     assert.equal(result.artifact.kind, "payload");
     assert.equal(result.originalByteLength > 100, true);
+    assert.equal(result.retrieval.tool, "browser_read_artifact");
+    assert.equal(result.retrieval.artifactId, result.artifact.id);
+    assert.match(result.retrieval.instructions, /complete result is stored/i);
 
     const restored = await store.read(result.artifact.id, "profile-a");
     assert.ok(restored);

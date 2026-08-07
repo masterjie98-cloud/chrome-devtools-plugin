@@ -49,6 +49,10 @@ export function repairFlattenedAssistantMarkdown(content: string): string {
 
 function repairFlattenedProseBlocks(content: string): string {
   let repaired = content.replace(
+    /([。！？.!?:：；;）)])(#{1,6})[\t ]+(?=\S)/gu,
+    "$1\n\n$2 ",
+  );
+  repaired = repaired.replace(
     /([^\n])[\t ]+(#{1,6})[\t ]+(?=\S)/g,
     "$1\n\n$2 ",
   );

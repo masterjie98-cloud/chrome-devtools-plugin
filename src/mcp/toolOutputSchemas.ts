@@ -715,6 +715,36 @@ export const MCP_TOOL_OUTPUT_SCHEMAS = {
     completedAt: outputString,
     workflow: z.unknown(),
   }),
+  [MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT]: outputObject({
+    version: z.literal("artifact-inspection-v1"),
+    artifactId: outputString,
+    mode: z.enum(["read", "search"]),
+    totalChars: z.number().int().nonnegative(),
+    offset: z.number().int().nonnegative().optional(),
+    returnedChars: z.number().int().nonnegative().optional(),
+    chunk: outputString.optional(),
+    nextOffset: z.number().int().nonnegative().optional(),
+    hasMore: z.boolean().optional(),
+    query: z.string().max(500).optional(),
+    caseSensitive: z.boolean().optional(),
+    searchOffset: z.number().int().nonnegative().optional(),
+    returnedMatches: z.number().int().nonnegative().optional(),
+    hasMoreMatches: z.boolean().optional(),
+    nextSearchOffset: z.number().int().nonnegative().optional(),
+    matches: z
+      .array(
+        z
+          .object({
+            offset: z.number().int().nonnegative(),
+            excerptStart: z.number().int().nonnegative(),
+            excerptEnd: z.number().int().nonnegative(),
+            excerpt: z.string().max(1_500),
+          })
+          .strict(),
+      )
+      .max(50)
+      .optional(),
+  }),
   [MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS]: outputObject({
     version: z.literal("browser-performance-diagnostics-v1"),
     capturedAt: outputString,

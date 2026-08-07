@@ -26,6 +26,7 @@ export const MCP_TOOL_NAMES = {
   BROWSER_EXPLAIN_CSS: "browser_explain_css",
   BROWSER_CREATE_REPRODUCTION_RECIPE: "browser_create_reproduction_recipe",
   BROWSER_RUN_REPRODUCTION_RECIPE: "browser_run_reproduction_recipe",
+  BROWSER_READ_ARTIFACT: "browser_read_artifact",
   BROWSER_PERFORMANCE_DIAGNOSTICS: "browser_performance_diagnostics",
   BROWSER_REALTIME_ACTIVITY: "browser_realtime_activity",
   BROWSER_START_ELEMENT_PICKER: "browser_start_element_picker",
@@ -587,6 +588,61 @@ const MCP_BASE_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
       properties: {
         artifactId: { type: "string" },
         requireUrlMatch: { type: "boolean" },
+      },
+      required: ["artifactId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT,
+    title: "Read stored result artifact",
+    description:
+      "Read or search a complete session-bound JSON artifact produced when a tool result is too large for model context. Use read mode with nextOffset until hasMore is false when the whole result matters; use search mode to locate exact evidence. The artifact summary is only an index and must not be treated as the complete result.",
+    parameters: {
+      type: "object",
+      properties: {
+        artifactId: {
+          type: "string",
+          pattern: "^art_[a-f0-9]{32}$",
+        },
+        mode: {
+          type: "string",
+          enum: ["read", "search"],
+          description: "Defaults to read.",
+        },
+        offset: {
+          type: "number",
+          minimum: 0,
+          description: "Character offset for read mode. Defaults to 0.",
+        },
+        limit: {
+          type: "number",
+          minimum: 1000,
+          maximum: 20000,
+          description: "Maximum characters returned by read mode. Defaults to 12000.",
+        },
+        query: {
+          type: "string",
+          description: "Required in search mode; matched against the complete serialized JSON artifact.",
+        },
+        searchOffset: {
+          type: "number",
+          minimum: 0,
+          description: "Character offset where search mode starts. Use nextSearchOffset to continue when hasMoreMatches is true.",
+        },
+        maxMatches: {
+          type: "number",
+          minimum: 1,
+          maximum: 50,
+          description: "Maximum search matches. Defaults to 20.",
+        },
+        contextChars: {
+          type: "number",
+          minimum: 40,
+          maximum: 500,
+          description: "Context characters on each side of a search match. Defaults to 160.",
+        },
+        caseSensitive: { type: "boolean" },
       },
       required: ["artifactId"],
       additionalProperties: false,
@@ -2691,6 +2747,7 @@ const MCP_EXPOSED_TOOL_ORDER: readonly McpToolName[] = [
   MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
   MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE,
   MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE,
+  MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT,
   MCP_TOOL_NAMES.BROWSER_ACT,
   MCP_TOOL_NAMES.BROWSER_VERIFY,
   MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,

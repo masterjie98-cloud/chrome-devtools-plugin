@@ -27,7 +27,6 @@ import type {
 
 const CONNECT_TIMEOUT_MS = 20_000;
 const CALL_TIMEOUT_MS = 60_000;
-const MAX_RESULT_BYTES = 1024 * 1024;
 const MAX_SERVER_INSTRUCTIONS_CHARS = 6_000;
 const STREAMABLE_HTTP_CONNECT_ATTEMPTS = 3;
 const EXTERNAL_MCP_TOOL_ATTEMPTS = 3;
@@ -164,21 +163,34 @@ export class ExternalMcpRegistry
     );
     for (let attempt = 1; attempt <= EXTERNAL_MCP_TOOL_ATTEMPTS; attempt += 1) {
       try {
-        return boundMcpResult(await invoke());
+        return normalizeMcpResult(await invoke());
       } catch (error) {
-        if (
-          attempt >= EXTERNAL_MCP_TOOL_ATTEMPTS ||
-          !canRetryExternalMcpTool(server, tool, error, options.signal)
-        ) {
+        const recoverable = isRecoverableExternalMcpToolFailure(error);
+        const canReplay =
+          attempt < EXTERNAL_MCP_TOOL_ATTEMPTS &&
+          canRetryExternalMcpTool(server, tool, error, options.signal);
+        if (!canReplay) {
+          if (recoverable) {
+            await this.recoverConnection(
+              route.serverId,
+              attemptedClient,
+              toolName,
+              error,
+              options.signal,
+            ).catch((recoveryError) => {
+              console.warn(
+                `[external-mcp] failed to refresh ${server.name} after ${toolName}: ${errorMessage(recoveryError)}`,
+              );
+            });
+          }
           throw readableExternalMcpError(error);
         }
         const statusCode = externalMcpHttpStatus(error);
         if (statusCode !== undefined) {
           console.warn(
-            `[external-mcp] transient HTTP ${statusCode} in ${toolName} (${attempt}/${EXTERNAL_MCP_TOOL_ATTEMPTS}); retrying`,
+            `[external-mcp] transient HTTP ${statusCode} in ${toolName} (${attempt}/${EXTERNAL_MCP_TOOL_ATTEMPTS}); reconnecting before retry`,
           );
           await delay(100 * attempt, options.signal);
-          continue;
         }
         await this.recoverConnection(
           route.serverId,
@@ -810,25 +822,10 @@ async function withDeadline<T>(
   }
 }
 
-function boundMcpResult(value: unknown): unknown {
-  const normalized = compactDuplicateStructuredContent(
+function normalizeMcpResult(value: unknown): unknown {
+  return compactDuplicateStructuredContent(
     JSON.parse(JSON.stringify(value ?? null)) as unknown,
   );
-  const serialized = JSON.stringify(normalized);
-  const bytes = Buffer.byteLength(serialized, "utf8");
-  if (bytes <= MAX_RESULT_BYTES) {
-    return normalized;
-  }
-  return {
-    isError: true,
-    content: [
-      {
-        type: "text",
-        text: `MCP result exceeded the ${MAX_RESULT_BYTES}-byte local limit. Use the server tool's pagination or filtering arguments.`,
-      },
-    ],
-    _meta: { truncated: true, originalBytes: bytes },
-  };
 }
 
 function compactDuplicateStructuredContent(value: unknown): unknown {
@@ -890,7 +887,6 @@ function canRetryExternalMcpTool(
     signal?.aborted ||
     (server.trustReadOnlyTools !== true && server.autoApproveTools !== true) ||
     !tool?.annotations?.readOnlyHint ||
-    !tool.annotations.idempotentHint ||
     tool.annotations.destructiveHint !== false
   ) {
     return false;
@@ -906,8 +902,17 @@ function canRetryExternalMcpTool(
   ) {
     return false;
   }
+  return isRecoverableExternalMcpToolFailure(error);
+}
+
+/** @internal Exported for transport classification regression coverage. */
+export function isRecoverableExternalMcpToolFailure(error: unknown): boolean {
+  const statusCode = externalMcpHttpStatus(error);
+  if (statusCode !== undefined) {
+    return statusCode === 408 || statusCode === 425 || statusCode >= 500;
+  }
   return /streamable http error|error posting to endpoint|fetch failed|network error|econnreset|econnrefused|etimedout|timed out|socket hang up|connection (?:closed|reset)|transport (?:closed|error)|terminated|unexpected eof/i.test(
-    message,
+    errorMessage(error),
   );
 }
 

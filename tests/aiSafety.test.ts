@@ -24,6 +24,7 @@ test("external-only chats omit browser-agent tool instructions", () => {
   });
   assert.match(prompt, /selected an external MCP server as the only tool source/);
   assert.match(prompt, /untrusted capability metadata/);
+  assert.match(prompt, /browser_read_artifact/);
   assert.doesNotMatch(prompt, /browser_verify/);
   assert.doesNotMatch(prompt, /browser_observe/);
   assert.doesNotMatch(prompt, /full DOM/);
@@ -45,6 +46,7 @@ test("evidence-report guidance requires structured detail without invented facts
   assert.match(prompt, /Never append trend arrows/);
   assert.match(prompt, /restart total, not a count of containers/);
   assert.match(prompt, /end with one short direct question/);
+  assert.match(prompt, /externalized=true/);
 });
 
 test("Chinese user input adds an explicit Simplified Chinese response contract", () => {
@@ -205,6 +207,9 @@ test("post-tool guidance requests minimum sufficient evidence without query exha
   assert.match(prompt, /emit the final answer directly/);
   assert.match(prompt, /marked isError is an unresolved operation/);
   assert.match(prompt, /missing namespace, scope, selector, or resource identity/);
+  assert.match(prompt, /use the narrowest scope/);
+  assert.match(prompt, /never repeat the identical broad query/);
+  assert.match(prompt, /report the upstream failure/);
   assert.doesNotMatch(prompt, /shown above|see above|报告如上所示/i);
 });
 
@@ -925,6 +930,39 @@ test("assistant tool markup removes an incomplete trailing provider tool block",
     ),
     "正在定位按钮。",
   );
+});
+
+test("assistant content removes leaked provider deliberation before the final Markdown answer", () => {
+  const leaked = [
+    "Do not fabricate coverage. Do not repeat a completed workflow. Do not call the same tool with identical arguments again.",
+    "The user asked whether I can query the current page's pods. I've already answered with page-level evidence.",
+    "I have sufficient evidence to answer. I should not keep calling tools unnecessarily. Let me give the final consolidated answer.## 当前页面 Pod 状态查询结果",
+    "结论：可以查询。当前页面展示 3 个服务的 Pod 全部为 Running。",
+  ].join("\n\n");
+
+  assert.equal(
+    stripAssistantToolMarkup(leaked),
+    "## 当前页面 Pod 状态查询结果\n\n结论：可以查询。当前页面展示 3 个服务的 Pod 全部为 Running。",
+  );
+});
+
+test("assistant content removes closed and incomplete think blocks", () => {
+  assert.equal(
+    stripAssistantToolMarkup(
+      "<think>Need to inspect the page first.</think>## 查询结果\n正常",
+    ),
+    "## 查询结果\n正常",
+  );
+  assert.equal(
+    stripAssistantToolMarkup("可见答复。\n<think>I should call another tool"),
+    "可见答复。",
+  );
+});
+
+test("assistant content preserves ordinary English prose before a Markdown heading", () => {
+  const answer =
+    "This section explains why the current page can be inspected safely and what evidence is available to readers.\n\n## Current page status\nAll visible pods are running.";
+  assert.equal(stripAssistantToolMarkup(answer), answer);
 });
 
 test("assistant display content replaces marker-only history without affecting streaming placeholders", () => {

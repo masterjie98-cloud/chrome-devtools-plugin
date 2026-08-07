@@ -13,6 +13,7 @@ export function getAssistantDisplayContent(
 
 export function stripAssistantToolMarkup(content: string): string {
   let next = content
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
     .replace(
       /<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/gi,
       "",
@@ -33,6 +34,11 @@ export function stripAssistantToolMarkup(content: string): string {
     next = next.slice(0, trailingFunctionStart);
   }
 
+  const trailingThinkStart = next.search(/<think\b[^>]*>[^<]*$/i);
+  if (trailingThinkStart !== -1) {
+    next = next.slice(0, trailingThinkStart);
+  }
+
   const trailingProviderSectionStart = next.lastIndexOf(
     "<|tool_calls_section_begin|>",
   );
@@ -45,8 +51,45 @@ export function stripAssistantToolMarkup(content: string): string {
     next = next.slice(0, trailingProviderStart);
   }
 
-  return next
+  next = next
     .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+
+  return stripInternalDeliberationPrefix(next);
+}
+
+const INTERNAL_DELIBERATION_MARKERS = [
+  /\bdo not (?:fabricate|repeat|call|mention|invent)\b/i,
+  /\bthe user (?:asked|wants|requested|said)\b/i,
+  /\bi(?:'ve| have)? already\b/i,
+  /\bi have sufficient (?:evidence|information|context)\b/i,
+  /\bi (?:should|need to|must)\b/i,
+  /\blet me (?:provide|give|answer|summarize)\b/i,
+  /\bfinal (?:answer|response|consolidated answer)\b/i,
+] as const;
+
+/**
+ * Some OpenAI-compatible providers occasionally put their private planning
+ * prefix in `content` instead of `reasoning_content`. Only remove a prefix when
+ * several high-confidence planning markers occur before a real Markdown
+ * heading, so ordinary English answers remain untouched.
+ */
+function stripInternalDeliberationPrefix(content: string): string {
+  const headingMatch = /#{1,6}[\t ]+(?=\S)/g.exec(content);
+  if (!headingMatch || headingMatch.index < 80) {
+    return content;
+  }
+
+  const prefix = content.slice(0, headingMatch.index);
+  const markerCount = INTERNAL_DELIBERATION_MARKERS.reduce(
+    (count, marker) => count + (marker.test(prefix) ? 1 : 0),
+    0,
+  );
+  const hasInternalDirective = INTERNAL_DELIBERATION_MARKERS[0].test(prefix);
+  if (markerCount < 3 && !(hasInternalDirective && markerCount >= 2)) {
+    return content;
+  }
+
+  return content.slice(headingMatch.index).trimStart();
 }

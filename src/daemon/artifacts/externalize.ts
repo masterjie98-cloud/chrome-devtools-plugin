@@ -8,6 +8,11 @@ export interface ExternalizedJsonResult {
   contentType: "application/json";
   originalByteLength: number;
   externalized: true;
+  retrieval: {
+    tool: "browser_read_artifact";
+    artifactId: string;
+    instructions: string;
+  };
   summary: Record<string, unknown>;
 }
 
@@ -39,7 +44,13 @@ export async function externalizeLargeJsonResult(
     contentType: "application/json",
     originalByteLength: bytes.byteLength,
     externalized: true,
-    summary: summarizeValue(value),
+    retrieval: {
+      tool: "browser_read_artifact",
+      artifactId: artifact.id,
+      instructions:
+        "The complete result is stored locally. Use browser_read_artifact in read or search mode to inspect the evidence before answering; the summary is not the full result.",
+    },
+    summary: summarizeExternalizedValue(value),
   } satisfies ExternalizedJsonResult;
 }
 
@@ -54,18 +65,69 @@ function isScreenshotResult(value: unknown): boolean {
   );
 }
 
-function summarizeValue(value: unknown): Record<string, unknown> {
-  if (Array.isArray(value)) {
-    return { type: "array", itemCount: value.length };
+function summarizeExternalizedValue(value: unknown): Record<string, unknown> {
+  const summary = summarizeValue(value);
+  if (!isRecord(value) || !Array.isArray(value.content)) {
+    return summary;
   }
-  if (value && typeof value === "object") {
-    const keys = Object.keys(value as Record<string, unknown>);
+  const textBlocks = value.content.flatMap((entry, index) => {
+    if (!isRecord(entry) || typeof entry.text !== "string") {
+      return [];
+    }
+    let parsedJson: Record<string, unknown> | undefined;
+    try {
+      parsedJson = summarizeValue(JSON.parse(entry.text) as unknown);
+    } catch {
+      // Plain-text MCP blocks still expose their exact size for retrieval.
+    }
+    return [
+      {
+        index,
+        charCount: entry.text.length,
+        ...(parsedJson ? { parsedJson } : {}),
+      },
+    ];
+  });
+  return textBlocks.length > 0
+    ? { ...summary, mcpTextBlocks: textBlocks.slice(0, 20) }
+    : summary;
+}
+
+function summarizeValue(value: unknown, depth = 0): Record<string, unknown> {
+  if (Array.isArray(value)) {
+    return {
+      type: "array",
+      itemCount: value.length,
+      ...(depth < 2 && value.length > 0
+        ? { itemShape: summarizeValue(value[0], depth + 1) }
+        : {}),
+    };
+  }
+  if (isRecord(value)) {
+    const keys = Object.keys(value);
+    const projectedKeys = keys.slice(0, 40);
     return {
       type: "object",
       fieldCount: keys.length,
-      fields: keys.slice(0, 40),
+      fields: projectedKeys,
       ...(keys.length > 40 ? { omittedFieldCount: keys.length - 40 } : {}),
+      ...(depth < 2
+        ? {
+            fieldShapes: Object.fromEntries(
+              projectedKeys
+                .slice(0, 12)
+                .map((key) => [key, summarizeValue(value[key], depth + 1)]),
+            ),
+          }
+        : {}),
     };
   }
-  return { type: value === null ? "null" : typeof value };
+  return {
+    type: value === null ? "null" : typeof value,
+    ...(typeof value === "string" ? { charCount: value.length } : {}),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

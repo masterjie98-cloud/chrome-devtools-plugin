@@ -55,6 +55,33 @@ if (fixtureMode === "structured") {
   );
 }
 
+if (fixtureMode === "large") {
+  server.registerTool(
+    "large_result",
+    {
+      description: "Return a result larger than the former local 1 MiB limit",
+      inputSchema: { size: z.number().int().min(1).max(2_000_000) },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ size }) => {
+      const marker = "CRITICAL_TAIL_EVIDENCE";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${"x".repeat(Math.max(0, size - marker.length))}${marker}`,
+          },
+        ],
+      };
+    },
+  );
+}
+
 if (fixtureMode === "retry") {
   server.registerTool(
     "flaky_read",
@@ -64,7 +91,7 @@ if (fixtureMode === "retry") {
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
-        idempotentHint: true,
+        idempotentHint: process.env.MCP_FIXTURE_IDEMPOTENT_HINT !== "false",
         openWorldHint: false,
       },
     },

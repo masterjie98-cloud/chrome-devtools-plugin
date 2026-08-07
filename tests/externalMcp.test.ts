@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { ExternalMcpRegistry } from "../src/daemon/externalMcpRegistry";
+import {
+  ExternalMcpRegistry,
+  isRecoverableExternalMcpToolFailure,
+} from "../src/daemon/externalMcpRegistry";
 import { toAiToolDefinitions } from "../src/sidepanel/services/aiClient";
 import {
   createExternalMcpToolName,
@@ -451,6 +454,43 @@ test("duplicate text JSON is removed when structuredContent carries the same res
   }
 });
 
+test("external MCP results larger than 1 MiB remain successful and complete", async () => {
+  const fixture = join(projectRoot, "tests", "fixtures", "externalMcpEchoServer.mjs");
+  const registry = new ExternalMcpRegistry(
+    [
+      {
+        id: "mcp_large_fixture",
+        name: "Large result fixture",
+        enabled: true,
+        transport: {
+          type: "stdio",
+          command: process.execPath,
+          args: [fixture],
+          env: { MCP_FIXTURE_MODE: "large" },
+        },
+      },
+    ],
+    { saveServers: async () => undefined },
+  );
+  try {
+    const tools = await registry.listTools();
+    const largeTool = tools.find((tool) => tool.title === "large_result");
+    assert.ok(largeTool);
+    const result = (await registry.callTool(largeTool.name, {
+      size: 1_200_000,
+    })) as {
+      isError?: boolean;
+      content?: Array<{ type?: string; text?: string }>;
+    };
+
+    assert.notEqual(result.isError, true);
+    assert.equal(result.content?.[0]?.text?.length, 1_200_000);
+    assert.match(result.content?.[0]?.text ?? "", /CRITICAL_TAIL_EVIDENCE$/);
+  } finally {
+    await registry.close();
+  }
+});
+
 test("read-only idempotent transport failure reconnects within a bounded retry budget", async () => {
   const fixture = join(projectRoot, "tests", "fixtures", "externalMcpEchoServer.mjs");
   const dataDir = await createTestDataDirectory("external-mcp-retry-");
@@ -489,6 +529,62 @@ test("read-only idempotent transport failure reconnects within a bounded retry b
   }
 });
 
+test("HTTP 5xx is classified for transport recovery without retrying client errors", () => {
+  const gatewayError = Object.assign(
+    new Error("Streamable HTTP error: Error POSTing to endpoint: Bad Gateway"),
+    { code: 502 },
+  );
+  const clientError = Object.assign(new Error("Bad Request"), { code: 400 });
+
+  assert.equal(isRecoverableExternalMcpToolFailure(gatewayError), true);
+  assert.equal(isRecoverableExternalMcpToolFailure(clientError), false);
+  assert.equal(
+    isRecoverableExternalMcpToolFailure(new Error("Connection closed")),
+    true,
+  );
+});
+
+test("trusted read-only non-idempotent transport failure reconnects before bounded replay", async () => {
+  const fixture = join(projectRoot, "tests", "fixtures", "externalMcpEchoServer.mjs");
+  const dataDir = await createTestDataDirectory("external-mcp-read-retry-");
+  const marker = join(dataDir.rootDir, "failed-once.marker");
+  const registry = new ExternalMcpRegistry(
+    [
+      {
+        id: "mcp_read_retry_fixture",
+        name: "Read retry fixture",
+        enabled: true,
+        autoApproveTools: true,
+        transport: {
+          type: "stdio",
+          command: process.execPath,
+          args: [fixture],
+          env: {
+            MCP_FIXTURE_MODE: "retry",
+            MCP_FIXTURE_RETRY_MARKER: marker,
+            MCP_FIXTURE_IDEMPOTENT_HINT: "false",
+          },
+        },
+      },
+    ],
+    { saveServers: async () => undefined },
+  );
+  try {
+    const tools = await registry.listTools();
+    const flakyTool = tools.find((tool) => tool.title === "flaky_read");
+    assert.ok(flakyTool);
+    assert.equal(flakyTool.annotations?.idempotentHint, false);
+    const result = (await registry.callTool(flakyTool.name, {})) as {
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    assert.equal(result.content?.[0]?.text, "recovered after reconnect");
+    assert.equal(registry.listServers()[0]?.reconnectCount, 1);
+  } finally {
+    await registry.close();
+    await dataDir.cleanup();
+  }
+});
+
 test("untrusted external annotations never authorize an automatic tool replay", async () => {
   const fixture = join(projectRoot, "tests", "fixtures", "externalMcpEchoServer.mjs");
   const dataDir = await createTestDataDirectory("external-mcp-untrusted-retry-");
@@ -520,6 +616,11 @@ test("untrusted external annotations never authorize an automatic tool replay", 
       registry.callTool(flakyTool.name, {}),
       /Connection closed/,
     );
+    assert.equal(registry.listServers()[0]?.reconnectCount, 1);
+    const explicitRetry = (await registry.callTool(flakyTool.name, {})) as {
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    assert.equal(explicitRetry.content?.[0]?.text, "recovered after reconnect");
   } finally {
     await registry.close();
     await dataDir.cleanup();

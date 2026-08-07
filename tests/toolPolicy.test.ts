@@ -80,6 +80,15 @@ test("ordinary bounded page reads do not require confirmation", () => {
   );
 });
 
+test("session-bound artifact reads reuse the approval of the producing tool", () => {
+  const policy = getToolPolicy(MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT);
+  assert.equal(policy.policyClass, "sensitive_read");
+  assert.equal(policy.sensitive, true);
+  assert.equal(policy.requiresApproval, false);
+  assert.equal(policy.approvalMode, "none");
+  assert.equal(policy.mutatesBrowser, false);
+});
+
 test("full DOM, sensitive reads, mutations, and unknown tools require confirmation", () => {
   assert.equal(
     requiresToolApproval(MCP_TOOL_NAMES.BROWSER_QUERY_DOM, {

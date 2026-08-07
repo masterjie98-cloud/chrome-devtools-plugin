@@ -204,6 +204,7 @@ const POLICY_GROUPS = {
     MCP_TOOL_NAMES.BROWSER_GET_PLUGIN_CONVERSATION,
     MCP_TOOL_NAMES.BROWSER_GET_AUDIT_EVENTS,
     MCP_TOOL_NAMES.BROWSER_GET_LAST_PLUGIN_MESSAGE,
+    MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT,
     MCP_TOOL_NAMES.BROWSER_TAKE_SCREENSHOT,
     MCP_TOOL_NAMES.BROWSER_STORAGE_STATE,
     MCP_TOOL_NAMES.BROWSER_COOKIE_LIST,
@@ -369,6 +370,19 @@ export function getToolPolicy(
       approvalMode: "decision_barrier",
       reason:
         "A persisted recipe may contain page actions whose semantics are opaque until the artifact is loaded, so each run requires a decision barrier.",
+    });
+  }
+
+  if (normalizedName === MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT) {
+    return overridePolicy(createPolicy(normalizedName, baseClass, true), {
+      requiresApproval: false,
+      mutatesBrowser: false,
+      destructive: false,
+      idempotent: true,
+      approvalMode: "none",
+      capability: undefined,
+      reason:
+        "Reads a bounded projection of a session-bound artifact already produced for the active tool flow.",
     });
   }
 

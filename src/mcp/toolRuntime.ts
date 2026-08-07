@@ -745,6 +745,52 @@ const runReproductionRecipeSchema = z
   })
   .strict();
 
+const readArtifactSchema = z
+  .object({
+    artifactId: z.string().regex(/^art_[a-f0-9]{32}$/),
+    mode: z.enum(["read", "search"]).optional(),
+    offset: z.number().int().nonnegative().optional(),
+    limit: z.number().int().min(1_000).max(20_000).optional(),
+    query: z.string().min(1).max(500).optional(),
+    searchOffset: z.number().int().nonnegative().optional(),
+    maxMatches: z.number().int().min(1).max(50).optional(),
+    contextChars: z.number().int().min(40).max(500).optional(),
+    caseSensitive: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const mode = value.mode ?? "read";
+    if (mode === "search" && value.query === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["query"],
+        message: "query is required in search mode",
+      });
+    }
+    if (
+      mode === "read" &&
+      (value.query !== undefined ||
+        value.maxMatches !== undefined ||
+        value.contextChars !== undefined ||
+        value.searchOffset !== undefined ||
+        value.caseSensitive !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "search arguments require mode=search",
+      });
+    }
+    if (
+      mode === "search" &&
+      (value.offset !== undefined || value.limit !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "offset and limit are available only in read mode",
+      });
+    }
+  });
+
 const performanceDiagnosticsSchema = z
   .object({
     ...frameReferenceShape,
@@ -1197,6 +1243,7 @@ const MCP_TOOL_INPUT_SCHEMA_BASE: Record<McpToolName, ZodTypeAny> = {
     createReproductionRecipeSchema,
   [MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE]:
     runReproductionRecipeSchema,
+  [MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT]: readArtifactSchema,
   [MCP_TOOL_NAMES.BROWSER_PERFORMANCE_DIAGNOSTICS]:
     performanceDiagnosticsSchema,
   [MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY]: realtimeActivitySchema,
@@ -1330,6 +1377,7 @@ export function runtimeToolsForProfile(
       MCP_TOOL_NAMES.BROWSER_REALTIME_ACTIVITY,
       MCP_TOOL_NAMES.BROWSER_CREATE_REPRODUCTION_RECIPE,
       MCP_TOOL_NAMES.BROWSER_RUN_REPRODUCTION_RECIPE,
+      MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT,
       MCP_TOOL_NAMES.BROWSER_ACT,
       MCP_TOOL_NAMES.BROWSER_VERIFY,
       MCP_TOOL_NAMES.BROWSER_DEBUG_ACTIVITY,
@@ -1473,6 +1521,7 @@ export async function executeMcpToolData(
       value: unknown,
     ) => Promise<ArtifactReference>;
     readJsonArtifact?: (artifactId: string) => Promise<unknown>;
+    readArtifactText?: (artifactId: string) => Promise<string>;
   } = {},
 ): Promise<unknown> {
   const normalizedToolName = normalizeMcpToolName(toolName);
@@ -1628,6 +1677,8 @@ export async function executeMcpToolData(
         parsedArgs,
         context,
       );
+    case MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT:
+      return readStoredArtifact(parsedArgs, context);
     case MCP_TOOL_NAMES.BROWSER_START_ELEMENT_PICKER:
       return proxyBrowserTool(pluginBridge, {
         id: createMessageId(),
@@ -2864,6 +2915,103 @@ async function runReproductionRecipe(
     startedAt,
     completedAt: new Date().toISOString(),
     workflow: workflowResult,
+  };
+}
+
+async function readStoredArtifact(
+  args: Record<string, unknown>,
+  context: {
+    sessionId?: string;
+    readJsonArtifact?: (artifactId: string) => Promise<unknown>;
+    readArtifactText?: (artifactId: string) => Promise<string>;
+  },
+): Promise<Record<string, unknown>> {
+  if (!context.sessionId) {
+    throw new Error(
+      "ARTIFACT_SESSION_UNBOUND: select a Chrome Profile session before reading an artifact.",
+    );
+  }
+  if (!context.readArtifactText && !context.readJsonArtifact) {
+    throw new Error(
+      "ARTIFACT_STORAGE_UNAVAILABLE: this runtime cannot read artifacts.",
+    );
+  }
+  const artifactId = args.artifactId as string;
+  const serialized = context.readArtifactText
+    ? await context.readArtifactText(artifactId)
+    : JSON.stringify(await context.readJsonArtifact!(artifactId));
+  if (!serialized) {
+    throw new Error("ARTIFACT_INVALID: artifact JSON is empty.");
+  }
+  const mode = args.mode === "search" ? "search" : "read";
+  if (mode === "read") {
+    const offset = Math.min(
+      (args.offset as number | undefined) ?? 0,
+      serialized.length,
+    );
+    const limit = (args.limit as number | undefined) ?? 12_000;
+    const nextOffset = Math.min(serialized.length, offset + limit);
+    return {
+      version: "artifact-inspection-v1",
+      artifactId,
+      mode,
+      totalChars: serialized.length,
+      offset,
+      returnedChars: nextOffset - offset,
+      chunk: serialized.slice(offset, nextOffset),
+      nextOffset,
+      hasMore: nextOffset < serialized.length,
+    };
+  }
+
+  const query = args.query as string;
+  const caseSensitive = args.caseSensitive === true;
+  const maxMatches = (args.maxMatches as number | undefined) ?? 20;
+  const contextChars = (args.contextChars as number | undefined) ?? 160;
+  const haystack = caseSensitive ? serialized : serialized.toLowerCase();
+  const needle = caseSensitive ? query : query.toLowerCase();
+  const matches: Array<{
+    offset: number;
+    excerptStart: number;
+    excerptEnd: number;
+    excerpt: string;
+  }> = [];
+  const initialSearchOffset = Math.min(
+    (args.searchOffset as number | undefined) ?? 0,
+    serialized.length,
+  );
+  let searchOffset = initialSearchOffset;
+  while (matches.length < maxMatches) {
+    const offset = haystack.indexOf(needle, searchOffset);
+    if (offset < 0) {
+      break;
+    }
+    const excerptStart = Math.max(0, offset - contextChars);
+    const excerptEnd = Math.min(
+      serialized.length,
+      offset + query.length + contextChars,
+    );
+    matches.push({
+      offset,
+      excerptStart,
+      excerptEnd,
+      excerpt: serialized.slice(excerptStart, excerptEnd),
+    });
+    searchOffset = offset + Math.max(1, needle.length);
+  }
+  const hasMoreMatches = haystack.indexOf(needle, searchOffset) >= 0;
+  return {
+    version: "artifact-inspection-v1",
+    artifactId,
+    mode,
+    totalChars: serialized.length,
+    query,
+    caseSensitive,
+    searchOffset: initialSearchOffset,
+    returnedMatches: matches.length,
+    hasMoreMatches,
+    nextSearchOffset: hasMoreMatches ? searchOffset : undefined,
+    matches,
   };
 }
 

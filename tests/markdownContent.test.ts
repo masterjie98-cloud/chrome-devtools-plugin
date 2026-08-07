@@ -95,6 +95,20 @@ test("delegated task compatibility repair restores a flattened H1 report", () =>
   assert.doesNotMatch(html, /# Pod 复测报告/);
 });
 
+test("assistant compatibility repair separates a heading glued to punctuation", () => {
+  const html = renderToStaticMarkup(
+    createElement(MarkdownContent, {
+      content:
+        "Let me give the final answer.## 当前页面 Pod 状态查询结果\n结论：全部 Running。",
+      repairFlattenedBlocks: true,
+    }),
+  );
+
+  assert.match(html, /Let me give the final answer\.<\/p>/);
+  assert.match(html, /<h3[^>]*>当前页面 Pod 状态查询结果<\/h3>/);
+  assert.doesNotMatch(html, /answer\.##/);
+});
+
 test("every Markdown surface repairs a GFM header split across physical lines", () => {
   const html = renderToStaticMarkup(
     createElement(MarkdownContent, {

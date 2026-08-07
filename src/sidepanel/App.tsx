@@ -1349,18 +1349,20 @@ export function App() {
     const normalizedSelection = normalizeExternalMcpSelection(selection);
     try {
       const tools = await mcpBridge.listMcpTools({
-        includeLocal: normalizedSelection.mode !== "selected",
+        includeLocal: true,
         includeExternal: normalizedSelection.mode !== "off",
         ...(normalizedSelection.mode === "selected"
           ? { externalServerIds: normalizedSelection.serverIds }
           : {}),
       });
-      const filteredTools = tools.filter((tool) =>
-        externalMcpToolAllowed(
-          tool.name,
-          tool.externalMcpServerId,
-          normalizedSelection,
-        ),
+      const filteredTools = tools.filter(
+        (tool) =>
+          tool.name === MCP_TOOL_NAMES.BROWSER_READ_ARTIFACT ||
+          externalMcpToolAllowed(
+            tool.name,
+            tool.externalMcpServerId,
+            normalizedSelection,
+          ),
       );
       const nextDefinitions = toAiToolDefinitions(filteredTools);
       if (

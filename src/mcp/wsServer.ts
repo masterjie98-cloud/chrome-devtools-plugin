@@ -3053,17 +3053,34 @@ async function handlePluginRequestedMcpTool(
                     );
                     if (!artifact) {
                       throw new Error(
-                        "RECIPE_NOT_FOUND: artifact was not found, expired, or belongs to another browser session.",
+                        "ARTIFACT_NOT_FOUND: artifact was not found, expired, or belongs to another browser session.",
                       );
                     }
                     if (artifact.metadata.mimeType !== "application/json") {
                       throw new Error(
-                        "RECIPE_INVALID: artifact MIME type is not application/json.",
+                        "ARTIFACT_INVALID: artifact MIME type is not application/json.",
                       );
                     }
                     return JSON.parse(
                       Buffer.from(artifact.bytes).toString("utf8"),
                     );
+                  },
+                  readArtifactText: async (artifactId) => {
+                    const artifact = await artifactStore.read(
+                      artifactId,
+                      sessionId,
+                    );
+                    if (!artifact) {
+                      throw new Error(
+                        "ARTIFACT_NOT_FOUND: artifact was not found, expired, or belongs to another browser session.",
+                      );
+                    }
+                    if (artifact.metadata.mimeType !== "application/json") {
+                      throw new Error(
+                        "ARTIFACT_INVALID: artifact MIME type is not application/json.",
+                      );
+                    }
+                    return Buffer.from(artifact.bytes).toString("utf8");
                   },
                   ...(stateStore
                     ? { listAuditEvents: () => stateStore.listAuditEvents() }
@@ -3081,7 +3098,9 @@ async function handlePluginRequestedMcpTool(
       },
     });
     const executionFinishedAt = Date.now();
-    const responseData = externalizeLargeResults
+    const responseData =
+      externalizeLargeResults ||
+      (normalizedToolName === null && additionalMcpBackend)
       ? await externalizeLargeJsonResult(data, sessionId, artifactStore)
       : data;
     const resultPayload: McpToolResultPayload = {
