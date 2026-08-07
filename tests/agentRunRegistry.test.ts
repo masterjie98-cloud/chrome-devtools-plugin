@@ -47,3 +47,26 @@ test("agent registry rejects two simultaneous runs in one conversation", () => {
     /AGENT_CONVERSATION_BUSY/,
   );
 });
+
+test("latest run identity survives completion and advances on the next run", () => {
+  const registry = new AgentRunRegistry();
+  const first = {
+    runId: "run-first",
+    conversationId: "conversation-a",
+    assistantMessageId: "assistant-first",
+    controller: new AbortController(),
+  };
+  registry.start(first);
+  assert.equal(registry.finish("conversation-a", "run-first"), true);
+  assert.equal(registry.isCurrent("conversation-a", "run-first"), false);
+  assert.equal(registry.isLatest("conversation-a", "run-first"), true);
+
+  registry.start({
+    runId: "run-second",
+    conversationId: "conversation-a",
+    assistantMessageId: "assistant-second",
+    controller: new AbortController(),
+  });
+  assert.equal(registry.isLatest("conversation-a", "run-first"), false);
+  assert.equal(registry.isLatest("conversation-a", "run-second"), true);
+});

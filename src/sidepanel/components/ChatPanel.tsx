@@ -56,6 +56,10 @@ import {
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
 import type { AgentSessionSnapshot } from "../../shared/agentSession";
 import {
+  buildConversationMemoryContext,
+  type ConversationMemoryV1,
+} from "../../shared/conversationMemory";
+import {
   contextUsagePercent,
   type AiContextUsageCategory,
   type AiContextUsageSnapshot,
@@ -82,6 +86,7 @@ import { getAssistantDisplayContent } from "../services/assistantContent";
 import { findActivityMonitorAnchorMessageId } from "../services/activityMonitorAnchor";
 import type { BackgroundConversationWork } from "../services/backgroundConversationWork";
 import type {
+  ChatConversationKind,
   ChatImageAttachment,
   ChatConversationSummary,
   ChatMessage,
@@ -98,6 +103,7 @@ import { getDelegatedTaskPhasePresentation } from "../services/delegatedTaskPres
 
 interface ChatPanelProps {
   messages: ChatMessage[];
+  conversationKind: ChatConversationKind;
   busy: boolean;
   agentBusy: boolean;
   aiConfigured: boolean;
@@ -115,6 +121,7 @@ interface ChatPanelProps {
   externalMcpServers: ExternalMcpServerSummary[];
   contextLabel: string;
   contextUsage?: AiContextUsageSnapshot;
+  conversationMemory?: ConversationMemoryV1;
   activeAgentSession?: AgentSessionSnapshot;
   streamingMessageId?: string;
   pendingToolApprovals: PendingToolApproval[];
@@ -138,7 +145,6 @@ interface ChatPanelProps {
     action?: "restart" | "stop";
   };
   queuedMessages: QueuedChatSubmission[];
-  delegatedTasks: DelegatedTaskSnapshot[];
   delegatedInboxTasks: DelegatedTaskSnapshot[];
   activeDelegatedTaskId?: string;
   delegatedTaskActionIds: Set<string>;
@@ -200,6 +206,7 @@ interface ChatPanelProps {
 
 export function ChatPanel({
   messages,
+  conversationKind,
   busy,
   agentBusy,
   aiConfigured,
@@ -212,6 +219,7 @@ export function ChatPanel({
   externalMcpServers,
   contextLabel,
   contextUsage,
+  conversationMemory,
   activeAgentSession,
   streamingMessageId,
   pendingToolApprovals,
@@ -225,7 +233,6 @@ export function ChatPanel({
   foregroundTab,
   activityMonitor,
   queuedMessages,
-  delegatedTasks,
   delegatedInboxTasks,
   activeDelegatedTaskId,
   delegatedTaskActionIds,
@@ -264,6 +271,7 @@ export function ChatPanel({
   onClearChat,
   onOpenSettings
 }: ChatPanelProps) {
+  const mcpCollaboration = conversationKind === "mcp_collaboration";
   const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
   const [autoScroll, setAutoScroll] = useState(true);
   const [expandedToolMessages, setExpandedToolMessages] = useState<Set<string>>(() => new Set());
@@ -896,6 +904,18 @@ export function ChatPanel({
           </div>
         </div>
         <LocalUpdateAlert status={localUpdateStatus} />
+        {mcpCollaboration ? (
+          <div className="mcp-conversation-banner" role="status">
+            <span className="mcp-conversation-banner-icon" aria-hidden="true">
+              <ApiOutlined />
+            </span>
+            <div className="mcp-conversation-banner-copy">
+              <strong>MCP 协作上下文</strong>
+              <span>MCP 后端 AI 与插件 AI 的真实任务消息、工具调用和结果按时间记录在这里。</span>
+            </div>
+            <Tag>实时记录</Tag>
+          </div>
+        ) : null}
         {activeExecutionBinding ? (
           <ExecutionTargetBar
             target={activeExecutionBinding.target}
@@ -923,14 +943,14 @@ export function ChatPanel({
       </div>
 
       <div className="chat-messages" ref={scrollRef} onScroll={handleScroll}>
-        {messages.map((message, index) => {
-          const delegatedTask =
-            message.source === "mcp_ai" && message.delegatedTaskId
-            ? delegatedTasks.find(
-                (task) => task.taskId === message.delegatedTaskId,
-              )
-            : undefined;
-          return (
+        {mcpCollaboration && messages.length === 0 ? (
+          <Empty
+            className="mcp-conversation-empty"
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description="正在建立 MCP 协作记录…"
+          />
+        ) : null}
+        {messages.map((message, index) => (
           <div
             className={`chat-message-row chat-message-row-${message.role} chat-message-row-source-${message.source ?? "unknown"}`}
             key={message.id}
@@ -949,25 +969,10 @@ export function ChatPanel({
                     : `工具结果 ${message.toolName ?? ""}`.trim()
               }
             >
-              {delegatedTask ? (
-                <DelegatedTaskCard
-                  task={delegatedTask}
-                  active={activeDelegatedTaskId === delegatedTask.taskId}
-                  queued={queuedMessages.some(
-                    (submission) =>
-                      submission.delegatedTask?.taskId === delegatedTask.taskId,
-                  )}
-                  loading={delegatedTaskActionIds.has(delegatedTask.taskId)}
-                  copied={copiedMessageId === message.id}
-                  onCopy={() => void copyMessage(message)}
-                  onAccept={onAcceptDelegatedTask}
-                  onRestore={onRestoreDelegatedTask}
-                  onReject={onRejectDelegatedTask}
-                />
-              ) : (
-                <>
+              <>
                   {message.role !== "tool" &&
                   (message.source === "extension_ai" ||
+                    message.source === "mcp_ai" ||
                     message.role === "user") ? (
                     <div
                       className={`chat-meta${
@@ -978,6 +983,11 @@ export function ChatPanel({
                         {message.source === "extension_ai" ? (
                           <Typography.Text type="secondary">
                             插件 AI
+                          </Typography.Text>
+                        ) : null}
+                        {message.source === "mcp_ai" ? (
+                          <Typography.Text type="secondary">
+                            MCP 后端 AI
                           </Typography.Text>
                         ) : null}
                         {message.role === "assistant" && message.model ? (
@@ -1016,9 +1026,8 @@ export function ChatPanel({
                     />
                   ) : null}
                 </>
-              )}
             </article>
-            {!delegatedTask && message.role !== "tool" && message.content ? (
+            {message.role !== "tool" && message.content ? (
               <div className="chat-message-actions" aria-label="消息操作">
                 {message.role === "user" ? (
                   <Tooltip title="编辑并创建新分支">
@@ -1032,7 +1041,8 @@ export function ChatPanel({
                       aria-label="编辑消息并创建新分支"
                     />
                   </Tooltip>
-                ) : message.source !== "mcp_ai" &&
+                ) : !mcpCollaboration &&
+                  message.source !== "mcp_ai" &&
                   index > 0 &&
                   messages
                     .slice(0, index)
@@ -1067,8 +1077,7 @@ export function ChatPanel({
               </div>
             ) : null}
           </div>
-          );
-        })}
+        ))}
         {activeAgentSession?.status === "running" ? (
           <AgentRuntimeBar session={activeAgentSession} />
         ) : null}
@@ -1159,12 +1168,32 @@ export function ChatPanel({
             />
           </div>
         ) : null}
-        <div className={`chat-composer ${composerFocused ? "chat-composer-focused" : ""}`}>
-        {queuedMessages.length ? (
-          <div className="chat-queue" aria-label="待发送消息队列">
-            <div className="chat-queue-header">
-              <span>
-                <ClockCircleOutlined /> 待发送 {queuedMessages.length}/5
+        {mcpCollaboration ? (
+          <div className="mcp-readonly-composer" role="note">
+            <div>
+              <strong>当前为只读协作记录</strong>
+              <span>这里只展示双方已经发生的真实任务交流；用户加入对话将在后续阶段开放。</span>
+            </div>
+            {agentBusy ? (
+              <Button
+                className="composer-control"
+                danger
+                icon={<StopOutlined />}
+                onClick={onStop}
+              >
+                停止插件 AI
+              </Button>
+            ) : null}
+          </div>
+        ) : (
+          <div
+            className={`chat-composer ${composerFocused ? "chat-composer-focused" : ""}`}
+          >
+            {queuedMessages.length ? (
+              <div className="chat-queue" aria-label="待发送消息队列">
+                <div className="chat-queue-header">
+                  <span>
+                    <ClockCircleOutlined /> 待发送 {queuedMessages.length}/5
               </span>
               <div className="chat-queue-header-actions">
                 <Typography.Text type="secondary">
@@ -1428,19 +1457,29 @@ export function ChatPanel({
               scopeLabel={executionApprovalScopeLabel}
               onChange={onChangeExecutionApprovalMode}
             />
-            {contextUsage ? (
+            {contextUsage || conversationMemory ? (
               <Popover
                 placement="topLeft"
                 trigger="click"
-                content={<ContextUsageDetails report={contextUsage} />}
+                content={
+                  <ContextUsageDetails
+                    report={contextUsage}
+                    memory={conversationMemory}
+                    messages={messages}
+                  />
+                }
               >
                 <Button
                   className="context-usage-trigger"
                   type="text"
                   icon={<PieChartOutlined />}
-                  aria-label={`查看上下文占用，约 ${contextUsagePercent(contextUsage)}%`}
+                  aria-label={
+                    contextUsage
+                      ? `查看对话与请求上下文，最近请求约 ${contextUsagePercent(contextUsage)}%`
+                      : "查看对话上下文"
+                  }
                 >
-                  {contextUsagePercent(contextUsage)}%
+                  {contextUsage ? `${contextUsagePercent(contextUsage)}%` : "上下文"}
                 </Button>
               </Popover>
             ) : null}
@@ -1492,6 +1531,7 @@ export function ChatPanel({
           </div>
         </div>
       </div>
+        )}
       </div>
       <input
         ref={fileInputRef}
@@ -1665,7 +1705,7 @@ export function ChatPanel({
         onClose={() => setHistoryOpen(false)}
       >
         <Typography.Paragraph type="secondary" className="chat-history-note">
-          仅保存在当前 Chrome Profile。工具原始结果、运行状态和图片不会写入历史。
+          本地对话与 MCP 协作上下文都仅保存在当前 Chrome Profile；两类记录彼此独立。
         </Typography.Paragraph>
         <Input
           allowClear
@@ -1702,6 +1742,9 @@ export function ChatPanel({
                     </span>
                   </button>
                   <div className="chat-history-actions">
+                    {conversation.kind === "mcp_collaboration" ? (
+                      <Tag className="chat-history-kind">MCP 协作</Tag>
+                    ) : null}
                     {active ? <Tag color="blue">当前</Tag> : null}
                     <Tooltip title="导出 Markdown">
                       <Button
@@ -2595,102 +2638,328 @@ const CONTEXT_USAGE_LABELS: Record<AiContextUsageCategory, string> = {
   system: "系统提示",
   tool_definitions: "工具定义",
   conversation: "对话",
+  conversation_memory: "对话记忆",
   page_context: "页面上下文",
   tool_results: "MCP 与工具结果",
   other: "协议开销",
 };
 
+const CONVERSATION_CUMULATIVE_LABELS = {
+  conversation: "对话消息",
+  tool_results: "工具调用与结果",
+} as const;
+
 function ContextUsageDetails({
   report,
+  memory,
+  messages,
 }: {
-  report: AiContextUsageSnapshot;
+  report?: AiContextUsageSnapshot;
+  memory?: ConversationMemoryV1;
+  messages: ChatMessage[];
 }): ReactNode {
-  const percentage = contextUsagePercent(report);
-  const rows = (
-    Object.entries(report.breakdown) as Array<
-      [AiContextUsageCategory, number]
+  const [activeView, setActiveView] = useState<"conversation" | "request">(
+    "conversation",
+  );
+  const percentage = report ? contextUsagePercent(report) : 0;
+  const rows = report
+    ? (
+        Object.entries(report.breakdown) as Array<
+          [AiContextUsageCategory, number]
+        >
+      ).filter(([, tokens]) => tokens > 0)
+    : [];
+  const cumulativeBreakdown = messages.reduce(
+    (totals, message) => {
+      const contentTokens = estimateTextTokens(message.content);
+      if (message.role === "tool") {
+        totals.tool_results += contentTokens;
+      } else {
+        totals.conversation += contentTokens;
+      }
+      if (message.toolRequestArguments) {
+        totals.tool_results += estimateTextTokens(message.toolRequestArguments);
+      }
+      return totals;
+    },
+    { conversation: 0, tool_results: 0 },
+  );
+  const cumulativeConversationTokens =
+    cumulativeBreakdown.conversation + cumulativeBreakdown.tool_results;
+  const cumulativeRows = (
+    Object.entries(cumulativeBreakdown) as Array<
+      [keyof typeof cumulativeBreakdown, number]
     >
   ).filter(([, tokens]) => tokens > 0);
+  const cumulativeContextWindowTokens = report?.contextWindowTokens;
+  const cumulativePercentage = cumulativeContextWindowTokens
+    ? Math.round(
+        (cumulativeConversationTokens / cumulativeContextWindowTokens) * 100,
+      )
+    : undefined;
+  const cumulativeMeterCapacity = Math.max(
+    cumulativeConversationTokens,
+    cumulativeContextWindowTokens ?? cumulativeConversationTokens,
+    1,
+  );
+  const memoryContext = buildConversationMemoryContext(memory);
+  const memoryContextTokens = memoryContext
+    ? estimateTextTokens(memoryContext)
+    : 0;
+  const pendingDecisions =
+    memory?.pendingDecisions.filter((decision) => decision.status === "pending") ??
+    [];
+  const activeConstraints =
+    memory?.constraints.filter((constraint) => constraint.lifecycle === "active") ??
+    [];
+  const activeFacts =
+    memory?.facts.filter((fact) => fact.lifecycle === "active") ?? [];
+  const taskStatus = memory?.activeTask
+    ? CONVERSATION_TASK_STATUS_LABELS[memory.activeTask.status]
+    : undefined;
 
   return (
-    <div className="context-usage-popover" aria-label="本次模型请求上下文明细">
-      <div className="context-usage-heading">
-        <strong>本次模型请求上下文</strong>
-        <span>{percentage}%</span>
+    <div className="context-usage-popover" aria-label="对话与请求上下文明细">
+      <div className="context-usage-tabs" role="tablist" aria-label="上下文视图">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeView === "conversation"}
+          className={activeView === "conversation" ? "is-active" : ""}
+          onClick={() => setActiveView("conversation")}
+        >
+          对话累计
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeView === "request"}
+          className={activeView === "request" ? "is-active" : ""}
+          onClick={() => setActiveView("request")}
+          disabled={!report}
+        >
+          本次请求
+        </button>
       </div>
-      <div className="context-usage-total">
-        {report.source === "provider" ? "实际" : "约"}{" "}
-        {formatEstimatedTokenCount(report.estimatedInputTokens)} / {formatEstimatedTokenCount(report.contextWindowTokens)}
-      </div>
-      <div className="context-usage-compaction" role="note">
-        这里显示最近一次请求，不是聊天累计总量。完成轮次的原始工具结果会由最终回答中的结论替代，对话问题和结论仍会保留。
-      </div>
-      <div
-        className="context-usage-meter"
-        role="img"
-        aria-label={`约使用 ${percentage}% 上下文`}
-      >
-        {rows.map(([category, tokens]) => (
-          <span
-            key={category}
-            className={`context-usage-segment is-${category}`}
-            style={{ flexGrow: tokens }}
-          />
-        ))}
-        {report.contextWindowTokens > report.estimatedInputTokens ? (
-          <span
-            className="context-usage-segment is-unused"
-            style={{
-              flexGrow:
-                report.contextWindowTokens - report.estimatedInputTokens,
-            }}
-          />
-        ) : null}
-      </div>
-      <div className="context-usage-list">
-        {rows.map(([category, tokens]) => (
-          <div className="context-usage-row" key={category}>
+
+      {activeView === "conversation" ? (
+        <div className="context-usage-view" role="tabpanel">
+          <div className="context-usage-heading">
+            <strong>对话累计存量</strong>
             <span>
-              <i className={`context-usage-dot is-${category}`} />
-              {CONTEXT_USAGE_LABELS[category]}
+              {cumulativePercentage !== undefined
+                ? `${cumulativePercentage}%`
+                : `${messages.length} 条记录`}
             </span>
-            <strong>约 {formatEstimatedTokenCount(tokens)}</strong>
           </div>
-        ))}
-      </div>
-      <div className="context-usage-reserve">
-        输入预算 {formatEstimatedTokenCount(report.inputBudgetTokens)} · 输出预留 {formatEstimatedTokenCount(report.outputReserveTokens)}
-      </div>
-      {report.providerUsage ? (
-        <div className="context-usage-provider" role="note">
-          Provider：输入 {formatEstimatedTokenCount(report.providerUsage.promptTokens)} · 输出 {formatEstimatedTokenCount(report.providerUsage.completionTokens)}
-          {report.providerUsage.cachedPromptTokens !== undefined
-            ? ` · 缓存 ${formatEstimatedTokenCount(report.providerUsage.cachedPromptTokens)}`
-            : ""}
-        </div>
-      ) : null}
-      {report.omittedMessageCount > 0 || report.compactedMessageCount > 0 ? (
-        <div className="context-usage-compaction" role="note">
-          发送前已省略 {report.omittedMessageCount} 条消息、压缩 {report.compactedMessageCount} 条消息。
-        </div>
-      ) : null}
-      {report.compactionSteps?.length ? (
-        <div className="context-usage-steps">
-          {report.compactionSteps.map((step, index) => (
-            <div key={`${step.reason}-${index}`}>
-              {step.reason}：{formatEstimatedTokenCount(step.beforeTokens)} → {formatEstimatedTokenCount(step.afterTokens)}
+          <div className="context-usage-total">
+            约 {formatEstimatedTokenCount(cumulativeConversationTokens)}
+            {cumulativeContextWindowTokens
+              ? ` / ${formatEstimatedTokenCount(cumulativeContextWindowTokens)} tokens`
+              : ` · ${messages.length} 条记录`}
+          </div>
+          <div
+            className="context-usage-meter"
+            role="img"
+            aria-label={
+              cumulativePercentage !== undefined
+                ? `累计对话约占最近模型窗口 ${cumulativePercentage}%`
+                : `累计对话约 ${formatEstimatedTokenCount(cumulativeConversationTokens)}`
+            }
+          >
+            {cumulativeRows.map(([category, tokens]) => (
+              <span
+                key={category}
+                className={`context-usage-segment is-${category}`}
+                style={{ flexGrow: tokens }}
+              />
+            ))}
+            {cumulativeMeterCapacity > cumulativeConversationTokens ? (
+              <span
+                className="context-usage-segment is-unused"
+                style={{
+                  flexGrow:
+                    cumulativeMeterCapacity - cumulativeConversationTokens,
+                }}
+              />
+            ) : null}
+          </div>
+          <div className="context-usage-list">
+            {cumulativeRows.map(([category, tokens]) => (
+              <div className="context-usage-row" key={category}>
+                <span>
+                  <i className={`context-usage-dot is-${category}`} />
+                  {CONVERSATION_CUMULATIVE_LABELS[category]}
+                </span>
+                <strong>约 {formatEstimatedTokenCount(tokens)}</strong>
+              </div>
+            ))}
+          </div>
+          {memoryContextTokens > 0 ? (
+            <div className="context-usage-current-memory">
+              当前结构化记忆约 {formatEstimatedTokenCount(memoryContextTokens)}，
+              作为可更新快照单独计算
             </div>
-          ))}
+          ) : null}
+          {memory?.activeTask ? (
+            <section className="context-memory-section">
+              <div className="context-memory-section-heading">
+                <strong>当前任务</strong>
+                {taskStatus ? <span>{taskStatus}</span> : null}
+              </div>
+              <p>{memory.activeTask.objective}</p>
+              {memory.activeTask.nextActions.length ? (
+                <ul>
+                  {memory.activeTask.nextActions.slice(0, 3).map((action) => (
+                    <li key={action}>{action}</li>
+                  ))}
+                </ul>
+              ) : null}
+              {memory.activeTask.blockers.length ? (
+                <div className="context-memory-warning">
+                  阻塞：{memory.activeTask.blockers.slice(0, 2).join("；")}
+                </div>
+              ) : null}
+            </section>
+          ) : (
+            <div className="context-memory-empty">
+              尚未形成当前任务。完成一次有效对话后会自动提取。
+            </div>
+          )}
+          {pendingDecisions.length ? (
+            <section className="context-memory-section">
+              <div className="context-memory-section-heading">
+                <strong>待决策</strong>
+                <span>{pendingDecisions.length}</span>
+              </div>
+              <ul>
+                {pendingDecisions.slice(0, 4).map((decision) => (
+                  <li key={decision.id}>{decision.question}</li>
+                ))}
+              </ul>
+            </section>
+          ) : null}
+          {activeConstraints.length || activeFacts.length ? (
+            <section className="context-memory-section">
+              <div className="context-memory-section-heading">
+                <strong>记忆</strong>
+                <span>
+                  {activeConstraints.length} 条约束 · {activeFacts.length} 条事实
+                </span>
+              </div>
+              <ul>
+                {activeConstraints.slice(0, 2).map((constraint) => (
+                  <li key={constraint.id}>{constraint.statement}</li>
+                ))}
+                {activeFacts.slice(0, 3).map((fact) => (
+                  <li key={fact.id}>{fact.statement}</li>
+                ))}
+              </ul>
+            </section>
+          ) : null}
+          {report &&
+          (report.omittedMessageCount > 0 || report.compactedMessageCount > 0) ? (
+            <div className="context-usage-compaction" role="note">
+              最近一次请求发送前省略 {report.omittedMessageCount} 条消息、压缩 {report.compactedMessageCount} 条消息；对话原文与结构化记忆仍按持久化规则保存。
+            </div>
+          ) : (
+            <div className="context-usage-note">
+              这是已保存消息与工具记录的累计估算，会随对话持续增长；实际发送量以“本次请求”为准，超过预算时会筛选或压缩。
+            </div>
+          )}
+        </div>
+      ) : report ? (
+        <div className="context-usage-view" role="tabpanel">
+          <div className="context-usage-heading">
+            <strong>本次模型请求上下文</strong>
+            <span>{percentage}%</span>
+          </div>
+          <div className="context-usage-total">
+            {report.source === "provider" ? "实际" : "约"}{" "}
+            {formatEstimatedTokenCount(report.estimatedInputTokens)} / {formatEstimatedTokenCount(report.contextWindowTokens)}
+          </div>
+          <div className="context-usage-compaction" role="note">
+            这里显示最近一次请求，不是聊天累计总量。完成轮次的原始工具结果会由最终回答中的结论替代，对话问题和结论仍会保留。
+          </div>
+          <div
+            className="context-usage-meter"
+            role="img"
+            aria-label={`约使用 ${percentage}% 上下文`}
+          >
+            {rows.map(([category, tokens]) => (
+              <span
+                key={category}
+                className={`context-usage-segment is-${category}`}
+                style={{ flexGrow: tokens }}
+              />
+            ))}
+            {report.contextWindowTokens > report.estimatedInputTokens ? (
+              <span
+                className="context-usage-segment is-unused"
+                style={{
+                  flexGrow:
+                    report.contextWindowTokens - report.estimatedInputTokens,
+                }}
+              />
+            ) : null}
+          </div>
+          <div className="context-usage-list">
+            {rows.map(([category, tokens]) => (
+              <div className="context-usage-row" key={category}>
+                <span>
+                  <i className={`context-usage-dot is-${category}`} />
+                  {CONTEXT_USAGE_LABELS[category]}
+                </span>
+                <strong>约 {formatEstimatedTokenCount(tokens)}</strong>
+              </div>
+            ))}
+          </div>
+          <div className="context-usage-reserve">
+            输入预算 {formatEstimatedTokenCount(report.inputBudgetTokens)} · 输出预留 {formatEstimatedTokenCount(report.outputReserveTokens)}
+          </div>
+          {report.providerUsage ? (
+            <div className="context-usage-provider" role="note">
+              Provider：输入 {formatEstimatedTokenCount(report.providerUsage.promptTokens)} · 输出 {formatEstimatedTokenCount(report.providerUsage.completionTokens)}
+              {report.providerUsage.cachedPromptTokens !== undefined
+                ? ` · 缓存 ${formatEstimatedTokenCount(report.providerUsage.cachedPromptTokens)}`
+                : ""}
+            </div>
+          ) : null}
+          {report.omittedMessageCount > 0 || report.compactedMessageCount > 0 ? (
+            <div className="context-usage-compaction" role="note">
+              发送前已省略 {report.omittedMessageCount} 条消息、压缩 {report.compactedMessageCount} 条消息。
+            </div>
+          ) : null}
+          {report.compactionSteps?.length ? (
+            <div className="context-usage-steps">
+              {report.compactionSteps.map((step, index) => (
+                <div key={`${step.reason}-${index}`}>
+                  {step.reason}：{formatEstimatedTokenCount(step.beforeTokens)} → {formatEstimatedTokenCount(step.afterTokens)}
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <div className="context-usage-note">
+            {report.source === "provider"
+              ? "本次数字来自 Provider usage；分类占比按发送内容估算。"
+              : "估算值；Provider 未返回 usage 时以当前估算器为准。"}
+          </div>
         </div>
       ) : null}
-      <div className="context-usage-note">
-        {report.source === "provider"
-          ? "本次数字来自 Provider usage；分类占比按发送内容估算。"
-          : "估算值；Provider 未返回 usage 时以当前估算器为准。"}
-      </div>
     </div>
   );
 }
+
+const CONVERSATION_TASK_STATUS_LABELS: Record<
+  NonNullable<ConversationMemoryV1["activeTask"]>["status"],
+  string
+> = {
+  active: "进行中",
+  waiting: "等待中",
+  suspended: "已暂停",
+  completed: "已完成",
+  blocked: "受阻",
+};
 
 function getToolMessageSizeSummary(message: ChatMessage): string {
   const size = message.toolResultMeta?.truncated
@@ -2962,7 +3231,9 @@ function DelegatedTaskCard({
           <ApiOutlined />
         </span>
         <div className="delegated-task-heading">
-          <span className="delegated-task-source">Codex · MCP / {requestTypeLabel}</span>
+          <span className="delegated-task-source">
+            MCP 后端 AI · Codex / {requestTypeLabel}
+          </span>
           <Typography.Text className="delegated-task-title" strong>
             {task.requestItem.title}
           </Typography.Text>

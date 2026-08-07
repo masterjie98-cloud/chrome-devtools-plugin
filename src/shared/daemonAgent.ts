@@ -8,6 +8,10 @@ import type { BrowserActivityCursor } from "./browserActivity";
 import type { CollaborationWorkspaceSnapshot } from "./collaborationWorkspace";
 import type { DomElementInfo, PageSnapshot } from "./dom";
 import type { AiContextUsageSnapshot } from "./aiContextUsage";
+import type {
+  ConversationMemoryPatch,
+  ConversationMemoryV1,
+} from "./conversationMemory";
 
 export interface DaemonAgentConfig {
   apiUrl: string;
@@ -101,12 +105,18 @@ export interface DaemonAgentContext {
   activityCursor?: BrowserActivityCursor;
   contextReadError?: string;
   toolScope?: "browser" | "mixed" | "external_only";
+  memory?: ConversationMemoryV1;
+  turnControl?: {
+    mode: "supersede";
+    supersededRunId: string;
+  };
 }
 
 export interface DaemonAgentStartPayload {
   runId: string;
   conversationId: string;
   assistantMessageId: string;
+  userMessageId?: string;
   config: DaemonAgentConfig;
   messages: DaemonAgentMessage[];
   input: string;
@@ -199,6 +209,7 @@ export interface DaemonAgentCompletionResult {
   session: AgentSessionSnapshot;
   status: "completed" | "blocked" | "failed" | "cancelled";
   errorDetail?: string;
+  memoryPatch?: ConversationMemoryPatch;
 }
 
 /**
@@ -291,6 +302,15 @@ export type DaemonAgentEventPayload =
       conversationId: string;
       kind: "context_usage";
       report: AiContextUsageSnapshot;
+    }
+  | {
+      runId: string;
+      conversationId: string;
+      kind: "memory_patch";
+      baseRevision: number;
+      patch: ConversationMemoryPatch;
+      source: "ai" | "fallback";
+      modelRequestCount: number;
     }
   | {
       runId: string;

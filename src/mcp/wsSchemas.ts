@@ -542,6 +542,7 @@ const daemonAgentStartSchema = z
     runId: z.string().min(1).max(200),
     conversationId: z.string().min(1).max(200),
     assistantMessageId: z.string().min(1).max(200),
+    userMessageId: z.string().min(1).max(200).optional(),
     config: daemonAgentConfigSchema,
     messages: z
       .array(
@@ -581,6 +582,14 @@ const daemonAgentStartSchema = z
           .optional(),
         contextReadError: z.string().max(2_000).optional(),
         toolScope: z.enum(["browser", "mixed", "external_only"]).optional(),
+        memory: z.unknown().optional(),
+        turnControl: z
+          .object({
+            mode: z.literal("supersede"),
+            supersededRunId: z.string().min(1).max(200),
+          })
+          .strict()
+          .optional(),
       })
       .strict(),
     tools: z

@@ -124,6 +124,11 @@ const RETAINED_COLLABORATION_WORKSPACE_BYTES =
   COLLABORATION_WORKSPACE_HEADROOM_BYTES;
 
 const ITEM_ID_PATTERN = /^ctx_[A-Za-z0-9_-]{8,200}$/;
+const DELEGATED_TASK_ID_PATTERN = /^task_[A-Za-z0-9_-]{8,120}$/;
+const DELEGATED_EVENT_ID_PATTERN = /^evt_[A-Za-z0-9_-]{8,80}$/;
+const DELEGATED_CONVERSATION_KEY_PATTERN = /^conv_(?:[a-p]{4}){1,200}$/;
+const CONTENT_FINGERPRINT_PATTERN = /^[A-Za-z0-9_-]{8,200}$/;
+const CONTENT_SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
 const MAX_JSON_DEPTH = 6;
 const MAX_ARRAY_ITEMS = 80;
 const MAX_OBJECT_KEYS = 80;
@@ -143,11 +148,14 @@ export function upsertCollaborationItem(
   now = new Date().toISOString(),
   options: { allowOwnerLastWriteWithoutRevision?: boolean } = {},
 ): CollaborationWorkspaceMutationResult {
-  assertWorkspaceSnapshot(workspace, now);
+  const sanitizedWorkspace = sanitizeCollaborationWorkspace(workspace, now);
   const normalizedSource = sanitizeSource(source);
   const itemId = normalizeItemId(input.id ?? `ctx_${createMessageId()}`);
-  const existingIndex = workspace.items.findIndex((item) => item.id === itemId);
-  const existing = existingIndex >= 0 ? workspace.items[existingIndex] : undefined;
+  const existingIndex = sanitizedWorkspace.items.findIndex(
+    (item) => item.id === itemId,
+  );
+  const existing =
+    existingIndex >= 0 ? sanitizedWorkspace.items[existingIndex] : undefined;
 
   if (existing) {
     if (
@@ -193,7 +201,7 @@ export function upsertCollaborationItem(
     },
   );
 
-  const items = [...workspace.items];
+  const items = [...sanitizedWorkspace.items];
   if (existingIndex >= 0) {
     items.splice(existingIndex, 1, item);
   } else {
@@ -202,7 +210,7 @@ export function upsertCollaborationItem(
 
   const nextWorkspace = {
     version: COLLABORATION_WORKSPACE_VERSION,
-    revision: workspace.revision + 1,
+    revision: sanitizedWorkspace.revision + 1,
     items: retainBoundedItems(items, now, item.id),
   } satisfies CollaborationWorkspaceSnapshot;
   assertWorkspaceByteLimit(nextWorkspace);
@@ -369,7 +377,11 @@ export function sanitizeCollaborationItem(value: unknown): CollaborationItem {
   }
   const content = value.content === undefined
     ? undefined
-    : sanitizeJsonValue(redactSensitiveData(value.content), 0);
+    : repairDelegatedTaskRequestContent(
+        id,
+        value.kind,
+        sanitizeJsonValue(redactSensitiveData(value.content), 0),
+      );
   if (
     content !== undefined &&
     new TextEncoder().encode(JSON.stringify(content)).byteLength >
@@ -402,7 +414,11 @@ export function sanitizeCollaborationItem(value: unknown): CollaborationItem {
   };
 }
 
-function sanitizeJsonValue(value: unknown, depth: number): CollaborationJsonValue {
+function sanitizeJsonValue(
+  value: unknown,
+  depth: number,
+  parentKey?: string,
+): CollaborationJsonValue {
   if (depth > MAX_JSON_DEPTH) {
     throw new Error("COLLABORATION_CONTENT_INVALID: JSON nesting is too deep.");
   }
@@ -416,6 +432,9 @@ function sanitizeJsonValue(value: unknown, depth: number): CollaborationJsonValu
     return value;
   }
   if (typeof value === "string") {
+    if (isOpaqueCollaborationControlValue(parentKey, value)) {
+      return value;
+    }
     // Collaboration content is payload data rather than compact metadata. It
     // can contain a delegated Agent report, code, or other Markdown whose
     // physical line breaks are semantically significant. Titles, tags, and
@@ -444,11 +463,67 @@ function sanitizeJsonValue(value: unknown, depth: number): CollaborationJsonValu
     return Object.fromEntries(
       entries.map(([key, entry]) => [
         sanitizeRequiredText(key, 120, "content key"),
-        sanitizeJsonValue(entry, depth + 1),
+        sanitizeJsonValue(entry, depth + 1, key),
       ]),
     );
   }
   throw new Error("COLLABORATION_CONTENT_INVALID: content must be JSON-serializable.");
+}
+
+function isOpaqueCollaborationControlValue(
+  key: string | undefined,
+  value: string,
+): boolean {
+  switch (key) {
+    case "taskId":
+      return DELEGATED_TASK_ID_PATTERN.test(value);
+    case "eventId":
+      return DELEGATED_EVENT_ID_PATTERN.test(value);
+    case "conversationKey":
+    case "previousConversationKey":
+      return DELEGATED_CONVERSATION_KEY_PATTERN.test(value);
+    case "requestFingerprint":
+    case "resultFingerprint":
+    case "eventFingerprint":
+      return CONTENT_FINGERPRINT_PATTERN.test(value);
+    case "agentSessionId":
+      return CONTENT_SESSION_ID_PATTERN.test(value);
+    case "claimedAt":
+    case "reboundAt":
+    case "completedAt":
+    case "publishedAt":
+      return isIsoTimestamp(value) && value.length <= 64;
+    default:
+      return false;
+  }
+}
+
+function repairDelegatedTaskRequestContent(
+  itemId: string,
+  kind: CollaborationItemKind,
+  content: CollaborationJsonValue,
+): CollaborationJsonValue {
+  if (
+    kind !== "task.request" ||
+    !itemId.startsWith("ctx_delegate_") ||
+    !isRecord(content) ||
+    content.version !== "delegated-task-v1" ||
+    content.type !== "request"
+  ) {
+    return content;
+  }
+  const taskId = `task_${itemId.slice("ctx_delegate_".length)}`;
+  if (
+    !DELEGATED_TASK_ID_PATTERN.test(taskId) ||
+    (typeof content.taskId === "string" &&
+      DELEGATED_TASK_ID_PATTERN.test(content.taskId))
+  ) {
+    return content;
+  }
+  return {
+    ...content,
+    taskId,
+  };
 }
 
 function sanitizeSource(value: unknown): CollaborationItemSource {

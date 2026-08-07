@@ -134,6 +134,43 @@ test("collaboration task result content preserves Markdown block boundaries", ()
   assert.equal(content.summary, markdown);
 });
 
+test("workspace repair restores a redacted delegated task ID from its item ID", () => {
+  const workspace = sanitizeCollaborationWorkspace({
+    version: "collaboration-workspace-v1",
+    revision: 1,
+    items: [
+      {
+        id: "ctx_delegate_mcp_ui_phase1_e2e_1786079805882",
+        kind: "task.request",
+        title: "MCP UI test",
+        summary: "Delegated request",
+        content: {
+          version: "delegated-task-v1",
+          type: "request",
+          taskId: "task_mcp_ui_phase1_e2e_[REDACTED_PHONE]",
+          requestType: "question",
+          instruction: "Reply without tools.",
+          acceptanceCriteria: [],
+          requestFingerprint: "QYvARzl4-oheG4njphiMUDpsRCke3nlGA5u6b-PVBxU",
+        },
+        tags: ["delegated-task", "question"],
+        visibility: "shared",
+        sensitivity: "safe",
+        status: "active",
+        source: { actor: "mcp_agent" },
+        revision: 1,
+        createdAt: NOW,
+        updatedAt: NOW,
+      },
+    ],
+  });
+
+  assert.equal(
+    (workspace.items[0]?.content as Record<string, unknown>).taskId,
+    "task_mcp_ui_phase1_e2e_1786079805882",
+  );
+});
+
 test("MCP workspace omits private items and sensitive item content", () => {
   const shared = upsertCollaborationItem(
     createEmptyCollaborationWorkspace(),

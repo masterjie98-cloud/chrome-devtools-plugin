@@ -3,6 +3,7 @@ import type { AgentRunBudgetExtensionRequest } from "../shared/agentRunBudget";
 import type { ToolResultPresentationMeta } from "./toolResultPresentation";
 
 export type ChatRole = "user" | "assistant" | "tool";
+export type ChatConversationKind = "local" | "mcp_collaboration";
 export type ChatMessageSource =
   | "user"
   | "extension_ai"
@@ -62,6 +63,8 @@ export interface QueuedChatSubmission {
   input: string;
   attachments: ChatImageAttachment[];
   createdAt: string;
+  /** The user explicitly stopped this run before sending the new request. */
+  supersedesRunId?: string;
   executionMode?: "standard" | "safe_retry";
   executionBinding?: ExecutionTaskBinding;
   delegatedTask?: {
@@ -96,6 +99,8 @@ export type ChatSendTargetChoice =
 
 export interface ChatConversationSummary {
   id: string;
+  kind: ChatConversationKind;
+  delegatedTaskId?: string;
   title: string;
   updatedAt: string;
   messageCount: number;

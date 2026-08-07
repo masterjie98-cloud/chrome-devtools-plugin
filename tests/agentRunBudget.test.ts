@@ -2561,6 +2561,265 @@ test("external MCP results do not trigger current-page browser verification", as
   }
 });
 
+test("structured memory continues a delegated external MCP decision without reading the current page", async () => {
+  const externalToolName =
+    "extmcp__mcp_prometheus_inf__prometheus_query_0ed7db8";
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-node-metrics",
+                type: "function",
+                function: {
+                  name: externalToolName,
+                  arguments:
+                    '{"query":"node_filesystem_avail_bytes{instance=\\"rs-compute1\\"}"}',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          message: {
+            content: "已按推荐项继续查询 rs-compute1 节点磁盘指标。",
+          },
+        },
+      ],
+    },
+  ];
+  const requestBodies: Record<string, unknown>[] = [];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+    (body) => requestBodies.push(body),
+  );
+  const executedTools: string[] = [];
+  try {
+    const result = await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 4 },
+      messages: [
+        {
+          id: "previous-user",
+          role: "user",
+          content: "排查 fluent-bit-jmz5k SIGBUS",
+          createdAt: "2026-08-06T10:00:00.000Z",
+        },
+        {
+          id: "previous-assistant",
+          role: "assistant",
+          content: "可以查询节点磁盘指标或对比正常节点。要继续哪个？",
+          createdAt: "2026-08-06T10:01:00.000Z",
+        },
+      ],
+      input: "你自己决定",
+      attachments: [],
+      context: {
+        memory: {
+          version: "conversation-memory-v1",
+          revision: 2,
+          activeTask: {
+            id: "task-fluent-bit",
+            objective: "排查 fluent-bit-jmz5k SIGBUS",
+            status: "waiting",
+            affinity: "external_mcp",
+            successCriteria: ["确认根因"],
+            entities: ["fluent-bit-jmz5k", "rs-compute1"],
+            nextActions: ["查询节点磁盘指标"],
+            blockers: [],
+            provenance: {
+              messageIds: ["previous-user", "previous-assistant"],
+              toolCallIds: [],
+            },
+            updatedAt: "2026-08-06T10:01:00.000Z",
+          },
+          pendingDecisions: [
+            {
+              id: "decision-next",
+              question: "继续哪个检查？",
+              options: [
+                {
+                  id: "node-metrics",
+                  label: "查询节点磁盘指标",
+                  recommended: true,
+                },
+              ],
+              status: "pending",
+              provenance: {
+                messageIds: ["previous-assistant"],
+                toolCallIds: [],
+              },
+              updatedAt: "2026-08-06T10:01:00.000Z",
+            },
+          ],
+          constraints: [],
+          facts: [],
+          turnSummaries: [],
+          updatedAt: "2026-08-06T10:01:00.000Z",
+        },
+        pageSnapshot: {
+          url: "https://enterprise.example/dns",
+          title: "DNS 管理",
+          origin: "https://enterprise.example",
+          capturedAt: "2026-08-06T10:02:00.000Z",
+          visibleText: "DNS 管理 添加记录",
+          domSummary: [],
+          nodeCount: 2,
+          truncated: false,
+        },
+      },
+      assistantMessageId: "assistant-memory-follow-up",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: externalToolName,
+            description: "Query Prometheus node and pod metrics.",
+            parameters: { type: "object", properties: {} },
+          },
+          clientMetadata: { source: "external_mcp" },
+        },
+        {
+          type: "function",
+          function: {
+            name: "browser_observe",
+            description: "Read the current page.",
+            parameters: { type: "object", properties: {} },
+          },
+          clientMetadata: { source: "builtin" },
+        },
+      ],
+      executeToolCalls: async (calls) => {
+        executedTools.push(...calls.map((call) => call.name));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({ series: [] }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedTools, [externalToolName]);
+    assert.equal(result.session.taskState.objective, "排查 fluent-bit-jmz5k SIGBUS");
+    const serialized = JSON.stringify(requestBodies[0]);
+    assert.match(serialized, /CONVERSATION_MEMORY/);
+    assert.doesNotMatch(serialized, /DNS 管理/);
+  } finally {
+    restore();
+  }
+});
+
+test("an explicit new page objective overrides remembered external MCP work", async () => {
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                id: "call-dns-observe",
+                type: "function",
+                function: { name: "browser_observe", arguments: "{}" },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [{ message: { content: "已切换为检查当前 DNS 页面。" } }],
+    },
+  ];
+  const restore = installBrowserGlobals(
+    (index) => responses[index] ?? responses.at(-1)!,
+    () => undefined,
+  );
+  const executedTools: string[] = [];
+  try {
+    await runAutonomousAgentSession({
+      config: { ...DEFAULT_AI_CONFIG, maxToolRounds: 4 },
+      messages: [],
+      input: "改为检查当前 DNS 页面",
+      attachments: [],
+      context: {
+        memory: {
+          version: "conversation-memory-v1",
+          revision: 2,
+          activeTask: {
+            id: "task-fluent-bit",
+            objective: "排查 fluent-bit SIGBUS",
+            status: "waiting",
+            affinity: "external_mcp",
+            successCriteria: [],
+            entities: ["fluent-bit"],
+            nextActions: ["查询节点指标"],
+            blockers: [],
+            provenance: { messageIds: ["old-user"], toolCallIds: [] },
+            updatedAt: "2026-08-06T10:00:00.000Z",
+          },
+          pendingDecisions: [],
+          constraints: [],
+          facts: [],
+          turnSummaries: [],
+          updatedAt: "2026-08-06T10:00:00.000Z",
+        },
+      },
+      assistantMessageId: "assistant-new-page-task",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "browser_observe",
+            description: "Observe the current DNS page.",
+            parameters: { type: "object", properties: {} },
+          },
+          clientMetadata: { source: "builtin" },
+        },
+        {
+          type: "function",
+          function: {
+            name: "external_prometheus_query",
+            description: "Query old fluent-bit metrics.",
+            parameters: { type: "object", properties: {} },
+          },
+          clientMetadata: { source: "external_mcp" },
+        },
+        ...Array.from({ length: 40 }, (_, index) => ({
+          type: "function" as const,
+          function: {
+            name: `external_unrelated_${index}`,
+            description: `Old external diagnostic capability ${index} ${"schema ".repeat(220)}`,
+            parameters: { type: "object", properties: {} },
+          },
+          clientMetadata: { source: "external_mcp" as const },
+        })),
+      ],
+      executeToolCalls: async (calls) => {
+        executedTools.push(...calls.map((call) => call.name));
+        return calls.map((call) => ({
+          toolCallId: call.id,
+          name: call.name,
+          content: JSON.stringify({ title: "DNS 管理" }),
+        }));
+      },
+      onVisibleContent: () => undefined,
+    });
+
+    assert.deepEqual(executedTools, ["browser_observe"]);
+  } finally {
+    restore();
+  }
+});
+
 test("Agent continues when an external MCP diagnosis ends with a promised next inspection", async () => {
   const podToolName = "extmcp__k8s_dev__pods_get_a1b2c3";
   const logToolName = "extmcp__k8s_dev__pods_log_d4e5f6";

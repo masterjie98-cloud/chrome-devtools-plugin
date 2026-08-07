@@ -50,6 +50,7 @@ test("another conversation's active run becomes one background notification", ()
     conversations: [
       {
         id: "chat-old",
+        kind: "local",
         title: "旧任务",
         updatedAt: "2026-07-29T00:00:00.000Z",
         messageCount: 3,
@@ -124,6 +125,7 @@ test("multiple conversations remain independently visible as background work", (
 function conversation(id: string, title: string) {
   return {
     id,
+    kind: "local" as const,
     title,
     updatedAt: "2026-07-29T00:00:00.000Z",
     messageCount: 1,

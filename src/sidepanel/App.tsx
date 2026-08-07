@@ -136,6 +136,13 @@ import {
   type StoredConversationTarget,
 } from "./services/chatWorkspace";
 import {
+  applyConversationMemoryPatch,
+  applyConversationMemoryPatchAtRevision,
+  summarizeConversationMemory,
+  supersedeConversationTask,
+  type ConversationMemoryV1,
+} from "../shared/conversationMemory";
+import {
   createConversationExecutionApproval,
   createAgentConversationOriginApprovalGrant,
   executionApprovalModeAllows,
@@ -152,6 +159,10 @@ import {
 } from "./services/activityCursor";
 import { ElementPickerUiTracker } from "./services/elementPickerUi";
 import { mergeChatTimelineMessages } from "./chatTimeline";
+import {
+  hasPersistedPluginReply,
+  projectDelegatedTaskTimeline,
+} from "./delegatedTaskTimeline";
 import {
   isStaleDelegatedTaskTargetError,
   STALE_DELEGATED_TASK_SUMMARY,
@@ -218,7 +229,9 @@ function toChatMessages(
               ? "system"
               : "extension_ai"),
       }))
-    : createInitialChat();
+    : conversation.kind === "mcp_collaboration"
+      ? []
+      : createInitialChat();
 }
 
 function getContextLabel(
@@ -397,6 +410,11 @@ export function App() {
       [initialConversationId, { ...DEFAULT_EXTERNAL_MCP_SELECTION }],
     ]),
   );
+  const conversationMemoriesRef = useRef(
+    new Map<string, ConversationMemoryV1>(),
+  );
+  const [conversationMemoryRevision, setConversationMemoryRevision] =
+    useState(0);
   const [contextUsageByConversation, setContextUsageByConversation] = useState(
     () => new Map<string, AiContextUsageSnapshot>(),
   );
@@ -413,6 +431,8 @@ export function App() {
     QueuedChatSubmission[]
   >([]);
   const queuedChatSubmissionsRef = useRef<QueuedChatSubmission[]>([]);
+  const interruptedRunByConversationRef = useRef(new Map<string, string>());
+  const supersededAgentRunIdsRef = useRef(new Set<string>());
   const runChatSubmissionRef = useRef<
     ((submission: QueuedChatSubmission) => Promise<void>) | null
   >(null);
@@ -488,6 +508,34 @@ export function App() {
   );
   const aiBusy = activeAgentRuns.length > 0;
   const busy = Boolean(runningTool) || aiBusy;
+
+  const supersedeActiveAgentRun = (
+    conversationId: string,
+  ): string | undefined => {
+    const active = agentRunRegistryRef.current.get(conversationId);
+    if (!active) {
+      return interruptedRunByConversationRef.current.get(conversationId);
+    }
+    interruptedRunByConversationRef.current.set(conversationId, active.runId);
+    supersededAgentRunIdsRef.current.add(active.runId);
+    while (supersededAgentRunIdsRef.current.size > 128) {
+      const oldest = supersededAgentRunIdsRef.current.values().next().value;
+      if (typeof oldest !== "string") {
+        break;
+      }
+      supersededAgentRunIdsRef.current.delete(oldest);
+    }
+    agentRunRegistryRef.current.cancel(
+      conversationId,
+      new DOMException(
+        "User interrupted this run with a new controlling request.",
+        "AbortError",
+      ),
+    );
+    resolveConversationToolApprovals(conversationId, "deny");
+    cancelConversationAgentBudgetRequests(conversationId);
+    return active.runId;
+  };
   const currentPageUrl = hubState.activeTab?.url ?? pageSnapshot?.url;
   const currentTargetTabId = hubState.activeTab?.tabId;
   const currentTargetId = hubState.activeTab?.targetId;
@@ -546,6 +594,30 @@ export function App() {
     if (conversationId === conversationIdRef.current) {
       setConversationMcpSelection(selection);
     }
+  };
+
+  const replaceConversationMemory = (
+    conversationId: string,
+    memory: ConversationMemoryV1,
+  ) => {
+    conversationMemoriesRef.current.set(conversationId, memory);
+    if (conversationId === conversationIdRef.current) {
+      setConversationMemoryRevision((current) => current + 1);
+      return;
+    }
+    setStoredConversations((current) => {
+      const conversations = current.map((conversation) =>
+        conversation.id === conversationId
+          ? { ...conversation, memory, updatedAt: new Date().toISOString() }
+          : conversation,
+      );
+      void saveChatWorkspace({
+        version: 2,
+        activeConversationId: conversationIdRef.current,
+        conversations,
+      }).catch(() => undefined);
+      return conversations;
+    });
   };
 
   const replaceActivityCursorForConversation = (
@@ -707,6 +779,10 @@ export function App() {
     () =>
       storedConversations.map((conversation) => ({
         id: conversation.id,
+        kind: conversation.kind,
+        ...(conversation.delegatedTaskId
+          ? { delegatedTaskId: conversation.delegatedTaskId }
+          : {}),
         title: conversation.title,
         updatedAt: conversation.updatedAt,
         messageCount: conversation.messages.length,
@@ -718,6 +794,10 @@ export function App() {
       })),
     [storedConversations],
   );
+  const activeConversationMetadata = storedConversations.find(
+    (conversation) => conversation.id === activeConversationId,
+  );
+  const activeConversationKind = activeConversationMetadata?.kind ?? "local";
   const delegatedTasks = useMemo(
     () => listDelegatedTasks(hubState.collaborationWorkspace),
     [hubState.collaborationWorkspace],
@@ -741,16 +821,24 @@ export function App() {
     [delegatedTasks, storedConversations, workspaceHydrated],
   );
   const displayedChatMessages = useMemo<ChatMessage[]>(() => {
-    const delegatedMessages = conversationDelegatedTasks.map((task) => ({
-      id: task.requestItem.id,
-      role: "assistant" as const,
-      source: "mcp_ai" as const,
-      delegatedTaskId: task.taskId,
-      content: formatDelegatedTaskMessage(task),
-      createdAt: task.claimItem?.createdAt ?? task.requestItem.createdAt,
-    }));
-    return mergeChatTimelineMessages(chatMessages, delegatedMessages);
-  }, [chatMessages, conversationDelegatedTasks]);
+    if (activeConversationKind !== "mcp_collaboration") {
+      return chatMessages;
+    }
+    const delegatedMessages = conversationDelegatedTasks.flatMap((task) =>
+      projectDelegatedTaskTimeline(task, {
+        includeResult: !hasPersistedPluginReply(chatMessages, task),
+      }),
+    );
+    const delegatedMessageIds = new Set(
+      delegatedMessages.map((message) => message.id),
+    );
+    const persistedMessages = chatMessages.filter(
+      (message) =>
+        !delegatedMessageIds.has(message.id) &&
+        !(message.source === "mcp_ai" && message.delegatedTaskId),
+    );
+    return mergeChatTimelineMessages(persistedMessages, delegatedMessages);
+  }, [activeConversationKind, chatMessages, conversationDelegatedTasks]);
 
   useEffect(() => {
     const known = knownDelegatedTaskIdsRef.current;
@@ -797,6 +885,57 @@ export function App() {
     const messages = stored ? toChatMessages(stored) : createInitialChat();
     conversationMessagesRef.current.set(conversationId, messages);
     return messages;
+  };
+
+  const applyMemoryPatchForConversation = (
+    conversationId: string,
+    patch: Parameters<typeof applyConversationMemoryPatch>[1],
+    expectedRevision?: number,
+  ) => {
+    if (deletedAgentConversationIdsRef.current.has(conversationId)) {
+      return;
+    }
+    const memoryMessages = getConversationMessages(conversationId);
+    const currentMemory = conversationMemoriesRef.current.get(conversationId);
+    const evidence = {
+      messageIds: new Set(memoryMessages.map((message) => message.id)),
+      userMessageIds: new Set(
+        memoryMessages
+          .filter((message) => message.role === "user")
+          .map((message) => message.id),
+      ),
+      toolCallIds: new Set(
+        memoryMessages.flatMap((message) =>
+          message.toolCallId ? [message.toolCallId] : [],
+        ),
+      ),
+    };
+    const memory =
+      expectedRevision === undefined
+        ? applyConversationMemoryPatch(currentMemory, patch, evidence)
+        : applyConversationMemoryPatchAtRevision(
+            currentMemory,
+            patch,
+            evidence,
+            expectedRevision,
+          );
+    if (!memory) {
+      return;
+    }
+    replaceConversationMemory(conversationId, memory);
+    const memorySummary = summarizeConversationMemory(memory);
+    setContextUsageByConversation((current) => {
+      const report = current.get(conversationId);
+      if (!report) {
+        return current;
+      }
+      const next = new Map(current);
+      next.set(conversationId, {
+        ...report,
+        ...(memorySummary ? { memorySummary } : {}),
+      });
+      return next;
+    });
   };
 
   const replaceConversationMessages = (
@@ -871,6 +1010,13 @@ export function App() {
               normalizeExternalMcpSelection(conversation.externalMcpSelection),
             ]),
           );
+          conversationMemoriesRef.current = new Map(
+            workspace.conversations.flatMap((conversation) =>
+              conversation.memory
+                ? ([[conversation.id, conversation.memory]] as const)
+                : [],
+            ),
+          );
           conversationIdRef.current = active.id;
           setActiveConversationId(active.id);
           setConversationCreatedAt(active.createdAt);
@@ -916,6 +1062,12 @@ export function App() {
       const updatedAt = new Date().toISOString();
       const active = createStoredConversation({
         id: activeConversationId,
+        kind: activeConversationKind,
+        delegatedTaskId: activeConversationMetadata?.delegatedTaskId,
+        title:
+          activeConversationKind === "mcp_collaboration"
+            ? activeConversationMetadata?.title
+            : undefined,
         createdAt: conversationCreatedAt,
         updatedAt,
         messages: chatMessages,
@@ -923,13 +1075,14 @@ export function App() {
         target: conversationTarget,
         activityCursor: conversationActivityCursor,
         externalMcpSelection: conversationMcpSelection,
+        memory: conversationMemoriesRef.current.get(activeConversationId),
         forkedFromConversationId: conversationOrigin.conversationId,
         forkedFromMessageId: conversationOrigin.messageId,
       });
       setStoredConversations((current) => {
         const conversations = upsertPersistableConversation(current, active);
         void saveChatWorkspace({
-          version: 1,
+          version: 2,
           activeConversationId,
           conversations,
         }).catch(() => undefined);
@@ -940,6 +1093,9 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [
     activeConversationId,
+    activeConversationKind,
+    activeConversationMetadata?.delegatedTaskId,
+    activeConversationMetadata?.title,
     chatDraft,
     chatMessages,
     conversationCreatedAt,
@@ -947,6 +1103,7 @@ export function App() {
     conversationOrigin.messageId,
     conversationActivityCursor,
     conversationMcpSelection,
+    conversationMemoryRevision,
     conversationTarget,
     workspaceHydrated,
   ]);
@@ -1659,7 +1816,26 @@ export function App() {
       );
       return;
     }
-    const historyMessages = getConversationMessages(runConversationId);
+    const allHistoryMessages = getConversationMessages(runConversationId);
+    const historyMessages = submission.supersedesRunId
+      ? allHistoryMessages.filter(
+          (message) => message.runId !== submission.supersedesRunId,
+        )
+      : allHistoryMessages;
+    if (submission.supersedesRunId) {
+      const supersededMemory = supersedeConversationTask(
+        conversationMemoriesRef.current.get(runConversationId),
+      );
+      if (supersededMemory) {
+        replaceConversationMemory(runConversationId, supersededMemory);
+      }
+      if (
+        interruptedRunByConversationRef.current.get(runConversationId) ===
+        submission.supersedesRunId
+      ) {
+        interruptedRunByConversationRef.current.delete(runConversationId);
+      }
+    }
     const runConfig =
       submission.executionMode === "safe_retry"
         ? createSafeRetryConfig(aiConfig)
@@ -1668,9 +1844,11 @@ export function App() {
     if (!runConfig.supportsVision && attachments.length > 0) {
       api.warning("当前检测结果不支持图片输入，已忽略本次图片附件。");
     }
+    const agentRunId = createMessageId();
     const userMessage: ChatMessage = delegatedTask
       ? {
           id: delegatedTask.requestItemId,
+          runId: agentRunId,
           role: "user",
           source: "mcp_ai",
           delegatedTaskId: delegatedTask.taskId,
@@ -1682,6 +1860,7 @@ export function App() {
         }
       : appendChat(
           {
+            runId: agentRunId,
             role: "user",
             content: input,
             attachments: outgoingAttachments.length
@@ -1769,7 +1948,6 @@ export function App() {
       return;
     }
 
-    const agentRunId = createMessageId();
     const isCurrentAgentRun = () =>
       agentRunRegistryRef.current.isCurrent(
         runConversationId,
@@ -1830,6 +2008,7 @@ export function App() {
           runId: agentRunId,
           conversationId: runConversationId,
           assistantMessageId: assistantMessage.id,
+          userMessageId: userMessage.id,
           config: { ...runConfig },
           messages: historyMessages,
           input,
@@ -1845,6 +2024,15 @@ export function App() {
                 : runMcpSelection.mode === "off"
                   ? "browser"
                   : "mixed",
+            memory: conversationMemoriesRef.current.get(runConversationId),
+            ...(submission.supersedesRunId
+              ? {
+                  turnControl: {
+                    mode: "supersede" as const,
+                    supersededRunId: submission.supersedesRunId,
+                  },
+                }
+              : {}),
           },
           tools: runtimeAiTools,
           executionBinding,
@@ -1886,6 +2074,22 @@ export function App() {
                 return next;
               });
             }
+          },
+          onMemoryPatch: (patch, metadata) => {
+            if (
+              supersededAgentRunIdsRef.current.has(agentRunId) ||
+              !agentRunRegistryRef.current.isLatest(
+                runConversationId,
+                agentRunId,
+              )
+            ) {
+              return;
+            }
+            applyMemoryPatchForConversation(
+              runConversationId,
+              patch,
+              metadata.baseRevision,
+            );
           },
           onSessionUpdate: (session) => {
             if (
@@ -2013,6 +2217,15 @@ export function App() {
         undefined,
         runConversationId,
       );
+      if (
+        result.memoryPatch &&
+        !supersededAgentRunIdsRef.current.has(agentRunId)
+      ) {
+        applyMemoryPatchForConversation(
+          runConversationId,
+          result.memoryPatch,
+        );
+      }
       syncAiConversationToMcp(
         userMessage,
         assistantMessage,
@@ -2165,9 +2378,70 @@ export function App() {
       return false;
     }
 
+    const delegatedTarget =
+      toStoredConversationTargetFromDelegatedTask(task) ??
+      conversationTargetRef.current ??
+      toStoredConversationTarget(
+        toActiveTabSnapshot(foregroundTab) ?? hubState.activeTab,
+      );
+    const shouldCreateMcpConversation =
+      task.phase === "pending" && !task.claim && !resume && !rebind;
+    let acceptedConversationId = conversationIdRef.current;
+    let previousConversation: StoredChatConversation | undefined;
+    let previousMessages: ChatMessage[] | undefined;
+    let createdMcpConversation: StoredChatConversation | undefined;
+    let claimAccepted = false;
+
+    const restorePreviousConversation = () => {
+      if (!previousConversation || !previousMessages || !createdMcpConversation) {
+        return;
+      }
+      conversationMessagesRef.current.delete(createdMcpConversation.id);
+      conversationMcpSelectionsRef.current.delete(createdMcpConversation.id);
+      conversationMemoriesRef.current.delete(createdMcpConversation.id);
+      const conversations = upsertPersistableConversation(
+        storedConversations.filter(
+          (conversation) => conversation.id !== createdMcpConversation?.id,
+        ),
+        previousConversation,
+      );
+      activateStoredConversation(previousConversation, previousMessages);
+      saveConversationSnapshot(conversations, previousConversation.id);
+      publishConversationToMcp(previousConversation.id, previousMessages);
+    };
+
+    if (shouldCreateMcpConversation) {
+      const now = new Date().toISOString();
+      previousConversation = currentStoredConversation(now);
+      previousMessages = getConversationMessages(previousConversation.id);
+      acceptedConversationId = createMessageId();
+      const messages = [toDelegatedTaskChatMessage(task)];
+      createdMcpConversation = createStoredConversation({
+        id: acceptedConversationId,
+        kind: "mcp_collaboration",
+        delegatedTaskId: task.taskId,
+        title: task.requestItem.title,
+        createdAt: now,
+        updatedAt: now,
+        messages,
+        draft: "",
+        target: delegatedTarget,
+        externalMcpSelection: DEFAULT_EXTERNAL_MCP_SELECTION,
+      });
+      const conversations = upsertPersistableConversation(
+        upsertPersistableConversation(
+          storedConversations,
+          previousConversation,
+        ),
+        createdMcpConversation,
+      );
+      activateStoredConversation(createdMcpConversation, messages);
+      saveConversationSnapshot(conversations, acceptedConversationId);
+      mcpBridge.startPluginConversation(acceptedConversationId);
+    }
+
     setDelegatedTaskActionPending(taskId, true);
     try {
-      const acceptedConversationId = conversationIdRef.current;
       const claim = (await mcpBridge.callMcpTool(
         COLLABORATION_TOOL_NAMES.CLAIM_TASK,
         {
@@ -2189,15 +2463,11 @@ export function App() {
         attempt?: number;
       };
       if (!claim.claimed) {
+        restorePreviousConversation();
         api.info("该委托已被另一个插件窗口接受；未重复启动。");
         return false;
       }
-      const delegatedTarget =
-        toStoredConversationTargetFromDelegatedTask(task) ??
-        conversationTargetRef.current ??
-        toStoredConversationTarget(
-          toActiveTabSnapshot(foregroundTab) ?? hubState.activeTab,
-        );
+      claimAccepted = true;
       if (
         acceptedConversationId === conversationIdRef.current &&
         delegatedTarget
@@ -2227,6 +2497,9 @@ export function App() {
       };
 
       if (!agentRunRegistryRef.current.get(acceptedConversationId)) {
+        if (shouldCreateMcpConversation) {
+          api.success("已创建独立 MCP 协作对话，插件 AI 正在处理委托。");
+        }
         void runChatSubmission(submission);
         return true;
       }
@@ -2240,10 +2513,18 @@ export function App() {
         );
         return false;
       }
+      if (shouldCreateMcpConversation) {
+        api.success("已创建独立 MCP 协作对话，插件 AI 正在处理委托。");
+      }
       replaceQueuedChatSubmissions(() => queued.queue);
-      api.success("已接受 Codex 委托并加入执行队列。");
+      if (!shouldCreateMcpConversation) {
+        api.success("已接受 Codex 委托并加入执行队列。");
+      }
       return true;
     } catch (error) {
+      if (!claimAccepted) {
+        restorePreviousConversation();
+      }
       if (isStaleDelegatedTaskTargetError(error)) {
         const boundConversationId = task.claim?.conversationKey
           ? decodeDelegatedTaskConversationKey(task.claim.conversationKey)
@@ -2327,9 +2608,12 @@ export function App() {
         previousConversation.id,
       );
       const conversationId = createMessageId();
-      const messages = createInitialChat();
+      const messages = [toDelegatedTaskChatMessage(task)];
       const nextConversation = createStoredConversation({
         id: conversationId,
+        kind: "mcp_collaboration",
+        delegatedTaskId: task.taskId,
+        title: task.requestItem.title,
         createdAt: now,
         updatedAt: now,
         messages,
@@ -2470,19 +2754,29 @@ export function App() {
     }
 
     const submissionConversationId = conversationIdRef.current;
+    const activeRun = agentRunRegistryRef.current.get(
+      submissionConversationId,
+    );
+    const supersedesRunId =
+      mode === "interrupt" && activeRun
+        ? activeRun.runId
+        : interruptedRunByConversationRef.current.get(
+            submissionConversationId,
+          );
     const submission: QueuedChatSubmission = {
       id: createMessageId(),
       conversationId: submissionConversationId,
       input,
       attachments: [...attachments],
       createdAt: new Date().toISOString(),
+      ...(supersedesRunId ? { supersedesRunId } : {}),
       executionBinding: createExecutionTaskBinding(
         submissionConversationId,
         selectedTarget,
       ),
     };
 
-    if (!agentRunRegistryRef.current.get(submissionConversationId)) {
+    if (!activeRun) {
       void runChatSubmission(submission);
       return true;
     }
@@ -2500,9 +2794,7 @@ export function App() {
     replaceQueuedChatSubmissions(() => queued.queue);
     if (mode === "interrupt") {
       const conversationId = conversationIdRef.current;
-      agentRunRegistryRef.current.cancel(conversationId);
-      resolveConversationToolApprovals(conversationId, "deny");
-      cancelConversationAgentBudgetRequests(conversationId);
+      supersedeActiveAgentRun(conversationId);
       api.info("已优先排队，正在停止当前回复…");
     } else {
       api.success("已加入待发送队列");
@@ -2525,22 +2817,31 @@ export function App() {
     const submission = queuedChatSubmissionsRef.current.find(
       (candidate) => candidate.id === submissionId,
     );
-    replaceQueuedChatSubmissions((current) =>
-      moveChatSubmissionToFront(current, submissionId),
-    );
     if (submission) {
-      agentRunRegistryRef.current.cancel(submission.conversationId);
-      resolveConversationToolApprovals(submission.conversationId, "deny");
-      cancelConversationAgentBudgetRequests(submission.conversationId);
+      const supersedesRunId = supersedeActiveAgentRun(
+        submission.conversationId,
+      );
+      replaceQueuedChatSubmissions((current) =>
+        moveChatSubmissionToFront(
+          current.map((candidate) =>
+            candidate.id === submissionId && supersedesRunId
+              ? { ...candidate, supersedesRunId }
+              : candidate,
+          ),
+          submissionId,
+        ),
+      );
+    } else {
+      replaceQueuedChatSubmissions((current) =>
+        moveChatSubmissionToFront(current, submissionId),
+      );
     }
     api.info("已调整为下一条并停止当前回复…");
   };
 
   const handleStopAi = () => {
     const conversationId = conversationIdRef.current;
-    agentRunRegistryRef.current.cancel(conversationId);
-    resolveConversationToolApprovals(conversationId, "deny");
-    cancelConversationAgentBudgetRequests(conversationId);
+    supersedeActiveAgentRun(conversationId);
     api.info("正在停止 Agent…");
   };
 
@@ -3049,7 +3350,7 @@ export function App() {
   ) => {
     setStoredConversations(conversations);
     void saveChatWorkspace({
-      version: 1,
+      version: 2,
       activeConversationId: nextActiveConversationId,
       conversations,
     }).catch(() => {
@@ -3060,9 +3361,15 @@ export function App() {
   const currentStoredConversation = (
     updatedAt = new Date().toISOString(),
     draft = chatDraft,
-  ): StoredChatConversation =>
-    createStoredConversation({
+  ): StoredChatConversation => {
+    const metadata = storedConversations.find(
+      (conversation) => conversation.id === conversationIdRef.current,
+    );
+    return createStoredConversation({
       id: conversationIdRef.current,
+      kind: metadata?.kind,
+      delegatedTaskId: metadata?.delegatedTaskId,
+      title: metadata?.kind === "mcp_collaboration" ? metadata.title : undefined,
       createdAt: conversationCreatedAt,
       updatedAt,
       messages: chatMessagesRef.current,
@@ -3072,9 +3379,11 @@ export function App() {
       externalMcpSelection:
         conversationMcpSelectionsRef.current.get(conversationIdRef.current) ??
         DEFAULT_EXTERNAL_MCP_SELECTION,
+      memory: conversationMemoriesRef.current.get(conversationIdRef.current),
       forkedFromConversationId: conversationOrigin.conversationId,
       forkedFromMessageId: conversationOrigin.messageId,
     });
+  };
 
   const activateStoredConversation = (
     conversation: StoredChatConversation,
@@ -3181,6 +3490,7 @@ export function App() {
     }
     conversationMessagesRef.current.delete(conversationId);
     conversationMcpSelectionsRef.current.delete(conversationId);
+    conversationMemoriesRef.current.delete(conversationId);
     setContextUsageByConversation((current) => {
       if (!current.has(conversationId)) {
         return current;
@@ -3264,6 +3574,7 @@ export function App() {
       externalMcpSelection:
         conversationMcpSelectionsRef.current.get(sourceConversationId) ??
         DEFAULT_EXTERNAL_MCP_SELECTION,
+      memory: conversationMemoriesRef.current.get(sourceConversationId),
       forkedFromConversationId: sourceConversationId,
       forkedFromMessageId: plan.sourceMessageId,
     });
@@ -3274,6 +3585,12 @@ export function App() {
       ),
       nextConversation,
     );
+    if (nextConversation.memory) {
+      conversationMemoriesRef.current.set(
+        conversationId,
+        nextConversation.memory,
+      );
+    }
 
     activateStoredConversation(nextConversation, plan.seedMessages);
     saveConversationSnapshot(conversations, conversationId);
@@ -3598,6 +3915,7 @@ export function App() {
                     <ChatPanel
                       key={activeConversationId}
                       messages={displayedChatMessages}
+                      conversationKind={activeConversationKind}
                       busy={
                         Boolean(currentConversationRunningTool) ||
                         currentConversationAgentBusy
@@ -3626,6 +3944,9 @@ export function App() {
                         Boolean(selectedElement),
                       )}
                       contextUsage={visibleContextUsage}
+                      conversationMemory={conversationMemoriesRef.current.get(
+                        activeConversationId,
+                      )}
                       activeAgentSession={currentAgentSession}
                       streamingMessageId={
                         currentConversationRun?.assistantMessageId
@@ -3673,7 +3994,6 @@ export function App() {
                           : undefined
                       }
                       queuedMessages={currentConversationQueue}
-                      delegatedTasks={conversationDelegatedTasks}
                       delegatedInboxTasks={delegatedInboxTasks}
                       activeDelegatedTaskId={
                         currentConversationRun?.delegatedTaskId
@@ -3939,6 +4259,17 @@ function formatDelegatedTaskMessage(task: DelegatedTaskSnapshot): string {
         .join("\n")}`
     : "";
   return `### ${task.requestItem.title}\n\n${task.request.instruction}${criteria}${updates}`;
+}
+
+function toDelegatedTaskChatMessage(task: DelegatedTaskSnapshot): ChatMessage {
+  return {
+    id: task.requestItem.id,
+    role: "assistant",
+    source: "mcp_ai",
+    delegatedTaskId: task.taskId,
+    content: formatDelegatedTaskMessage(task),
+    createdAt: task.claimItem?.createdAt ?? task.requestItem.createdAt,
+  };
 }
 
 function toStoredConversationTargetFromDelegatedTask(

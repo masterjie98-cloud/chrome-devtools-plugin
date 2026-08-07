@@ -3,6 +3,7 @@ import type { CollaborationWorkspaceSnapshot } from "../../shared/collaborationW
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
 import type { AgentTaskStatePatch } from "../../shared/agentTaskState";
 import type { AiContextUsageSnapshot } from "../../shared/aiContextUsage";
+import type { ConversationMemoryV1 } from "../../shared/conversationMemory";
 import {
   appendAgentSessionEvent,
   createAgentSessionSnapshot,
@@ -96,6 +97,7 @@ export interface AgentContext {
   collaborationWorkspace?: CollaborationWorkspaceSnapshot;
   activityCursor?: BrowserActivityCursor;
   contextReadError?: string;
+  memory?: ConversationMemoryV1;
 }
 
 const READ_ONLY_NO_PROGRESS_NOTICE =
@@ -184,13 +186,29 @@ export async function runAutonomousAgentSession(
   const reserveBudget: ReserveAgentRunBudget = (reservation) =>
     reserveAgentRunBudget(params, runBudget, reservation);
   let visibleContent = "";
+  const rememberedTask = params.context.memory?.activeTask;
   let session = createAgentSessionSnapshot(
     createMessageId(),
-    params.input,
+    rememberedTask &&
+      rememberedTask.status !== "completed" &&
+      rememberedTask.status !== "suspended"
+      ? rememberedTask.objective
+      : params.input,
     undefined,
     params.executionBinding,
     params.assistantMessageId,
   );
+  if (
+    rememberedTask &&
+    rememberedTask.status !== "completed" &&
+    rememberedTask.status !== "suspended"
+  ) {
+    session = updateAgentSessionTaskState(session, {
+      successCriteria: rememberedTask.successCriteria,
+      plannedActions: rememberedTask.nextActions,
+      blockers: rememberedTask.blockers,
+    });
+  }
   let context = params.context;
   const activeAttachments = [...params.attachments];
   const toolExchanges: AiToolExchange[] = [];

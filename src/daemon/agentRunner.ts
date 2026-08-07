@@ -11,6 +11,7 @@ import type {
   DaemonAgentBudgetDecisionPayload,
   DaemonAgentEventPayload,
   DaemonAgentStartPayload,
+  DaemonAgentToolMessage,
 } from "../shared/daemonAgent";
 import type {
   AgentRunBudgetExtensionDecision,
@@ -38,6 +39,14 @@ import type { ToolResultPresentationMeta } from "../sidepanel/toolResultPresenta
 import type { ChatImageAttachment } from "../sidepanel/types";
 import { RUNTIME_BUILD_ID } from "../shared/runtimeIdentity";
 import type { AgentRuntimeEnvironmentSnapshot } from "../shared/agentSession";
+import {
+  buildDeterministicConversationMemoryPatch,
+  extractConversationMemory,
+} from "./conversationMemoryExtractor";
+import {
+  requestNeedsBrowserContext,
+  sanitizeConversationMemory,
+} from "../shared/conversationMemory";
 
 export interface DaemonAgentToolRequest {
   sessionId: string;
@@ -199,6 +208,15 @@ export class DaemonAgentRunner {
   ): Promise<void> {
     let latestVisibleContent = "";
     let latestSession: AgentSessionSnapshot | undefined;
+    const memoryToolMessages: DaemonAgentToolMessage[] = [];
+    const sanitizedMemory = sanitizeConversationMemory(payload.context.memory);
+    payload.context = {
+      ...payload.context,
+      ...(sanitizedMemory ? { memory: sanitizedMemory } : {}),
+    };
+    if (!sanitizedMemory) {
+      delete payload.context.memory;
+    }
     const runtimeEnvironment = buildAgentRuntimeEnvironment(payload);
     try {
       const result = await this.runSession({
@@ -215,6 +233,16 @@ export class DaemonAgentRunner {
         requestBudgetExtension: (request) =>
           this.requestBudgetDecision(sessionId, payload, callbacks, request),
         prepareContext: async (context) => {
+          const activeAffinity = payload.context.memory?.activeTask?.affinity;
+          if (!requestNeedsBrowserContext(payload.input, activeAffinity)) {
+            const {
+              pageSnapshot: _pageSnapshot,
+              selectedElement: _selectedElement,
+              contextReadError: _contextReadError,
+              ...contextWithoutPage
+            } = context;
+            return contextWithoutPage;
+          }
           if (!payload.config.includePageContext) {
             return context;
           }
@@ -323,6 +351,7 @@ export class DaemonAgentRunner {
             controller.signal,
             callbacks,
             latestSession?.turns?.at(-1)?.id,
+            memoryToolMessages,
           ),
         onVisibleContent: (content) => {
           latestVisibleContent = content.slice(0, 12_000);
@@ -434,6 +463,32 @@ export class DaemonAgentRunner {
       };
       callbacks.persistSession(finalSessionEvent);
       callbacks.emit(finalSessionEvent);
+      const shouldExtractMemory =
+        result.status === "completed" || result.status === "blocked";
+      const memoryExtractionInput = shouldExtractMemory
+        ? {
+            config: { ...payload.config },
+            memory: payload.context.memory,
+            runId: payload.runId,
+            userMessageId:
+              payload.userMessageId ??
+              payload.messages.filter((message) => message.role === "user").at(-1)
+                ?.id ??
+              `user:${payload.runId}`,
+            assistantMessageId: payload.assistantMessageId,
+            input: payload.input,
+            finalContent: result.finalContent,
+            session: durableResultSession,
+            toolMessages: memoryToolMessages,
+          }
+        : undefined;
+      const memoryPatch = memoryExtractionInput
+        ? buildDeterministicConversationMemoryPatch(memoryExtractionInput)
+        : undefined;
+      // The completion patch is merged first. The delayed semantic patch may
+      // only build on that exact revision, never on a newer turn's state.
+      const memoryPatchBaseRevision =
+        (sanitizedMemory?.revision ?? 1) + (memoryPatch ? 1 : 0);
       callbacks.emit({
         runId: payload.runId,
         conversationId: payload.conversationId,
@@ -441,8 +496,35 @@ export class DaemonAgentRunner {
         result: {
           ...result,
           session: durableResultSession,
+          ...(memoryPatch ? { memoryPatch } : {}),
         },
       });
+      if (memoryExtractionInput) {
+        void extractConversationMemory(memoryExtractionInput).then(
+          (extraction) => {
+            callbacks.emit({
+              runId: payload.runId,
+              conversationId: payload.conversationId,
+              kind: "memory_patch",
+              baseRevision: memoryPatchBaseRevision,
+              patch: extraction.patch,
+              source: extraction.source,
+              modelRequestCount: 1,
+            });
+          },
+          () => {
+            callbacks.emit({
+              runId: payload.runId,
+              conversationId: payload.conversationId,
+              kind: "memory_patch",
+              baseRevision: memoryPatchBaseRevision,
+              patch: memoryPatch!,
+              source: "fallback",
+              modelRequestCount: 1,
+            });
+          },
+        );
+      }
     } catch (error) {
       const detail =
         error instanceof Error ? error.message : "Daemon Agent failed.";
@@ -500,6 +582,7 @@ export class DaemonAgentRunner {
     signal: AbortSignal,
     callbacks: DaemonAgentRunnerCallbacks,
     turnId?: string,
+    memoryToolMessages?: DaemonAgentToolMessage[],
   ): Promise<AiToolResultMessage[]> {
     type Prepared = { result: AiToolResultMessage; success: boolean };
     const modelResultCharLimit = toolResultModelCharLimit(
@@ -577,27 +660,29 @@ export class DaemonAgentRunner {
           );
           resultMeta = presentation.meta;
         }
+        const toolMessage: DaemonAgentToolMessage = {
+          id: createMessageId(),
+          assistantMessageId,
+          toolCallId: call.id,
+          toolName: call.name,
+          toolSource,
+          toolDisplayName:
+            clientMetadata?.externalMcpToolName ??
+            clientMetadata?.displayName ??
+            call.name,
+          toolServerName: clientMetadata?.externalMcpServerName,
+          requestArguments,
+          content: displayContent,
+          resultMeta,
+          createdAt: new Date().toISOString(),
+          attachments,
+        };
+        memoryToolMessages?.push(toolMessage);
         callbacks.emit({
           runId: payload.runId,
           conversationId: payload.conversationId,
           kind: "tool_message",
-          message: {
-            id: createMessageId(),
-            assistantMessageId,
-            toolCallId: call.id,
-            toolName: call.name,
-            toolSource,
-            toolDisplayName:
-              clientMetadata?.externalMcpToolName ??
-              clientMetadata?.displayName ??
-              call.name,
-            toolServerName: clientMetadata?.externalMcpServerName,
-            requestArguments,
-            content: displayContent,
-            resultMeta,
-            createdAt: new Date().toISOString(),
-            attachments,
-          },
+          message: toolMessage,
         });
         return {
           result: {

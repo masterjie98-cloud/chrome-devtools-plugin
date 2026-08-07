@@ -2,6 +2,7 @@ export const AI_CONTEXT_USAGE_CATEGORIES = [
   "system",
   "tool_definitions",
   "conversation",
+  "conversation_memory",
   "page_context",
   "tool_results",
   "other",
@@ -37,6 +38,12 @@ export interface AiContextBudgetReport {
   compactedMessageCount: number;
   compactionSteps: AiContextCompactionStep[];
   breakdown: AiContextUsageBreakdown;
+  memorySummary?: {
+    activeObjective?: string;
+    activeStatus?: string;
+    pendingDecisionCount: number;
+    factCount: number;
+  };
 }
 
 export interface AiContextUsageSnapshot extends AiContextBudgetReport {

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   estimateOpenAiRequestTokens,
   fitMessagesToContextWindow,
+  selectProviderToolsForContextBudget,
 } from "../src/sidepanel/services/aiClient";
 
 test("context budgeting estimates CJK and tool schemas before sending", () => {
@@ -120,6 +121,30 @@ test("context budgeting preserves the latest coherent conversation turn before p
   assert.doesNotMatch(serialized, /DNS management page/);
 });
 
+test("context budgeting reports protected conversation memory separately", () => {
+  const fitted = fitMessagesToContextWindow(
+    [
+      { role: "system", content: "trusted system instruction" },
+      {
+        role: "system",
+        contextCategory: "conversation_memory",
+        content:
+          'CONVERSATION_MEMORY\n{"activeTask":{"objective":"排查 fluent-bit","status":"active"},"pendingDecisions":[{"id":"next"}],"facts":[{"id":"fact"}]}',
+      },
+      {
+        role: "user",
+        contextCategory: "conversation",
+        content: "CURRENT_USER_REQUEST\n继续",
+      },
+    ],
+    { contextWindowTokens: 8_192, maxOutputTokens: 1_024 },
+  );
+
+  assert.ok(fitted.report.breakdown.conversation_memory > 0);
+  assert.equal(fitted.report.memorySummary?.activeObjective, "排查 fluent-bit");
+  assert.equal(fitted.report.memorySummary?.pendingDecisionCount, 1);
+});
+
 test("context budgeting fails locally when tool schemas consume the whole window", () => {
   assert.throws(
     () =>
@@ -131,3 +156,101 @@ test("context budgeting fails locally when tool schemas consume the whole window
     /AI_CONTEXT_BUDGET_EXCEEDED/,
   );
 });
+
+test("tool schema budgeting preserves memory by selecting task-relevant tools", () => {
+  const tools = [
+    tool("browser_observe", "builtin", "Read the current browser DOM"),
+    tool(
+      "external_prometheus_query",
+      "external_mcp",
+      "Query Prometheus metrics for fluent-bit pods and nodes",
+    ),
+    tool(
+      "external_prometheus_labels",
+      "external_mcp",
+      "List Prometheus labels and discover metrics",
+    ),
+    ...Array.from({ length: 12 }, (_, index) =>
+      tool(
+        `unrelated_${index}`,
+        "external_mcp",
+        `Unrelated capability ${index}`,
+      ),
+    ),
+  ];
+  const selected = selectProviderToolsForContextBudget(
+    tools,
+    [
+      {
+        role: "system",
+        contextCategory: "conversation_memory",
+        content:
+          'CONVERSATION_MEMORY\n{"activeTask":{"objective":"排查 fluent-bit","affinity":"external_mcp"}}',
+      },
+      {
+        role: "user",
+        contextCategory: "conversation",
+        content: "CURRENT_USER_REQUEST\n你自己决定",
+      },
+    ],
+    { contextWindowTokens: 8_192, maxOutputTokens: 1_024 },
+  ) as typeof tools;
+
+  const names = selected.map((entry) => entry.function.name);
+  assert.ok(names.includes("external_prometheus_query"));
+  assert.ok(names.includes("external_prometheus_labels"));
+  assert.equal(names.includes("browser_observe"), false);
+  assert.ok(selected.length < tools.length);
+});
+
+test("current page objective keeps browser tools despite stale external MCP memory", () => {
+  const tools = [
+    tool("browser_observe", "builtin", "Read and inspect the current DNS page DOM"),
+    tool("browser_click", "builtin", "Click a current page element"),
+    ...Array.from({ length: 90 }, (_, index) =>
+      tool(
+        `external_metric_${index}`,
+        "external_mcp",
+        `Query historical fluent-bit Prometheus metric ${index}`,
+      ),
+    ),
+  ];
+  const selected = selectProviderToolsForContextBudget(
+    tools,
+    [
+      {
+        role: "system",
+        contextCategory: "conversation_memory",
+        content:
+          'CONVERSATION_MEMORY\n{"activeTask":{"objective":"排查 fluent-bit","affinity":"external_mcp"}}',
+      },
+      {
+        role: "user",
+        contextCategory: "conversation",
+        content: "CURRENT_USER_REQUEST\n改为检查当前 DNS 页面",
+      },
+    ],
+    { contextWindowTokens: 8_192, maxOutputTokens: 1_024 },
+  ) as typeof tools;
+
+  const names = selected.map((entry) => entry.function.name);
+  assert.ok(names.includes("browser_observe"));
+  assert.ok(names.includes("browser_click"));
+  assert.ok(selected.length < tools.length);
+});
+
+function tool(
+  name: string,
+  source: "builtin" | "external_mcp",
+  description: string,
+) {
+  return {
+    type: "function" as const,
+    function: {
+      name,
+      description: `${description} ${"schema ".repeat(280)}`,
+      parameters: { type: "object", properties: {} },
+    },
+    clientMetadata: { source },
+  };
+}

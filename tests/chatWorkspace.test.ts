@@ -14,7 +14,7 @@ import {
 } from "../src/sidepanel/services/chatWorkspace";
 import type { ChatMessage } from "../src/sidepanel/types";
 
-test("stored conversations retain bounded tool audit details but omit secrets, attachments, and runtime status", () => {
+test("stored conversations retain original bounded tool audit details but omit attachments and runtime status", () => {
   const messages: ChatMessage[] = [
     {
       id: "user-1",
@@ -81,8 +81,8 @@ test("stored conversations retain bounded tool audit details but omit secrets, a
       toolSource: "external_mcp",
       toolDisplayName: "prometheus_query",
       toolServerName: "Prometheus Infra MCP",
-      toolRequestArguments: '{\n  "query": "up",\n  "apiKey": "[redacted]"\n}',
-      content: '{\n  "authorization": "[redacted]"\n}',
+      toolRequestArguments: '{\n  "query": "up",\n  "apiKey": "request-secret"\n}',
+      content: '{\n  "authorization": "secret"\n}',
       toolResultMeta: {
         originalCharCount: 26,
         displayedSourceCharCount: 26,
@@ -99,8 +99,8 @@ test("stored conversations retain bounded tool audit details but omit secrets, a
     },
   ]);
   assert.equal(JSON.stringify(stored).includes("SECRET_BYTES"), false);
-  assert.equal(JSON.stringify(stored).includes("request-secret"), false);
-  assert.equal(JSON.stringify(stored).includes('"secret"'), false);
+  assert.equal(JSON.stringify(stored).includes("request-secret"), true);
+  assert.equal(JSON.stringify(stored).includes('\\"secret\\"'), true);
   assert.equal(JSON.stringify(stored).includes("prometheus_query"), true);
 });
 
@@ -163,6 +163,38 @@ test("an unavailable restored Tab clears the target and its activity cursor with
   assert.equal(cleared.activityCursor, undefined);
   assert.equal(cleared.messages[0]?.content, "Continue the investigation");
   assert.equal(clearUnavailableConversationTarget(stored, 18), stored);
+});
+
+test("local chat persistence keeps model-visible content unchanged", () => {
+  const content =
+    "排查日期 2026-08-07，原始邮箱 owner@example.test，电话 13800138000，token=diagnostic-value";
+  const stored = createStoredConversation({
+    id: "conversation-local-original-content",
+    createdAt: "2026-08-07T13:15:00.000Z",
+    updatedAt: "2026-08-07T13:16:00.000Z",
+    messages: [
+      {
+        id: "assistant-local-original-content",
+        role: "assistant",
+        source: "extension_ai",
+        content,
+        createdAt: "2026-08-07T13:15:00.000Z",
+      },
+      {
+        id: "tool-local-original-content",
+        role: "tool",
+        content: JSON.stringify({ content }),
+        toolRequestArguments: JSON.stringify({ query: content }),
+        createdAt: "2026-08-07T13:15:30.000Z",
+      },
+    ],
+    draft: content,
+  });
+
+  assert.equal(stored.messages[0]?.content, content);
+  assert.equal(stored.draft, content);
+  assert.match(stored.messages[1]?.content ?? "", /owner@example\.test/);
+  assert.match(stored.messages[1]?.toolRequestArguments ?? "", /13800138000/);
 });
 
 test("conversation activity cursor persists a stream identity and sequence", () => {
@@ -305,7 +337,7 @@ test("a greeting-only conversation remains ephemeral until it has real state", (
       activeConversationId: empty.id,
       conversations: [empty],
     }),
-    { version: 1, conversations: [] },
+    { version: 2, conversations: [] },
   );
 
   const withDraft = createStoredConversation({
@@ -313,10 +345,20 @@ test("a greeting-only conversation remains ephemeral until it has real state", (
     draft: "准备检查当前页面",
     messages: empty.messages as ChatMessage[],
   });
-  const withTarget = createStoredConversation({
+  const withAutomaticTarget = createStoredConversation({
     ...empty,
     messages: empty.messages as ChatMessage[],
     target: { tabId: 17, url: "https://example.test/reports" },
+  });
+  const nextWithAutomaticTarget = createStoredConversation({
+    ...withAutomaticTarget,
+    id: "conversation-empty-next",
+    messages: [
+      {
+        ...empty.messages[0],
+        id: "assistant-ready-next",
+      },
+    ] as ChatMessage[],
   });
   const withUserMessage = createStoredConversation({
     ...empty,
@@ -332,7 +374,25 @@ test("a greeting-only conversation remains ephemeral until it has real state", (
   });
 
   assert.equal(isEmptyStoredConversation(withDraft), false);
-  assert.equal(isEmptyStoredConversation(withTarget), false);
+  assert.equal(isEmptyStoredConversation(withAutomaticTarget), true);
+  assert.deepEqual(
+    upsertPersistableConversation(
+      upsertPersistableConversation(
+        upsertStoredConversation([], withAutomaticTarget),
+        withAutomaticTarget,
+      ),
+      nextWithAutomaticTarget,
+    ),
+    [],
+  );
+  assert.deepEqual(
+    normalizeChatWorkspace({
+      version: 2,
+      activeConversationId: withAutomaticTarget.id,
+      conversations: [withAutomaticTarget],
+    }),
+    { version: 2, conversations: [] },
+  );
   assert.equal(isEmptyStoredConversation(withUserMessage), false);
 });
 
@@ -363,6 +423,58 @@ test("tool-heavy runs preserve primary history and the latest bounded audit trai
   assert.equal(stored.messages.length, 49);
   assert.equal(stored.messages[1]?.id, "tool-52");
   assert.equal(stored.messages.at(-1)?.id, "tool-99");
+});
+
+test("conversation character budget retains the latest messages", () => {
+  const messages: ChatMessage[] = Array.from({ length: 21 }, (_, index) => ({
+    id: `message-${index}`,
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `${String(index).padStart(2, "0")}${"x".repeat(11_998)}`,
+    createdAt: `2026-07-14T00:00:${String(index).padStart(2, "0")}.000Z`,
+  }));
+
+  const stored = createStoredConversation({
+    id: "character-budget",
+    createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:20.000Z",
+    messages,
+    draft: "",
+  });
+
+  assert.equal(stored.messages.length, 20);
+  assert.equal(stored.messages[0]?.id, "message-1");
+  assert.equal(stored.messages.at(-1)?.id, "message-20");
+  assert.equal(
+    stored.messages.reduce((total, message) => total + message.content.length, 0),
+    240_000,
+  );
+});
+
+test("MCP collaboration conversations persist as independent contexts", () => {
+  const conversation = createStoredConversation({
+    id: "mcp-conversation",
+    kind: "mcp_collaboration",
+    delegatedTaskId: "task_mcpconversation1",
+    title: "检查发布页并返回证据",
+    createdAt: "2026-08-07T00:00:00.000Z",
+    updatedAt: "2026-08-07T00:00:01.000Z",
+    messages: [],
+    draft: "",
+  });
+
+  assert.equal(conversation.kind, "mcp_collaboration");
+  assert.equal(conversation.delegatedTaskId, "task_mcpconversation1");
+  assert.equal(conversation.title, "检查发布页并返回证据");
+  assert.equal(isEmptyStoredConversation(conversation), false);
+
+  const [restored] = normalizeChatWorkspace({
+    version: 2,
+    activeConversationId: conversation.id,
+    conversations: [conversation],
+  }).conversations;
+  assert.equal(restored?.kind, "mcp_collaboration");
+  assert.equal(restored?.delegatedTaskId, "task_mcpconversation1");
+  assert.equal(restored?.title, "检查发布页并返回证据");
 });
 
 test("conversation history supports full-text search and explicit Markdown/JSON export", () => {
@@ -398,4 +510,189 @@ test("conversation history supports full-text search and explicit Markdown/JSON 
     JSON.parse(exportStoredConversation(conversation, "json")).version,
     "ai-devtools-conversation-export-v1",
   );
+});
+
+test("MCP backend AI keeps its identity in persisted messages and export", () => {
+  const conversation = createStoredConversation({
+    id: "mcp-export",
+    kind: "mcp_collaboration",
+    delegatedTaskId: "task_mcpexport1234",
+    title: "MCP 检查",
+    createdAt: "2026-08-07T00:00:00.000Z",
+    updatedAt: "2026-08-07T00:00:01.000Z",
+    messages: [
+      {
+        id: "mcp-request",
+        role: "assistant",
+        source: "mcp_ai",
+        delegatedTaskId: "task_mcpexport1234",
+        content: "检查当前页面并返回结果。",
+        createdAt: "2026-08-07T00:00:00.000Z",
+      },
+    ],
+    draft: "",
+  });
+
+  assert.equal(conversation.messages[0]?.delegatedTaskId, "task_mcpexport1234");
+  assert.match(exportStoredConversation(conversation, "markdown"), /## MCP 后端 AI/);
+});
+
+test("workspace v1 migrates without trusting fields that did not exist in v1", () => {
+  const migrated = normalizeChatWorkspace({
+    version: 1,
+    activeConversationId: "chat-memory",
+    conversations: [
+      {
+        id: "chat-memory",
+        createdAt: "2026-08-06T10:00:00.000Z",
+        updatedAt: "2026-08-06T10:01:00.000Z",
+        messages: [
+          {
+            id: "user-memory",
+            role: "user",
+            content: "排查 fluent-bit",
+            createdAt: "2026-08-06T10:00:00.000Z",
+          },
+        ],
+        draft: "",
+        memory: {
+          version: "conversation-memory-v1",
+          revision: 1,
+          activeTask: {
+            id: "task-memory",
+            objective: "排查 fluent-bit",
+            status: "active",
+            affinity: "external_mcp",
+            successCriteria: [],
+            entities: ["fluent-bit"],
+            nextActions: [],
+            blockers: [],
+            provenance: {
+              messageIds: ["user-memory"],
+              toolCallIds: [],
+            },
+            updatedAt: "2026-08-06T10:01:00.000Z",
+          },
+          pendingDecisions: [],
+          constraints: [],
+          facts: [],
+          turnSummaries: [],
+          updatedAt: "2026-08-06T10:01:00.000Z",
+        },
+      },
+    ],
+  });
+
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.conversations[0]?.memory, undefined);
+});
+
+test("workspace v2 retains sourced memory and its cited old tool evidence", () => {
+  const toolMessage: ChatMessage = {
+    id: "tool-memory-evidence",
+    role: "tool",
+    toolCallId: "call-memory-evidence",
+    toolName: "prometheus_query",
+    toolSource: "external_mcp",
+    content: '{"exitCode":"SIGBUS"}',
+    createdAt: "2026-08-06T10:00:01.000Z",
+  };
+  const primaryMessages: ChatMessage[] = Array.from(
+    { length: 90 },
+    (_, index) => ({
+      id: `message-${index}`,
+      role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+      content: `conversation message ${index}`,
+      createdAt: `2026-08-06T10:${String(index).padStart(2, "0")}:00.000Z`,
+    }),
+  );
+  const memory = {
+    version: "conversation-memory-v1" as const,
+    revision: 2,
+    pendingDecisions: [],
+    constraints: [],
+    facts: [
+      {
+        id: "fact-sigbus",
+        key: "pod.exit_reason",
+        statement: "Pod 退出原因是 SIGBUS",
+        kind: "verified" as const,
+        lifecycle: "active" as const,
+        importance: 90,
+        tags: ["pod"],
+        provenance: { messageIds: [], toolCallIds: ["call-memory-evidence"] },
+        updatedAt: "2026-08-06T10:01:00.000Z",
+      },
+    ],
+    turnSummaries: [],
+    updatedAt: "2026-08-06T10:01:00.000Z",
+  };
+
+  const normalized = normalizeChatWorkspace({
+    version: 2,
+    activeConversationId: "chat-memory-v2",
+    conversations: [
+      {
+        id: "chat-memory-v2",
+        createdAt: "2026-08-06T10:00:00.000Z",
+        updatedAt: "2026-08-06T11:00:00.000Z",
+        messages: [toolMessage, ...primaryMessages],
+        draft: "",
+        memory,
+      },
+    ],
+  });
+
+  assert.equal(normalized.conversations[0]?.messages.length, 80);
+  assert.ok(
+    normalized.conversations[0]?.messages.some(
+      (message) => message.toolCallId === "call-memory-evidence",
+    ),
+  );
+  assert.equal(normalized.conversations[0]?.memory?.facts[0]?.id, "fact-sigbus");
+});
+
+test("workspace drops durable facts whose cited evidence is unavailable", () => {
+  const normalized = normalizeChatWorkspace({
+    version: 2,
+    conversations: [
+      {
+        id: "chat-stale-memory",
+        createdAt: "2026-08-06T10:00:00.000Z",
+        updatedAt: "2026-08-06T10:01:00.000Z",
+        messages: [
+          {
+            id: "user-stale-memory",
+            role: "user",
+            content: "继续排查",
+            createdAt: "2026-08-06T10:00:00.000Z",
+          },
+        ],
+        draft: "",
+        memory: {
+          version: "conversation-memory-v1",
+          revision: 1,
+          pendingDecisions: [],
+          constraints: [],
+          facts: [
+            {
+              id: "fact-missing-source",
+              key: "pod.node",
+              statement: "Pod 位于 rs-compute1",
+              kind: "verified",
+              lifecycle: "active",
+              importance: 80,
+              tags: ["pod"],
+              provenance: { messageIds: [], toolCallIds: ["missing-call"] },
+              updatedAt: "2026-08-06T10:01:00.000Z",
+            },
+          ],
+          turnSummaries: [],
+          updatedAt: "2026-08-06T10:01:00.000Z",
+        },
+      },
+    ],
+  });
+
+  assert.deepEqual(normalized.conversations[0]?.memory?.facts, []);
 });

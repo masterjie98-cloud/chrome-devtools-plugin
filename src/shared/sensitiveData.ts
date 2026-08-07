@@ -1,3 +1,5 @@
+import { redactSensitiveText } from "./sanitize";
+
 const REDACTED = "[redacted]";
 
 const SENSITIVE_HEADER_NAMES = new Set([
@@ -30,6 +32,16 @@ const SENSITIVE_FIELD_NAMES = new Set([
 
 export function redactSensitiveData(value: unknown): unknown {
   return redactValue(value, "");
+}
+
+/**
+ * Applies the full outbound MCP policy: structured credentials are always
+ * removed, and free-form strings have email/phone/inline-secret redaction.
+ * Protocol control values are preserved so sanitization cannot corrupt task
+ * routing or optimistic-concurrency fields.
+ */
+export function redactSensitiveDataForMcp(value: unknown): unknown {
+  return redactMcpValue(redactSensitiveData(value), "");
 }
 
 export function redactApprovalArguments(
@@ -91,6 +103,62 @@ function redactValue(value: unknown, parentKey: string): unknown {
     );
   }
   return value;
+}
+
+function redactMcpValue(value: unknown, parentKey: string): unknown {
+  if (typeof value === "string") {
+    return isOpaqueMcpControlValue(parentKey, value)
+      ? value
+      : redactSensitiveText(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactMcpValue(entry, parentKey));
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        redactMcpValue(entry, key),
+      ]),
+    );
+  }
+  return value;
+}
+
+function isOpaqueMcpControlValue(key: string, value: string): boolean {
+  const normalizedKey = normalizeFieldName(key);
+  if (
+    [
+      "taskid",
+      "eventid",
+      "conversationid",
+      "conversationkey",
+      "previousconversationkey",
+      "requestid",
+      "runid",
+      "callid",
+      "toolcallid",
+      "sessionid",
+      "agentsessionid",
+      "targetid",
+      "documentid",
+      "navigationid",
+      "requestfingerprint",
+      "resultfingerprint",
+      "eventfingerprint",
+      "idempotencykey",
+    ].includes(normalizedKey)
+  ) {
+    return /^[A-Za-z0-9_-]{1,240}$/.test(value);
+  }
+  if (
+    ["createdat", "updatedat", "claimedat", "completedat", "publishedat", "reboundat", "sentat", "deadlineat"].includes(
+      normalizedKey,
+    )
+  ) {
+    return Number.isFinite(Date.parse(value));
+  }
+  return false;
 }
 
 function isHeaderField(key: string): boolean {

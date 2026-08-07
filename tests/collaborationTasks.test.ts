@@ -74,6 +74,40 @@ test("delegated tasks deduplicate by taskId and reject conflicting reuse", () =>
   );
 });
 
+test("numeric delegated task IDs remain parseable while prose stays redacted", () => {
+  const hub = createHubWithTarget();
+  const taskId = "task_mcp_ui_phase1_e2e_1786079805882";
+  delegateCollaborationTask(
+    {
+      ...delegateArgs(),
+      taskId,
+      instruction: "On 2026-08-07 call 13800138000 only after approval.",
+    },
+    SESSION_ID,
+    "codex",
+    hub,
+  );
+
+  const task = findDelegatedTask(
+    hub.snapshot(SESSION_ID).collaborationWorkspace,
+    taskId,
+  );
+  assert.equal(task?.taskId, taskId);
+  assert.equal(isDelegatedTaskInboxActionable(task!), true);
+  assert.match(task?.request.instruction ?? "", /REDACTED_PHONE/);
+  assert.match(task?.request.instruction ?? "", /2026-08-07/);
+
+  const restored = new BrowserStateHub();
+  restored.restorePersistentState(hub.toPersistentState());
+  assert.equal(
+    findDelegatedTask(
+      restored.snapshot(SESSION_ID).collaborationWorkspace,
+      taskId,
+    )?.taskId,
+    taskId,
+  );
+});
+
 test("a persisted result resolves current and reconnected waiters without replay", async () => {
   const hub = createHubWithTarget();
   delegateCollaborationTask(delegateArgs(), SESSION_ID, "codex", hub);

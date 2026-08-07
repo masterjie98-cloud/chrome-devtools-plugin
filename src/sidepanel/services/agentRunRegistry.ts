@@ -18,6 +18,7 @@ export interface ActiveAgentRun {
  */
 export class AgentRunRegistry {
   private readonly byConversationId = new Map<string, ActiveAgentRun>();
+  private readonly latestRunIdByConversation = new Map<string, string>();
 
   start(run: ActiveAgentRun): void {
     if (this.byConversationId.has(run.conversationId)) {
@@ -26,6 +27,7 @@ export class AgentRunRegistry {
       );
     }
     this.byConversationId.set(run.conversationId, run);
+    this.latestRunIdByConversation.set(run.conversationId, run.runId);
   }
 
   get(conversationId: string): ActiveAgentRun | undefined {
@@ -34,6 +36,14 @@ export class AgentRunRegistry {
 
   isCurrent(conversationId: string, runId: string): boolean {
     return this.byConversationId.get(conversationId)?.runId === runId;
+  }
+
+  /**
+   * Unlike isCurrent(), this remains true after a run finishes and turns false
+   * only when a newer run starts in the same conversation.
+   */
+  isLatest(conversationId: string, runId: string): boolean {
+    return this.latestRunIdByConversation.get(conversationId) === runId;
   }
 
   list(): ActiveAgentRun[] {

@@ -103,6 +103,59 @@ test("daemon Agent skips automatic page reads when a chat has no browser binding
   assert.deepEqual(preparedContext, {});
 });
 
+test("daemon Agent completion does not wait for semantic memory extraction", async () => {
+  const originalFetch = globalThis.fetch;
+  let releaseExtraction: (() => void) | undefined;
+  const extractionGate = new Promise<void>((resolve) => {
+    releaseExtraction = resolve;
+  });
+  globalThis.fetch = (async () => {
+    await extractionGate;
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "{}" } }],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  }) as typeof fetch;
+  const runner = new DaemonAgentRunner(async (params) => {
+    const session = finalizeAgentSession(
+      createAgentSessionSnapshot("internal", params.input),
+      "completed",
+      "done",
+    );
+    return { finalContent: "done", session, status: "completed" };
+  });
+  const events: DaemonAgentEventPayload[] = [];
+
+  try {
+    runner.start(
+      "profile-a",
+      payload("run-async-memory", "conversation-async-memory"),
+      {
+        executeTool: async () => ({}),
+        emit: (event) => events.push(event),
+        persistSession: () => undefined,
+      },
+    );
+
+    await waitFor(() => events.some((event) => event.kind === "completed"));
+    assert.equal(events.some((event) => event.kind === "memory_patch"), false);
+    releaseExtraction?.();
+    await waitFor(() => events.some((event) => event.kind === "memory_patch"));
+    const memoryPatch = events.find(
+      (event): event is Extract<
+        DaemonAgentEventPayload,
+        { kind: "memory_patch" }
+      > => event.kind === "memory_patch",
+    );
+    assert.equal(memoryPatch?.baseRevision, 2);
+  } finally {
+    releaseExtraction?.();
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("daemon Agent cancellation is scoped to one run", async () => {
   let observedAbort = false;
   const runner = new DaemonAgentRunner(async (params: RunAutonomousAgentSessionParams) => {
@@ -406,10 +459,27 @@ test("daemon Agent stops a volatile external MCP duplicate loop before a second 
       assert.equal(completed.result.status, "completed");
       assert.match(completed.result.finalContent, /停止重复查询/);
     }
-    assert.equal(requestBodies.length, 3);
+    await waitFor(() =>
+      events.some(
+        (event) =>
+          event.kind === "memory_patch" &&
+          event.runId === "run-external-repeat",
+      ),
+    );
+    assert.equal(requestBodies.length, 4);
     assert.equal(
-      Object.hasOwn(requestBodies.at(-1) ?? {}, "tools"),
-      false,
+      requestBodies.filter((body) => Object.hasOwn(body, "tools")).length,
+      2,
+    );
+    assert.equal(
+      requestBodies.filter((body) => !Object.hasOwn(body, "tools")).length,
+      2,
+    );
+    assert.equal(
+      requestBodies.filter((body) =>
+        JSON.stringify(body).includes("conversation-memory extractor"),
+      ).length,
+      1,
     );
   } finally {
     restoreFetch();

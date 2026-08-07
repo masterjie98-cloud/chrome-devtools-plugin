@@ -1,6 +1,7 @@
 import type { PageSnapshot } from "../../shared/dom";
 import type { AgentSessionSnapshot } from "../../shared/agentSession";
 import type { AiContextUsageSnapshot } from "../../shared/aiContextUsage";
+import type { ConversationMemoryPatch } from "../../shared/conversationMemory";
 import type {
   DaemonAgentBudgetDecisionPayload,
   DaemonAgentCompletionResult,
@@ -56,10 +57,12 @@ import {
   type PluginToMcpMessage,
   type ScreenshotSnapshot,
 } from "../../shared/wsProtocol";
+import { redactSensitiveDataForMcp } from "../../shared/sensitiveData";
 import type {
   ExternalMcpServerConfig,
   ExternalMcpServerSummary,
 } from "../../shared/externalMcp";
+import { isExternalMcpToolName } from "../../shared/externalMcp";
 import { WS_CLIENT_IDENTITIES } from "../../shared/wsClientIdentity";
 import {
   RUNTIME_BUILD_ID,
@@ -82,6 +85,7 @@ type ApprovalCancellationHandler = (
 const MCP_CONNECT_WAIT_MS = 6_000;
 const DAEMON_AGENT_START_TIMEOUT_MS = 15_000;
 const DAEMON_AGENT_CANCEL_RETRY_MS = 4_000;
+const DAEMON_MEMORY_PATCH_GRACE_MS = 30_000;
 
 interface McpCallOptions {
   signal?: AbortSignal;
@@ -98,6 +102,14 @@ interface DaemonAgentHandlers {
   onSessionUpdate?: (session: AgentSessionSnapshot) => void;
   onToolMessage?: (message: DaemonAgentToolMessage) => void;
   onContextUsage?: (report: AiContextUsageSnapshot) => void;
+  onMemoryPatch?: (
+    patch: ConversationMemoryPatch,
+    metadata: {
+      baseRevision: number;
+      source: "ai" | "fallback";
+      modelRequestCount: number;
+    },
+  ) => void;
   onBudgetExtensionRequest?: (
     request: AgentRunBudgetExtensionRequest & {
       budgetRequestId: string;
@@ -214,6 +226,14 @@ export class McpBridge {
     }
   >();
   private activeDaemonAgentRuns = new Map<string, ActiveDaemonAgentRun>();
+  private recentDaemonAgentHandlers = new Map<
+    string,
+    {
+      conversationId: string;
+      handlers: DaemonAgentHandlers;
+      timeout: number;
+    }
+  >();
   private readonly daemonAgentStartTimeoutMs: number;
   private readonly daemonAgentCancelRetryMs: number;
 
@@ -640,7 +660,9 @@ export class McpBridge {
       payload: {
         call: {
           toolName,
-          args,
+          args: isExternalMcpToolName(toolName)
+            ? redactSensitiveDataForMcp(args) as Record<string, unknown>
+            : args,
         },
         ...(!options.skipTaskContext &&
         (options.taskContext ?? this.taskContext)
@@ -882,6 +904,18 @@ export class McpBridge {
     }
     active.cleanup?.();
     this.activeDaemonAgentRuns.delete(runId);
+    const previousRecent = this.recentDaemonAgentHandlers.get(runId);
+    if (previousRecent) {
+      window.clearTimeout(previousRecent.timeout);
+    }
+    const timeout = window.setTimeout(() => {
+      this.recentDaemonAgentHandlers.delete(runId);
+    }, DAEMON_MEMORY_PATCH_GRACE_MS);
+    this.recentDaemonAgentHandlers.set(runId, {
+      conversationId: active.conversationId,
+      handlers: active.handlers,
+      timeout,
+    });
     const terminalError = active.terminalError ?? error;
     if (terminalError) {
       active.reject(terminalError);
@@ -1243,6 +1277,23 @@ export class McpBridge {
 
   private handleDaemonAgentEvent(event: DaemonAgentEventPayload): void {
     this.markDaemonAgentStartAccepted(event.runId);
+    if (event.kind === "memory_patch") {
+      const active = this.activeDaemonAgentRuns.get(event.runId);
+      const recent = this.recentDaemonAgentHandlers.get(event.runId);
+      const target = active ?? recent;
+      if (target?.conversationId === event.conversationId) {
+        target.handlers.onMemoryPatch?.(event.patch, {
+          baseRevision: event.baseRevision,
+          source: event.source,
+          modelRequestCount: event.modelRequestCount,
+        });
+        if (recent) {
+          window.clearTimeout(recent.timeout);
+          this.recentDaemonAgentHandlers.delete(event.runId);
+        }
+      }
+      return;
+    }
     const active = this.activeDaemonAgentRuns.get(event.runId);
     if (!active || active.conversationId !== event.conversationId) {
       return;

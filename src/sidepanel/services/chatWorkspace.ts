@@ -1,12 +1,15 @@
-import type { ChatMessage } from "../types";
+import type { ChatConversationKind, ChatMessage } from "../types";
 import type { BrowserActivityCursor } from "../../shared/browserActivity";
 import {
   normalizeExternalMcpSelection,
   type ExternalMcpSelection,
 } from "../../shared/externalMcp";
 import { isGeneratedMcpCapabilityGreeting } from "./mcpCapabilityGreeting";
-import { redactSensitiveData } from "../../shared/sensitiveData";
-import { sanitizeMultilineText } from "../../shared/sanitize";
+import {
+  revalidateConversationMemory,
+  sanitizeConversationMemory,
+  type ConversationMemoryV1,
+} from "../../shared/conversationMemory";
 
 export const CHAT_WORKSPACE_STORAGE_KEY = "aiDevtools.chatWorkspaceV1";
 export const MAX_STORED_CONVERSATIONS = 20;
@@ -31,6 +34,7 @@ export interface StoredChatMessage {
   createdAt: string;
   model?: string;
   source?: "user" | "extension_ai" | "mcp_ai" | "system";
+  delegatedTaskId?: string;
   toolName?: string;
   toolSource?: "builtin" | "external_mcp";
   toolDisplayName?: string;
@@ -49,6 +53,8 @@ export interface StoredConversationTarget {
 
 export interface StoredChatConversation {
   id: string;
+  kind: ChatConversationKind;
+  delegatedTaskId?: string;
   title: string;
   createdAt: string;
   updatedAt: string;
@@ -57,12 +63,13 @@ export interface StoredChatConversation {
   target?: StoredConversationTarget;
   activityCursor?: BrowserActivityCursor;
   externalMcpSelection?: ExternalMcpSelection;
+  memory?: ConversationMemoryV1;
   forkedFromConversationId?: string;
   forkedFromMessageId?: string;
 }
 
 export interface ChatWorkspaceState {
-  version: 1;
+  version: 2;
   activeConversationId?: string;
   conversations: StoredChatConversation[];
 }
@@ -120,11 +127,15 @@ export function exportStoredConversation(
     "",
     ...conversation.messages.flatMap((message) => [
       `## ${
-        message.role === "user"
-          ? "用户"
-          : message.role === "tool"
-            ? `${message.toolSource === "external_mcp" ? "MCP" : "内置工具"} · ${message.toolDisplayName ?? message.toolName ?? "调用"}`
-            : "插件 AI"
+        message.source === "mcp_ai"
+          ? "MCP 后端 AI"
+          : message.source === "extension_ai"
+            ? "插件 AI"
+            : message.role === "user"
+              ? "用户"
+              : message.role === "tool"
+                ? `${message.toolSource === "external_mcp" ? "MCP" : "内置工具"} · ${message.toolDisplayName ?? message.toolName ?? "调用"}`
+                : "插件 AI"
       }`,
       "",
       ...(message.role === "tool" && message.toolRequestArguments
@@ -141,11 +152,14 @@ export function exportStoredConversation(
 }
 
 export function createEmptyChatWorkspace(): ChatWorkspaceState {
-  return { version: 1, conversations: [] };
+  return { version: 2, conversations: [] };
 }
 
 export function createStoredConversation(params: {
   id: string;
+  kind?: ChatConversationKind;
+  delegatedTaskId?: string;
+  title?: string;
   createdAt: string;
   updatedAt: string;
   messages: ChatMessage[];
@@ -153,18 +167,35 @@ export function createStoredConversation(params: {
   target?: StoredConversationTarget;
   activityCursor?: BrowserActivityCursor;
   externalMcpSelection?: ExternalMcpSelection;
+  memory?: ConversationMemoryV1;
   forkedFromConversationId?: string;
   forkedFromMessageId?: string;
 }): StoredChatConversation {
-  const messages = sanitizeMessages(params.messages);
+  const kind = sanitizeConversationKind(params.kind);
+  const delegatedTaskId =
+    kind === "mcp_collaboration"
+      ? sanitizeOptionalIdentifier(params.delegatedTaskId)
+      : undefined;
+  const candidateMemory = sanitizeConversationMemory(params.memory);
+  const messages = sanitizeMessages(
+    params.messages,
+    referencedToolCallIds(candidateMemory),
+  );
   const target = sanitizeConversationTarget(params.target);
   const activityCursor = sanitizeActivityCursor(params.activityCursor);
   const externalMcpSelection = normalizeExternalMcpSelection(
     params.externalMcpSelection,
   );
+  const memory = revalidateStoredMemory(candidateMemory, messages);
   return {
     id: sanitizeIdentifier(params.id),
-    title: deriveConversationTitle(messages),
+    kind,
+    ...(delegatedTaskId ? { delegatedTaskId } : {}),
+    title: deriveConversationTitle(
+      messages,
+      kind,
+      sanitizeText(params.title, 1_000),
+    ),
     createdAt: sanitizeTimestamp(params.createdAt),
     updatedAt: sanitizeTimestamp(params.updatedAt),
     messages,
@@ -172,6 +203,7 @@ export function createStoredConversation(params: {
     ...(target ? { target } : {}),
     ...(activityCursor !== undefined ? { activityCursor } : {}),
     externalMcpSelection,
+    ...(memory ? { memory } : {}),
     ...(params.forkedFromConversationId
       ? {
           forkedFromConversationId: sanitizeIdentifier(
@@ -190,7 +222,7 @@ export function upsertStoredConversation(
   conversation: StoredChatConversation,
 ): StoredChatConversation[] {
   return normalizeChatWorkspace({
-    version: 1,
+    version: 2,
     conversations: [
       conversation,
       ...conversations.filter((candidate) => candidate.id !== conversation.id),
@@ -201,9 +233,11 @@ export function upsertStoredConversation(
 export function isEmptyStoredConversation(
   conversation: StoredChatConversation,
 ): boolean {
+  // Local chats receive a target automatically, so target metadata alone must
+  // not make an untouched greeting durable.
   if (
+    conversation.kind === "mcp_collaboration" ||
     conversation.draft.trim() ||
-    conversation.target ||
     conversation.activityCursor ||
     conversation.forkedFromConversationId ||
     conversation.forkedFromMessageId
@@ -246,8 +280,11 @@ export function normalizeChatWorkspace(value: unknown): ChatWorkspaceState {
   }
 
   const seenIds = new Set<string>();
+  const canRestoreMemory = value.version === 2;
   const conversations = value.conversations
-    .map(normalizeStoredConversation)
+    .map((conversation) =>
+      normalizeStoredConversation(conversation, canRestoreMemory),
+    )
     .filter((conversation): conversation is StoredChatConversation => {
       if (
         !conversation ||
@@ -266,7 +303,7 @@ export function normalizeChatWorkspace(value: unknown): ChatWorkspaceState {
   );
 
   return {
-    version: 1,
+    version: 2,
     ...(activeConversationId &&
     conversations.some((conversation) => conversation.id === activeConversationId)
       ? { activeConversationId }
@@ -315,6 +352,7 @@ export async function saveChatWorkspace(
 
 function normalizeStoredConversation(
   value: unknown,
+  canRestoreMemory = true,
 ): StoredChatConversation | null {
   if (!isRecord(value)) {
     return null;
@@ -323,7 +361,13 @@ function normalizeStoredConversation(
   if (!id || !Array.isArray(value.messages)) {
     return null;
   }
-  const messages = sanitizeMessages(value.messages);
+  const candidateMemory = canRestoreMemory
+    ? sanitizeConversationMemory(value.memory)
+    : undefined;
+  const messages = sanitizeMessages(
+    value.messages,
+    referencedToolCallIds(candidateMemory),
+  );
   const createdAt = sanitizeTimestamp(value.createdAt);
   const updatedAt = sanitizeTimestamp(value.updatedAt, createdAt);
   const target = sanitizeConversationTarget(value.target);
@@ -331,9 +375,21 @@ function normalizeStoredConversation(
   const externalMcpSelection = normalizeExternalMcpSelection(
     value.externalMcpSelection,
   );
+  const kind = sanitizeConversationKind(value.kind);
+  const delegatedTaskId =
+    kind === "mcp_collaboration"
+      ? sanitizeOptionalIdentifier(value.delegatedTaskId)
+      : undefined;
+  const memory = revalidateStoredMemory(candidateMemory, messages);
   return {
     id,
-    title: deriveConversationTitle(messages),
+    kind,
+    ...(delegatedTaskId ? { delegatedTaskId } : {}),
+    title: deriveConversationTitle(
+      messages,
+      kind,
+      sanitizeText(value.title, 1_000),
+    ),
     createdAt,
     updatedAt,
     messages,
@@ -341,6 +397,7 @@ function normalizeStoredConversation(
     ...(target ? { target } : {}),
     ...(activityCursor !== undefined ? { activityCursor } : {}),
     externalMcpSelection,
+    ...(memory ? { memory } : {}),
     ...(sanitizeOptionalIdentifier(value.forkedFromConversationId)
       ? {
           forkedFromConversationId: sanitizeIdentifier(
@@ -424,7 +481,10 @@ function sanitizeStoredTargetUrl(value: unknown): string | undefined {
   }
 }
 
-function sanitizeMessages(values: unknown[]): StoredChatMessage[] {
+function sanitizeMessages(
+  values: unknown[],
+  preferredToolCallIds: ReadonlySet<string> = new Set(),
+): StoredChatMessage[] {
   const accepted: StoredChatMessage[] = [];
   let acceptedChars = 0;
   const indexed = values
@@ -436,24 +496,36 @@ function sanitizeMessages(values: unknown[]): StoredChatMessage[] {
           entry.value.role === "assistant" ||
           entry.value.role === "tool"),
     );
+  const allTools = indexed.filter((entry) => entry.value.role === "tool");
+  const preferredTools = allTools
+    .filter((entry) => {
+      const toolCallId = sanitizeOptionalIdentifier(entry.value.toolCallId);
+      return Boolean(toolCallId && preferredToolCallIds.has(toolCallId));
+    })
+    .slice(-MAX_STORED_TOOL_MESSAGES);
+  const preferredIndexes = new Set(preferredTools.map((entry) => entry.index));
+  const remainingToolCapacity = Math.max(
+    0,
+    MAX_STORED_TOOL_MESSAGES - preferredTools.length,
+  );
+  const nonPreferredTools = allTools.filter(
+    (entry) => !preferredIndexes.has(entry.index),
+  );
+  const recentTools =
+    remainingToolCapacity > 0
+      ? nonPreferredTools.slice(-remainingToolCapacity)
+      : [];
+  const tools = [...preferredTools, ...recentTools].sort(
+    (left, right) => left.index - right.index,
+  );
   const primary = indexed
     .filter((entry) => entry.value.role !== "tool")
-    .slice(-MAX_STORED_MESSAGES);
-  const toolCapacity = Math.min(
-    MAX_STORED_TOOL_MESSAGES,
-    Math.max(0, MAX_STORED_MESSAGES - primary.length),
-  );
-  const tools =
-    toolCapacity > 0
-      ? indexed
-          .filter((entry) => entry.value.role === "tool")
-          .slice(-toolCapacity)
-      : [];
+    .slice(-Math.max(0, MAX_STORED_MESSAGES - tools.length));
   const candidates = [...primary, ...tools]
     .sort((left, right) => left.index - right.index)
     .map((entry) => entry.value);
 
-  for (const value of candidates) {
+  for (const value of [...candidates].reverse()) {
     if (
       !isRecord(value) ||
       (value.role !== "user" &&
@@ -504,6 +576,9 @@ function sanitizeMessages(values: unknown[]): StoredChatMessage[] {
       value.source === "system"
         ? { source: value.source }
         : {}),
+      ...(sanitizeOptionalIdentifier(value.delegatedTaskId)
+        ? { delegatedTaskId: sanitizeIdentifier(value.delegatedTaskId) }
+        : {}),
       ...(value.role === "tool" && sanitizeOptionalIdentifier(value.toolName)
         ? { toolName: sanitizeIdentifier(value.toolName) }
         : {}),
@@ -526,7 +601,46 @@ function sanitizeMessages(values: unknown[]): StoredChatMessage[] {
     });
   }
 
-  return accepted;
+  return accepted.reverse();
+}
+
+function referencedToolCallIds(
+  memory: ConversationMemoryV1 | undefined,
+): ReadonlySet<string> {
+  if (!memory) {
+    return new Set();
+  }
+  return new Set([
+    ...(memory.activeTask?.provenance.toolCallIds ?? []),
+    ...memory.pendingDecisions.flatMap(
+      (entry) => entry.provenance.toolCallIds,
+    ),
+    ...memory.constraints.flatMap((entry) => entry.provenance.toolCallIds),
+    ...memory.facts.flatMap((entry) => entry.provenance.toolCallIds),
+    ...memory.turnSummaries.flatMap((entry) => entry.provenance.toolCallIds),
+  ]);
+}
+
+function revalidateStoredMemory(
+  memory: ConversationMemoryV1 | undefined,
+  messages: StoredChatMessage[],
+): ConversationMemoryV1 | undefined {
+  if (!memory) {
+    return undefined;
+  }
+  return revalidateConversationMemory(memory, {
+    messageIds: new Set(messages.map((message) => message.id)),
+    userMessageIds: new Set(
+      messages
+        .filter((message) => message.role === "user")
+        .map((message) => message.id),
+    ),
+    toolCallIds: new Set(
+      messages.flatMap((message) =>
+        message.toolCallId ? [message.toolCallId] : [],
+      ),
+    ),
+  });
 }
 
 function sanitizeStoredToolPayload(value: unknown): string {
@@ -534,12 +648,12 @@ function sanitizeStoredToolPayload(value: unknown): string {
     return "";
   }
   try {
-    return sanitizeMultilineText(
-      JSON.stringify(redactSensitiveData(JSON.parse(value)), null, 2),
+    return sanitizeText(
+      JSON.stringify(JSON.parse(value), null, 2),
       MAX_STORED_MESSAGE_CHARS,
     );
   } catch {
-    return sanitizeMultilineText(value, MAX_STORED_MESSAGE_CHARS);
+    return sanitizeText(value, MAX_STORED_MESSAGE_CHARS);
   }
 }
 
@@ -569,13 +683,34 @@ function sanitizeToolResultMeta(
   };
 }
 
-function deriveConversationTitle(messages: StoredChatMessage[]): string {
+function deriveConversationTitle(
+  messages: StoredChatMessage[],
+  kind: ChatConversationKind,
+  explicitTitle = "",
+): string {
+  if (kind === "mcp_collaboration") {
+    const title = explicitTitle.replace(/\s+/g, " ").trim();
+    if (title) {
+      return title.length > 64 ? `${title.slice(0, 63)}…` : title;
+    }
+    const mcpMessage = messages.find((message) => message.source === "mcp_ai");
+    const compact = mcpMessage?.content.replace(/\s+/g, " ").trim();
+    return compact
+      ? compact.length > 64
+        ? `${compact.slice(0, 63)}…`
+        : compact
+      : "MCP 协作";
+  }
   const firstUserMessage = messages.find((message) => message.role === "user");
   if (!firstUserMessage) {
     return "新对话";
   }
   const compact = firstUserMessage.content.replace(/\s+/g, " ").trim();
   return compact.length > 48 ? `${compact.slice(0, 47)}…` : compact;
+}
+
+function sanitizeConversationKind(value: unknown): ChatConversationKind {
+  return value === "mcp_collaboration" ? "mcp_collaboration" : "local";
 }
 
 function sanitizeIdentifier(value: unknown): string {

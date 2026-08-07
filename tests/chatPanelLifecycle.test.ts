@@ -218,3 +218,55 @@ test("a new chat binds the foreground tab without blocking general questions whe
   assert.match(clearChat, /target,/);
   assert.doesNotMatch(handleSend, /请先打开一个可用页面，再发送这条消息/);
 });
+
+test("stop and interrupt supersede the active run without changing ordinary FIFO queueing", async () => {
+  const source = await readFile(
+    new URL("../src/sidepanel/App.tsx", import.meta.url),
+    "utf8",
+  );
+  const runSubmission = source.slice(
+    source.indexOf("const runChatSubmission = async"),
+    source.indexOf("const processNextQueuedSubmission ="),
+  );
+  const sendChat = source.slice(
+    source.indexOf("const handleSendChat = ("),
+    source.indexOf("const removeQueuedChatSubmission ="),
+  );
+  const stopChat = source.slice(
+    source.indexOf("const runQueuedChatSubmissionNow ="),
+    source.indexOf("const requestToolApproval ="),
+  );
+
+  assert.match(runSubmission, /runId: agentRunId,[\s\S]*role: "user"/);
+  assert.match(runSubmission, /supersedeConversationTask/);
+  assert.match(runSubmission, /message\.runId !== submission\.supersedesRunId/);
+  assert.match(runSubmission, /turnControl:[\s\S]*mode: "supersede"/);
+  assert.match(sendChat, /mode === "interrupt" \? "front" : "back"/);
+  assert.match(sendChat, /supersedeActiveAgentRun\(conversationId\)/);
+  assert.match(stopChat, /const handleStopAi = \(\) => \{[\s\S]*supersedeActiveAgentRun\(conversationId\)/);
+});
+
+test("new MCP delegations create a dedicated collaboration conversation", async () => {
+  const source = await readFile(
+    new URL("../src/sidepanel/App.tsx", import.meta.url),
+    "utf8",
+  );
+  const acceptTask = source.slice(
+    source.indexOf("const acceptDelegatedTask = async"),
+    source.indexOf("const restoreDelegatedTask = async"),
+  );
+  const restoreTask = source.slice(
+    source.indexOf("const restoreDelegatedTask = async"),
+    source.indexOf("const dismissDelegatedTask = async"),
+  );
+
+  assert.match(acceptTask, /shouldCreateMcpConversation/);
+  assert.match(acceptTask, /kind: "mcp_collaboration"/);
+  assert.match(acceptTask, /delegatedTaskId: task\.taskId/);
+  assert.match(acceptTask, /toDelegatedTaskChatMessage\(task\)/);
+  assert.match(acceptTask, /conversationId: acceptedConversationId/);
+  assert.match(acceptTask, /restorePreviousConversation/);
+  assert.match(restoreTask, /kind: "mcp_collaboration"/);
+  assert.match(restoreTask, /toDelegatedTaskChatMessage\(task\)/);
+  assert.doesNotMatch(restoreTask, /const messages = createInitialChat\(\)/);
+});

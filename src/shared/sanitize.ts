@@ -14,6 +14,7 @@ const SENSITIVE_KEY_PATTERN =
 
 const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const PHONE_PATTERN = /(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)(?!\d)/g;
+const DATE_LIKE_PATTERN = /(?:^|\D)(?:19|20)\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])(?:\D|$)/;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi;
 const HEADER_SECRET_PATTERN = /\b(authorization|cookie|set-cookie)\s*:\s*([^\n\r]+)/gi;
 const KEY_VALUE_SECRET_PATTERN =
@@ -66,11 +67,15 @@ export function sanitizeMultilineText(value: string, maxLength: number): string 
   return truncateText(redactSensitiveText(normalized), maxLength);
 }
 
-function redactSensitiveText(value: string): string {
+export function redactSensitiveText(value: string): string {
   return value
     .replace(HEADER_SECRET_PATTERN, (_match, key: string) => `${key}: [REDACTED]`)
     .replace(EMAIL_PATTERN, "[REDACTED_EMAIL]")
-    .replace(PHONE_PATTERN, "[REDACTED_PHONE]")
+    .replace(PHONE_PATTERN, (candidate, offset: number, source: string) =>
+      shouldRedactPhoneCandidate(candidate, offset, source)
+        ? "[REDACTED_PHONE]"
+        : candidate,
+    )
     .replace(BEARER_PATTERN, "Bearer [REDACTED]")
     .replace(KEY_VALUE_SECRET_PATTERN, (_match, key: string) => `${key}=[REDACTED]`);
 }
@@ -82,10 +87,32 @@ export function sanitizeHtmlSnippet(value: string, maxLength: number): string {
     .replace(/(\s[^\s=>]*(?:password|passwd|pwd|token|secret|authorization|auth|cookie|session|credential|jwt|api[-_]?key|access[-_]?key)[^\s=>]*\s*=\s*)(["'])(.*?)\2/gi, "$1$2[REDACTED]$2")
     .replace(/(\svalue\s*=\s*)(["'])(.*?)\2/gi, "$1$2[REDACTED]$2")
     .replace(EMAIL_PATTERN, "[REDACTED_EMAIL]")
-    .replace(PHONE_PATTERN, "[REDACTED_PHONE]")
+    .replace(PHONE_PATTERN, (candidate, offset: number, source: string) =>
+      shouldRedactPhoneCandidate(candidate, offset, source)
+        ? "[REDACTED_PHONE]"
+        : candidate,
+    )
     .replace(BEARER_PATTERN, "Bearer [REDACTED]");
 
   return truncateText(redacted, maxLength);
+}
+
+function shouldRedactPhoneCandidate(
+  candidate: string,
+  offset: number,
+  source: string,
+): boolean {
+  if (DATE_LIKE_PATTERN.test(candidate)) {
+    return false;
+  }
+  const previous = source[offset - 1] ?? "";
+  const next = source[offset + candidate.length] ?? "";
+  // Long numeric suffixes are common in task IDs, request IDs, versions, and
+  // fingerprints. They are not standalone phone numbers.
+  if (/[A-Za-z0-9_-]/.test(previous) || /[A-Za-z0-9_-]/.test(next)) {
+    return false;
+  }
+  return candidate.replace(/\D/g, "").length >= 8;
 }
 
 export function isSensitiveKey(key: string): boolean {

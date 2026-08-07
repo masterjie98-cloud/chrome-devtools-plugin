@@ -117,6 +117,48 @@ test("dependent follow-ups inherit the previous task instead of automatic page c
       input: "你自己决定",
       attachments: [],
       context: {
+        memory: {
+          version: "conversation-memory-v1",
+          revision: 2,
+          activeTask: {
+            id: "task-fluent-bit",
+            objective: "排查 fluent-bit-jmz5k 的 SIGBUS 根因",
+            status: "waiting",
+            affinity: "external_mcp",
+            successCriteria: ["确认根因"],
+            entities: ["fluent-bit-jmz5k", "rs-compute1"],
+            nextActions: ["查询节点磁盘指标"],
+            blockers: [],
+            provenance: {
+              messageIds: ["previous-user", "previous-assistant"],
+              toolCallIds: [],
+            },
+            updatedAt: "2026-08-06T10:41:00.000Z",
+          },
+          pendingDecisions: [
+            {
+              id: "decision-next-check",
+              question: "继续查询节点指标还是对比正常节点？",
+              options: [
+                {
+                  id: "node-metrics",
+                  label: "查询 rs-compute1 节点指标",
+                  recommended: true,
+                },
+              ],
+              status: "pending",
+              provenance: {
+                messageIds: ["previous-assistant"],
+                toolCallIds: [],
+              },
+              updatedAt: "2026-08-06T10:41:00.000Z",
+            },
+          ],
+          constraints: [],
+          facts: [],
+          turnSummaries: [],
+          updatedAt: "2026-08-06T10:41:00.000Z",
+        },
         pageSnapshot: {
           url: "https://enterprise.example/dns",
           title: "DNS 管理",
@@ -136,7 +178,8 @@ test("dependent follow-ups inherit the previous task instead of automatic page c
       content?: unknown;
     }>;
     const serializedMessages = JSON.stringify(requestMessages);
-    assert.match(serializedMessages, /CONVERSATION_CONTINUATION/);
+    assert.match(serializedMessages, /CONVERSATION_MEMORY/);
+    assert.match(serializedMessages, /decision-next-check/);
     assert.match(serializedMessages, /fluent-bit-jmz5k/);
     assert.equal(
       requestMessages.some(
@@ -699,6 +742,69 @@ test("a completed tool run cannot overshadow the latest user request", async () 
       serializedMessages,
       /only active request|唯一需要执行的请求/i,
     );
+  } finally {
+    restore();
+  }
+});
+
+test("an explicitly superseding turn excludes every message from the interrupted run", async () => {
+  const requestBodies: Array<Record<string, unknown>> = [];
+  const restore = installBrowserGlobals(requestBodies, {
+    choices: [{ message: { content: "这是对当前新问题的直接回答。" } }],
+  });
+
+  try {
+    await streamAiChat({
+      config: { ...DEFAULT_AI_CONFIG, enableTools: false, maxHistory: 12 },
+      messages: [
+        {
+          id: "old-user",
+          runId: "run-interrupted",
+          role: "user",
+          content: "继续执行旧 MCP 查询 OLD_USER_PLAN",
+          createdAt: "2026-08-06T00:00:00.000Z",
+        },
+        {
+          id: "old-assistant",
+          runId: "run-interrupted",
+          role: "assistant",
+          content: "我会继续旧工具计划 OLD_ASSISTANT_PLAN",
+          createdAt: "2026-08-06T00:00:01.000Z",
+        },
+        {
+          id: "old-tool",
+          runId: "run-interrupted",
+          role: "tool",
+          toolName: "pods_get",
+          content: "OLD_TOOL_RESULT",
+          createdAt: "2026-08-06T00:00:02.000Z",
+        },
+        {
+          id: "retained-fact",
+          role: "assistant",
+          content: "更早已完成的事实可以作为普通历史保留。",
+          createdAt: "2026-08-05T23:59:00.000Z",
+        },
+      ],
+      input: "不要继续旧任务，只解释 HTTP 204。",
+      attachments: [],
+      context: {
+        turnControl: {
+          mode: "supersede",
+          supersededRunId: "run-interrupted",
+        },
+      },
+      onDelta: () => undefined,
+    });
+
+    const serializedMessages = JSON.stringify(requestBodies[0]?.messages);
+    assert.doesNotMatch(serializedMessages, /OLD_USER_PLAN/);
+    assert.doesNotMatch(serializedMessages, /OLD_ASSISTANT_PLAN/);
+    assert.doesNotMatch(serializedMessages, /OLD_TOOL_RESULT/);
+    assert.match(serializedMessages, /更早已完成的事实/);
+    assert.match(serializedMessages, /explicitly interrupted/);
+    assert.match(serializedMessages, /Do not resume, complete, or replay/);
+    assert.match(serializedMessages, /不要继续旧任务，只解释 HTTP 204/);
   } finally {
     restore();
   }
